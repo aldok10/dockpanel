@@ -1,0 +1,56 @@
+#!/sbin/openrc-run
+# DockPanel agent — OpenRC runscript.
+#
+# The Alpine counterpart of `dockpanel-agent.service`, and the same discipline
+# applies: this file is the ONE source of the runscript. `setup.sh` deploys it,
+# `install-agent.sh` obtains it from the binary (`dockpanel-agent --print-unit`),
+# and `services::agent_unit::heal_agent_unit()` reconciles the on-disk copy
+# against it at every start — so an agent installed by an older script still
+# picks up the current version instead of running whatever heredoc that script
+# happened to contain.
+#
+# Why there is no sandbox here: systemd's `ProtectSystem=`/`ReadWritePaths=`
+# machinery has no OpenRC equivalent, and inventing a partial one would make
+# the panel behave differently on Alpine in ways nothing tests. The agent is
+# already careful about what it touches; the runscript's job is to keep it
+# running.
+name="dockpanel-agent"
+description="DockPanel Agent"
+
+command="/usr/local/bin/dockpanel-agent"
+supervisor="supervise-daemon"
+respawn_delay=5
+respawn_max=0
+pidfile="/run/dockpanel-agent.pid"
+output_log="/var/log/dockpanel-agent.log"
+error_log="/var/log/dockpanel-agent.log"
+
+depend() {
+    need net
+    use dns docker nginx
+}
+
+start_pre() {
+    # The panel and the agent resolve `systemctl` from PATH; on OpenRC boxes
+    # that name is a compatibility entry point the agent installs into
+    # /usr/local/bin (see services::init::install_shim), so PATH has to name
+    # that directory first.
+    export PATH="/usr/local/sbin:/usr/local/bin:$PATH"
+    mkdir -p /run/dockpanel /var/lib/dockpanel/git
+
+    # agent.env is a fleet member's file; a panel box has none, which is the
+    # same "read it if it exists" semantics the unit's EnvironmentFile=- has.
+    if [ -r /etc/dockpanel/agent.env ]; then
+        set -a
+        . /etc/dockpanel/agent.env
+        set +a
+    fi
+    export RUST_LOG="${RUST_LOG:-info}"
+}
+
+start_post() {
+    sleep 1
+    chgrp nginx /var/run/dockpanel/agent.sock 2>/dev/null
+    chmod 660 /var/run/dockpanel/agent.sock 2>/dev/null
+    return 0
+}

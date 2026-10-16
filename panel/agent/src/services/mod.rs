@@ -19,6 +19,7 @@ pub mod files;
 pub mod firewall;
 pub mod git_build;
 pub mod image_scanner;
+pub mod init;
 pub mod logs;
 pub mod sbom_scanner;
 pub mod migration;

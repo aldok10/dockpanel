@@ -130,14 +130,55 @@ async fn put_site(
         }
     }
 
-    // Validate php_socket path
+    // Validate php_socket path.
+    //
+    // Two shapes are real, and the door used to accept only the first: Debian's
+    // `/run/php/php{v}-fpm.sock` (and its unversioned `/run/php/php-fpm.sock`),
+    // and Alpine's squashed `/run/php-fpm{XY}.sock` (per-site:
+    // `/run/php-fpm{XY}-{pool}.sock`). The second is exactly what
+    // `pkg::resolve_php_fpm_socket` RETURNS on an apk box, so the resolution two
+    // blocks below fed this literal a socket the literal rejected — a box with a
+    // running PHP-FPM was told its socket "must be under /run/php/".
     if let Some(ref socket) = config.php_socket {
         let socket_path = socket.strip_prefix("unix:").unwrap_or(socket);
-        if !socket_path.starts_with("/run/php/") || socket_path.contains("..") {
+        let allowed = socket_path.starts_with("/run/php/")
+            || (socket_path.starts_with("/run/php-fpm") && socket_path.ends_with(".sock"));
+        if !allowed || socket_path.contains("..") {
             return Err((StatusCode::BAD_REQUEST, Json(NginxResponse {
                 success: false,
                 message: "PHP socket must be under /run/php/".into(),
             })));
+        }
+    }
+
+    // A PHP site that names no version arrives with a socket that carries no
+    // version either: the panel's own body builder writes
+    // `unix:/run/php/php-fpm.sock` for such a site (and omits the field entirely
+    // when the version column is null). The block below extracts a version from
+    // that path, which yields the empty string, and every resolution of "" fails
+    // — so on Alpine the render then fell back to the Debian literal
+    // `/run/php/php-fpm.sock`, a path Alpine's PHP-FPM never opens: every page
+    // fell through `try_files` to a `fastcgi_pass` nobody was listening on and
+    // answered 502. Name the version this host actually runs instead, newest
+    // installed first — the order the PHP screen lists them in — and hand it to
+    // the same resolver as the versioned form, which is what turns it into the
+    // real Alpine socket. Debian is unaffected: its versioned wire form is used
+    // as-is, and a box with no PHP at all is left exactly as it was.
+    if config.runtime == "php" {
+        let versionless = match config.php_socket.as_deref() {
+            None => true,
+            Some(s) => {
+                let p = s.strip_prefix("unix:").unwrap_or(s);
+                p == "/run/php/php-fpm.sock" || p == "/run/php-fpm.sock"
+            }
+        };
+        if versionless {
+            for v in crate::routes::php::ALLOWED_VERSIONS.iter().rev() {
+                if crate::services::pkg::is_installed(&format!("php{v}-fpm")).await {
+                    config.php_socket = Some(format!("unix:/run/php/php{v}-fpm.sock"));
+                    break;
+                }
+            }
         }
     }
 
@@ -158,6 +199,12 @@ async fn put_site(
                 .strip_prefix("/run/php/php")
                 .and_then(|s| s.strip_suffix("-fpm.sock"))
                 .unwrap_or("unknown");
+            // On Alpine the socket nginx needs does not exist until the panel
+            // writes one (its stock pool listens on TCP); on Debian this is a
+            // no-op because packaging already created it. Doing it here, at the
+            // moment a PHP site is about to be written, is what keeps this from
+            // being a 400 on a box where PHP-FPM is installed and running.
+            let _ = crate::services::pkg::ensure_php_fpm_socket(version).await;
             match crate::services::pkg::resolve_php_fpm_socket(version).await {
                 Some(real_socket) => config.php_socket = Some(format!("unix:{real_socket}")),
                 None => {
@@ -214,7 +261,11 @@ async fn put_site(
                     // socket would 502 the entire site. If it never appears we keep the
                     // shared socket — degraded exactly as before, rather than broken.
                     let pool_name = domain.replace('.', "_");
-                    let candidate = format!("/run/php/php{ver}-fpm-{pool_name}.sock");
+                    // The socket the pool config asked for, in this family's
+                    // shape — the Debian literal would never appear on Alpine,
+                    // and the poll below would time out on every site.
+                    let candidate =
+                        crate::services::pkg::php_fpm_pool_socket(ver, &pool_name);
                     for _ in 0..15 {
                         if std::path::Path::new(&candidate).exists() {
                             per_site_socket = Some(format!("unix:{candidate}"));

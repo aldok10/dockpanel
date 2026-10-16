@@ -481,9 +481,21 @@ check "no bare is-active decides a service's fate" \
 # slice: code_lines blanks rather than deletes, so the range boundaries land on
 # exactly the lines they did before, and a helper whose body was commented out
 # arrives here as an empty function instead of a working one.
-code_lines "$SETUP" | sed -n '/^wait_for_unit() {/,/^}/p' > "$TMP/helper.sh"
+#
+# ⚠ The probe is no longer inside `wait_for_unit`. The OpenRC work moved it into
+# `svc_is_active`, which picks `systemctl is-active` or `rc-service … status` from
+# $INIT, and `service_name_for`, which resolves a unit's distro-specific name. So
+# the collaborators are extracted with it and $INIT is pinned to systemd — the
+# branch this section stubs; an unset $INIT falls into the "no init system" arm,
+# answers `inactive` to everything, and three arms below went red for THAT rather
+# than for a defect. A deleted collaborator still leaves the arms with teeth: the
+# slice is empty, every answer is `inactive`, and the three "expects 0" arms fail.
+code_lines "$SETUP" \
+  | sed -n -e '/^svc_is_active() {/,/^}/p' \
+           -e '/^service_name_for() {/,/^}/p' \
+           -e '/^wait_for_unit() {/,/^}/p' > "$TMP/helper.sh"
 mkstub() { mkdir -p "$TMP/bin"; printf '#!/usr/bin/env bash\n%s\n' "$1" > "$TMP/bin/systemctl"; chmod +x "$TMP/bin/systemctl"; }
-runhelper() { ( PATH="$TMP/bin:$PATH"; . "$TMP/helper.sh"; wait_for_unit some-unit "${1:-3}" >/dev/null 2>&1; echo $?; ); }
+runhelper() { ( PATH="$TMP/bin:$PATH"; INIT=systemd; . "$TMP/helper.sh"; wait_for_unit some-unit "${1:-3}" >/dev/null 2>&1; echo $?; ); }
 
 mkstub 'echo active'
 check "an active unit is accepted"                       "$(runhelper)" "0"

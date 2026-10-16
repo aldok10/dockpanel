@@ -21,18 +21,31 @@ const CONFIG_DIR: &str = "/etc/dockpanel";
 
 #[tokio::main]
 async fn main() {
-    // `--print-unit` emits the compiled-in systemd unit and exits. This is how
-    // `install-agent.sh` obtains the unit for a fleet member: it already
-    // downloads this binary, and the unit travels inside it, so the two can
-    // never disagree. It used to hand-write its own copy with the sandbox
-    // switched off, and that copy is what every fleet member has been running.
+    // `__dockpanel-initctl` is this binary re-entered as the service-manager
+    // dispatcher for OpenRC boxes: `safe_command("systemctl")` and
+    // `safe_command("journalctl")` resolve to `dockpanel-agent
+    // __dockpanel-initctl …` there, so the ~150 call sites written against
+    // systemd keep working (see `services::init`). Handled before anything
+    // else, and before the option check below, since it is not a user option.
+    if let Some(code) = services::init::dispatch_if_requested() {
+        std::process::exit(code);
+    }
+
+    // `--print-unit` emits the compiled-in service definition and exits. This is
+    // how `install-agent.sh` obtains it for a fleet member: it already
+    // downloads this binary, and the definition travels inside it, so the two
+    // can never disagree. On an OpenRC box that definition is the runscript
+    // rather than the systemd unit — same contract, different service manager.
+    //
+    // It used to hand-write its own copy with the sandbox switched off, and
+    // that copy is what every fleet member has been running.
     //
     // Handled before anything else runs. Note the standing hazard this does NOT
     // change: an UNRECOGNISED argument still falls through to the daemon, which
     // binds the agent socket — never run this binary by hand on a box that is
     // already serving one (there is still no `--version`; read /health instead).
     if std::env::args().skip(1).any(|a| a == "--print-unit") {
-        print!("{}", services::agent_unit::AGENT_UNIT);
+        print!("{}", services::agent_unit::unit_for_this_init());
         std::process::exit(0);
     }
     // An unrecognised option must be an ERROR, not a daemon. Every version
@@ -287,6 +300,16 @@ async fn main() {
     // thing that does reach them (six-hourly self-update), so it carries the
     // unit. No-op when the bytes already match, which is every panel box.
     tokio::spawn(services::agent_unit::heal_agent_unit());
+
+    // OpenRC boxes: install the `systemctl`/`journalctl` entry points and make
+    // sure the `www-data` account exists. Both are Alpine-only, both are
+    // idempotent, and both exist because the alternative is every call site and
+    // every script in the tree learning a second name for the same thing. See
+    // `services::init`.
+    if services::init::has_openrc() {
+        services::init::install_shim();
+        services::init::ensure_web_user();
+    }
 
     // Start phone-home if configured (remote agent mode)
     if let Some(mut ph_config) = services::phone_home::PhoneHomeConfig::from_env() {

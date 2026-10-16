@@ -745,8 +745,11 @@ pub async fn apply_fix(fix_id: &str) -> Result<String, String> {
                     .lines()
                     .filter_map(|l| l.split_whitespace().next())
                     .filter(|name| {
-                        let n = name.trim_end_matches(".service");
-                        n == "php-fpm" || (n.starts_with("php") && n.ends_with("-fpm"))
+                        // Three spellings, one daemon: `php8.3-fpm` (Debian),
+                        // `php-fpm` (RHEL), `php-fpm83` (Alpine — what this
+                        // box's service listing actually contains). See
+                        // `init::is_php_fpm_service`.
+                        crate::services::init::is_php_fpm_service(name)
                     })
                     .map(|s| s.trim_end_matches(".service").to_string())
                     .collect();

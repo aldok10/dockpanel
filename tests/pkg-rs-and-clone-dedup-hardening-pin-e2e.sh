@@ -10,7 +10,10 @@
 #       elsewhere, never swept in this specific file's safe_command() (as
 #       opposed to safe_command_unsandboxed()) call sites: installed_php_
 #       version, php_streams, run_ok, which. Fixed: kill_on_drop(true) added
-#       to each.
+#       to each. A FIFTH site arrived with Alpine support — apk_php_versions()
+#       (the apk counterpart of php_streams(), same shape: a repository query
+#       wrapped in a 120s timeout) — so the control count below is 5, with its
+#       own arm, rather than an unexplained drift.
 #   F2  The harder, 9-session-carried fix: safe_command_unsandboxed()'s
 #       systemd-run --wait timeout only ever killed the LOCAL waiting
 #       client — the remote transient unit it started runs in its own
@@ -24,7 +27,10 @@
 #       unit. All 6 of pkg.rs's safe_command_unsandboxed(...) call sites
 #       (enable_php_stream, transact's main transaction, transact's
 #       autoremove, refresh_index, escape_hatch_works, add_repo) converted
-#       from an external tokio::time::timeout wrapper to this method.
+#       from an external tokio::time::timeout wrapper to this method. A
+#       SEVENTH arrived with Alpine support — refresh_index's apk branch
+#       (`apk update`), paired with its own output_with_timeout call — so the
+#       1:1 control below is 7/7.
 #       spawn_streaming() (the live-log-streaming path) deliberately left
 #       untouched — different completion semantics, out of scope.
 #   F3  routes/nginx.rs::clone_site reimplemented, inline, the exact same
@@ -89,7 +95,7 @@ for f in "$PKG" "$SAFE_CMD" "$NGINX_ROUTE" "$STAGING" "$INSTALL_AGENT_SH"; do
   [ -f "$f" ] || { echo "missing source file: $f"; exit 1; }
 done
 
-echo "── 1. F1: the 4 safe_command(...) (sandboxed) sites in pkg.rs now kill_on_drop ──"
+echo "── 1. F1: the 5 safe_command(...) (sandboxed) sites in pkg.rs now kill_on_drop ──"
 if bodyhasre "$PKG" "^pub async fn installed_php_version" 'kill_on_drop\(true\)'; then
   ok "installed_php_version() sets kill_on_drop(true)"
 else
@@ -110,14 +116,20 @@ if bodyhasre "$PKG" "^async fn which" 'kill_on_drop\(true\)'; then
 else
   bad "which() is missing kill_on_drop(true)"
 fi
-# Whole-file count control: exactly 4 kill_on_drop(true) sites in pkg.rs —
+# Added with Alpine support (s472): the apk counterpart of php_streams().
+if bodyhasre "$PKG" "^pub async fn apk_php_versions" 'kill_on_drop\(true\)'; then
+  ok "apk_php_versions() sets kill_on_drop(true)"
+else
+  bad "apk_php_versions() is missing kill_on_drop(true)"
+fi
+# Whole-file count control: exactly 5 kill_on_drop(true) sites in pkg.rs —
 # a regression that ADDS one without pairing it correctly, or that silently
 # drops one, both change this count.
 KOD_COUNT=$(code "$PKG" | grep -Fc 'kill_on_drop(true)')
-if [ "$KOD_COUNT" -eq 4 ]; then
-  ok "pkg.rs has exactly 4 kill_on_drop(true) sites total"
+if [ "$KOD_COUNT" -eq 5 ]; then
+  ok "pkg.rs has exactly 5 kill_on_drop(true) sites total"
 else
-  bad "pkg.rs has $KOD_COUNT kill_on_drop(true) sites, expected 4 — a site was added or removed"
+  bad "pkg.rs has $KOD_COUNT kill_on_drop(true) sites, expected 5 — a site was added or removed"
 fi
 
 echo
@@ -174,10 +186,10 @@ echo
 echo "── 3. F2: every safe_command_unsandboxed(...) call site in pkg.rs routes through output_with_timeout ──"
 USC_COUNT=$(code "$PKG" | grep -Fc 'safe_command_unsandboxed(')
 OWT_COUNT=$(code "$PKG" | grep -Fc 'output_with_timeout(')
-if [ "$USC_COUNT" -eq 6 ] && [ "$OWT_COUNT" -eq 6 ]; then
-  ok "6 safe_command_unsandboxed(...) call sites, 6 output_with_timeout(...) call sites — 1:1"
+if [ "$USC_COUNT" -eq 7 ] && [ "$OWT_COUNT" -eq 7 ]; then
+  ok "7 safe_command_unsandboxed(...) call sites, 7 output_with_timeout(...) call sites — 1:1"
 else
-  bad "safe_command_unsandboxed count=$USC_COUNT, output_with_timeout count=$OWT_COUNT (expected 6/6) — a call site may have been added, removed, or left on the old external-timeout pattern"
+  bad "safe_command_unsandboxed count=$USC_COUNT, output_with_timeout count=$OWT_COUNT (expected 7/7) — a call site may have been added, removed, or left on the old external-timeout pattern"
 fi
 # Control: no leftover instance of the OLD pattern (an external
 # tokio::time::timeout directly wrapping a safe_command_unsandboxed(...)

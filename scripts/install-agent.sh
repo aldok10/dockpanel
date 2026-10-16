@@ -448,6 +448,39 @@ while [ $# -gt 0 ]; do
 done
 
 rc=0
+
+# These two verbs take no service operands, so they are answered BEFORE the
+# per-service loop below: inside it they would be code that never runs (the
+# `svcs` list is empty for them), which is how `list-units` came to print
+# nothing at all — and how the panel came to report "No PHP-FPM service
+# installed on this host" on a box where PHP-FPM is running.
+if [ "$verb" = "list-units" ]; then
+    for f in /etc/init.d/*; do
+        [ -f "$f" ] || continue
+        s=$(basename "$f")
+        if [ -e "/run/openrc/started/$s" ]; then
+            act=active; sub=running
+        else
+            act=inactive; sub=dead
+        fi
+        printf '%s.service loaded %s %s\n' "$s" "$act" "$sub"
+    done
+    exit 0
+fi
+if [ "$verb" = "list-unit-files" ]; then
+    for f in /etc/init.d/*; do
+        [ -f "$f" ] || continue
+        s=$(basename "$f")
+        if [ -e "/etc/runlevels/default/$s" ]; then
+            st=enabled
+        else
+            st=disabled
+        fi
+        printf '%s.service\t%s\n' "$s" "$st"
+    done
+    exit 0
+fi
+
 for one in $svcs; do
     s=$(translate "$one")
     case "$verb" in

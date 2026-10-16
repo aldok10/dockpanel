@@ -77,7 +77,15 @@ RestrictNamespaces=~user
 # sandbox landed. Reproduced on a fresh Ubuntu 24.04 box (s288). Note the failure
 # is only legible because s287 stopped flattening the agent's message; before that
 # it read "Agent offline".
-ReadWritePaths=/etc/nginx /etc/dockpanel /var/run/dockpanel /var/backups/dockpanel /var/lib/dockpanel /var/www /var/log /etc/systemd/system /opt -/etc/letsencrypt -/etc/apt -/etc/fail2ban -/etc/powerdns -/etc/modsecurity -/etc/cloudflared -/etc/postfix -/etc/dovecot -/var/spool/postfix -/var/spool/cron -/var/vmail -/var/cache/nginx -/etc/ufw -/var/lib/ufw -/etc/php -/etc/ssh -/var/dockpanel-sftp
+# /etc/init.d is the OpenRC mirror of the /etc/systemd/system entry above, and
+# exists for the same reason: `agent_unit::heal_agent_unit()` keeps the service
+# definition the binary carries in sync with the one on disk, and on Alpine that
+# definition is a runscript in /etc/init.d rather than a unit. The write is
+# guarded by `init::has_openrc()`, so on a systemd box this entry grants access
+# to a directory nothing in the agent ever writes — it is here so the invariant
+# "the agent only writes where the unit says it may" stays literally true, and
+# `-`-prefixed because a RHEL minimal image has no /etc/init.d at all.
+ReadWritePaths=/etc/nginx /etc/dockpanel /var/run/dockpanel /var/backups/dockpanel /var/lib/dockpanel /var/www /var/log /etc/systemd/system -/etc/init.d /opt -/etc/letsencrypt -/etc/apt -/etc/fail2ban -/etc/powerdns -/etc/modsecurity -/etc/cloudflared -/etc/postfix -/etc/dovecot -/var/spool/postfix -/var/spool/cron -/var/vmail -/var/cache/nginx -/etc/ufw -/var/lib/ufw -/etc/php -/etc/ssh -/var/dockpanel-sftp
 
 MemoryMax=512M
 LimitNOFILE=65535

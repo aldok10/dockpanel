@@ -16,6 +16,14 @@
 //! `pdns-server` is `pdns`, `redis-server` is `redis`, and the three Debian
 //! Dovecot packages are one `dovecot`. Callers keep passing the Debian name
 //! (which is what the installers use) and [`is_installed`] translates.
+//!
+//! Alpine Linux (`apk`) is the third family. It was the same defect a third
+//! time: the manager probe did not know `apk`, so [`manager`] answered
+//! `Unknown`, [`is_installed`] answered `false` for every package, and every
+//! install path that treats "not installed" as a reason to do work took a
+//! Debian-shaped branch and refused — `PHP install` answered *"Unsupported
+//! distro for PHP install: ID='alpine'"* about a box whose PHP was already
+//! installed and running. [`apk_name`] is the counterpart of [`rpm_name`].
 
 use crate::safe_cmd::{safe_command, safe_command_unsandboxed};
 use std::time::Duration;
@@ -30,7 +38,9 @@ const INSTALL_TIMEOUT: Duration = Duration::from_secs(300);
 pub enum PkgMgr {
     Dpkg,
     Rpm,
-    /// Neither binary is present. Every query answers `false` — the same
+    /// Alpine's `apk`. Answers package questions with `apk info`.
+    Apk,
+    /// No database is present. Every query answers `false` — the same
     /// thing the old dpkg-only code did, but now it is a stated outcome
     /// rather than an accident of which distro we happened to be on.
     Unknown,
@@ -46,6 +56,8 @@ pub enum Installer {
     AptGet,
     Dnf,
     Yum,
+    /// Alpine's `apk`. Transactions are `apk add` / `apk del`.
+    Apk,
 }
 
 impl Installer {
@@ -54,11 +66,22 @@ impl Installer {
             Installer::AptGet => "apt-get",
             Installer::Dnf => "dnf",
             Installer::Yum => "yum",
+            Installer::Apk => "apk",
         }
     }
 
     fn is_apt(self) -> bool {
         self == Installer::AptGet
+    }
+
+    fn is_apk(self) -> bool {
+        self == Installer::Apk
+    }
+
+    /// The RPM-side installers, which share a module-stream model and a
+    /// `php-<ext>` package naming scheme.
+    fn is_dnf_like(self) -> bool {
+        matches!(self, Installer::Dnf | Installer::Yum)
     }
 }
 
@@ -73,6 +96,8 @@ pub async fn manager() -> PkgMgr {
             PkgMgr::Dpkg
         } else if which("rpm").await {
             PkgMgr::Rpm
+        } else if which("apk").await {
+            PkgMgr::Apk
         } else {
             PkgMgr::Unknown
         }
@@ -93,6 +118,8 @@ pub async fn installer() -> Option<Installer> {
                 Some(Installer::Dnf)
             } else if which("yum").await {
                 Some(Installer::Yum)
+            } else if which("apk").await {
+                Some(Installer::Apk)
             } else {
                 None
             }
@@ -180,6 +207,51 @@ fn php_rpm_name(debian: &str) -> &str {
     }
 }
 
+/// Translate a Debian package name to its Alpine (`apk`) spelling.
+///
+/// The third family in the same map [`rpm_name`] started. Two shapes of
+/// translation live here, and they are genuinely different:
+///
+/// * **Renames** — `redis-server` is `redis`, and the three Debian Dovecot
+///   protocol packages are one `dovecot`.
+/// * **Versioned PHP** — Debian spells the version with a dot in the middle
+///   (`php8.3-fpm`); Alpine squashes it (`php83-fpm`). Two extension names
+///   differ as well: PHP's MySQL driver is `mysqli` here (not `mysql`), and
+///   PECL extensions are namespaced `pecl-` (`php83-pecl-redis`). Verified
+///   against the Alpine 3.22 repositories rather than inferred.
+fn apk_name(debian: &str) -> String {
+    match debian {
+        "pdns-server" => "pdns".into(),
+        "redis-server" => "redis".into(),
+        "dovecot-imapd" | "dovecot-pop3d" | "dovecot-lmtpd" => "dovecot".into(),
+        "python3-certbot-nginx" => "certbot-nginx".into(),
+        other => match split_php_package(other) {
+            Some((version, ext)) => {
+                let digits = version.replace('.', "");
+                let ext = match ext {
+                    "mysql" => "mysqli",
+                    "redis" | "imagick" | "memcached" | "apcu" | "mongodb" | "ssh2" => {
+                        return format!("php{digits}-pecl-{ext}");
+                    }
+                    other => other,
+                };
+                format!("php{digits}-{ext}")
+            }
+            None => other.to_string(),
+        },
+    }
+}
+
+/// `php8.3-fpm` → `("8.3", "fpm")`; `None` for anything that is not a
+/// versioned PHP package (`php-fpm`, `phpmyadmin`, …).
+fn split_php_package(name: &str) -> Option<(String, &str)> {
+    let (version, ext) = name.strip_prefix("php")?.split_once('-')?;
+    if version.is_empty() || !version.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return None;
+    }
+    Some((version.to_string(), ext))
+}
+
 /// Select the PHP version on the RHEL family by enabling its module stream.
 ///
 /// **Without this the panel would install PHP 8.0.** Rocky 9's AppStream offers
@@ -195,7 +267,9 @@ pub async fn enable_php_stream(version: &str) -> Result<(), String> {
     let Some(inst) = installer().await else {
         return Err("No supported package manager found".into());
     };
-    if inst.is_apt() {
+    // Only the RPM family selects PHP by module stream. apt and apk both carry
+    // one package per PHP version, and `module` is not a verb either knows.
+    if !inst.is_dnf_like() {
         return Ok(());
     }
     let out = safe_command_unsandboxed(inst.bin(), &[])
@@ -263,6 +337,15 @@ pub async fn resolve_php_fpm_socket(version: &str) -> Option<String> {
     if std::path::Path::new(&debian).exists() {
         return Some(debian);
     }
+    // Alpine: the runscript is `php-fpm{XY}` and its shared pool listens on a
+    // unix socket this panel writes (`ensure_php_fpm_socket`). Checked before
+    // the RHEL fallback because an apk box has no `/run/php-fpm/www.sock`.
+    if manager().await == PkgMgr::Apk {
+        let alpine = alpine_php_fpm_socket(version);
+        if std::path::Path::new(&alpine).exists() {
+            return Some(alpine);
+        }
+    }
     if installed_php_version().await.as_deref() == Some(version)
         && std::path::Path::new("/run/php-fpm/www.sock").exists()
     {
@@ -271,13 +354,159 @@ pub async fn resolve_php_fpm_socket(version: &str) -> Option<String> {
     None
 }
 
+/// The shared PHP-FPM unix socket for `version` in Alpine's shape.
+///
+/// `/run/php-fpm83.sock` for `8.3` — Alpine squashes the version into the
+/// runscript and socket names, the same way [`apk_name`] squashes it into
+/// package names.
+pub fn alpine_php_fpm_socket(version: &str) -> String {
+    format!("/run/php-fpm{}.sock", version.replace('.', ""))
+}
+
+/// A per-site PHP-FPM pool socket for `version`, in Alpine's shape.
+pub fn alpine_php_fpm_pool_socket(version: &str, pool: &str) -> String {
+    format!("/run/php-fpm{}-{pool}.sock", version.replace('.', ""))
+}
+
+/// The directory PHP-FPM reads per-site pool configs from, or `None` when no
+/// pool tree exists for this version.
+///
+/// Debian: `/etc/php/{version}/fpm/pool.d`. Alpine: `/etc/php{XY}/php-fpm.d`.
+/// Both include every `*.conf` in the directory, so a pool written into either
+/// one is picked up by a reload — the shapes differ, the mechanism does not.
+pub fn php_fpm_pool_dir(version: &str) -> Option<String> {
+    let debian = format!("/etc/php/{version}/fpm/pool.d");
+    if std::path::Path::new(&debian).is_dir() {
+        return Some(debian);
+    }
+    let alpine = format!("/etc/php{}/php-fpm.d", version.replace('.', ""));
+    if std::path::Path::new(&alpine).is_dir() {
+        return Some(alpine);
+    }
+    None
+}
+
+/// The socket path a per-site pool for `version` listens on, in whichever
+/// shape is real on this box.
+///
+/// Callers must not spell this out: the vhost's `fastcgi_pass` and the pool's
+/// `listen` are two halves of one agreement, and the Debian literal
+/// (`/run/php/php{v}-fpm-{pool}.sock`) is a path Alpine's FPM would never
+/// open.
+pub fn php_fpm_pool_socket(version: &str, pool: &str) -> String {
+    if std::path::Path::new(&format!("/etc/php/{version}/fpm/pool.d")).is_dir() {
+        format!("/run/php/php{version}-fpm-{pool}.sock")
+    } else {
+        alpine_php_fpm_pool_socket(version, pool)
+    }
+}
+
+/// Give an installed PHP version a shared unix socket nginx can reach, and
+/// return it once it exists.
+///
+/// Debian's packaging creates `/run/php/php{v}-fpm.sock` for its default pool.
+/// **Alpine's default pool listens on TCP `127.0.0.1:9000` instead**, so a PHP
+/// site created by the panel has nothing to point `fastcgi_pass` at — and
+/// `php.rs::settle()` would report the install as failed (correctly, by its
+/// own definition: no socket, no PHP site) on a box where PHP-FPM is running.
+///
+/// So the panel writes the socket it needs, exactly as it already does for
+/// per-site pools. Idempotent, and only on Alpine: on Debian the file is
+/// already there and this returns immediately.
+pub async fn ensure_php_fpm_socket(version: &str) -> Option<String> {
+    let socket = alpine_php_fpm_socket(version);
+    if std::path::Path::new(&socket).exists() {
+        return Some(socket);
+    }
+    if manager().await != PkgMgr::Apk {
+        return resolve_php_fpm_socket(version).await;
+    }
+    let dir = php_fpm_pool_dir(version)?;
+    let (user, group) = (
+        crate::services::init::web_user(),
+        crate::services::init::web_group(),
+    );
+    let config = format!(
+        "; Written by DockPanel — gives PHP {version} a unix socket nginx can reach.\n\
+         ; Alpine's stock pool listens on 127.0.0.1:9000; this one is additive.\n\
+         [dockpanel]\n\
+         user = {user}\n\
+         group = {group}\n\
+         listen = {socket}\n\
+         listen.owner = {user}\n\
+         listen.group = {group}\n\
+         listen.mode = 0660\n\
+         \n\
+         pm = dynamic\n\
+         pm.max_children = 10\n\
+         pm.start_servers = 2\n\
+         pm.min_spare_servers = 1\n\
+         pm.max_spare_servers = 3\n\
+         pm.max_requests = 500\n"
+    );
+    let pool_path = format!("{dir}/zz-dockpanel-shared.conf");
+    if let Err(e) = std::fs::write(&pool_path, &config) {
+        tracing::warn!("could not write {pool_path}: {e}");
+        return None;
+    }
+
+    let unit = service_name(&format!("php{version}-fpm")).await;
+    let _ = safe_command("systemctl")
+        .args(["restart", &unit])
+        .output()
+        .await;
+
+    for _ in 0..25 {
+        if std::path::Path::new(&socket).exists() {
+            return Some(socket);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    tracing::warn!("PHP {version}: {socket} did not appear after writing {pool_path}");
+    None
+}
+
+/// The PHP minor versions this box's Alpine repositories offer, newest first.
+///
+/// The Alpine counterpart of [`php_streams`]: Alpine packages PHP per minor
+/// version (`php82-fpm`, `php83-fpm`, `php84-fpm`), so the answer comes from
+/// the repositories rather than from a module stream. Empty on every other
+/// family.
+pub async fn apk_php_versions() -> Vec<String> {
+    if manager().await != PkgMgr::Apk {
+        return Vec::new();
+    }
+    let out = tokio::time::timeout(
+        Duration::from_secs(120),
+        safe_command("apk")
+            .args(["search", "-q", "php*-fpm"])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()
+    .and_then(|r| r.ok());
+    let Some(out) = out.filter(|o| o.status.success()) else {
+        return Vec::new();
+    };
+    let mut versions: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("php")?.strip_suffix("-fpm"))
+        .filter(|d| d.len() >= 2 && d.chars().all(|c| c.is_ascii_digit()))
+        .map(|d| format!("{}.{}", &d[..d.len() - 1], &d[d.len() - 1..]))
+        .collect();
+    versions.sort_by(|a, b| b.cmp(a));
+    versions.dedup();
+    versions
+}
+
 /// The PHP module streams this box offers, newest first. Empty on apt boxes,
 /// where versions come from the archive rather than a stream.
 pub async fn php_streams() -> Vec<String> {
     let Some(inst) = installer().await else {
         return Vec::new();
     };
-    if inst.is_apt() {
+    if !inst.is_dnf_like() {
         return Vec::new();
     }
     let out = tokio::time::timeout(
@@ -322,6 +551,9 @@ pub async fn is_installed(package: &str) -> bool {
             run_ok("dpkg", &["-l", package], |out| out.contains("ii")).await
         }
         PkgMgr::Rpm => run_ok("rpm", &["-q", rpm_name(package)], |_| true).await,
+        // `apk info -e` is an exact-name "is installed" query (no globbing —
+        // the glob forms are `apk search`, which is a different question).
+        PkgMgr::Apk => run_ok("apk", &["info", "-e", &apk_name(package)], |_| true).await,
         PkgMgr::Unknown => false,
     }
 }
@@ -337,10 +569,16 @@ pub async fn is_installed(package: &str) -> bool {
 /// `redis.service`, `php-fpm.service` and `pdns.service` exist;
 /// `redis-server.service`, `php{v}-fpm.service` and `pdns-server.service` do not.
 pub async fn service_name(debian_unit: &str) -> String {
-    if manager().await == PkgMgr::Rpm {
-        rpm_service_name(debian_unit).to_string()
-    } else {
-        debian_unit.to_string()
+    match manager().await {
+        PkgMgr::Rpm => rpm_service_name(debian_unit).to_string(),
+        // Alpine renames services the same way it renames packages, and the
+        // map lives with the init layer because that is what consumes it:
+        // `php8.3-fpm` is the runscript `php-fpm83`, `redis-server` is
+        // `redis`, `cron` is `crond`. `init::service_name` is the single
+        // source for both `systemctl` translation and this answer, so a site's
+        // vhost and the panel's restart button cannot disagree.
+        PkgMgr::Apk => crate::services::init::service_name(debian_unit),
+        _ => debian_unit.to_string(),
     }
 }
 
@@ -408,6 +646,21 @@ pub async fn available(package: &str) -> bool {
                 })
                 .await
         }
+        Some(Installer::Apk) => {
+            // `apk search -x` is documented as an exact match, but this
+            // apk-tools prefix-matches anyway (`search -x postgresql` answers
+            // `postgresql-bdr` on 3.22), and it exits 0 whether or not
+            // anything matched. So the signal is a line that equals the
+            // translated name, not the exit status — otherwise every prefix
+            // of a real package would look installable and one such name
+            // would fail the whole `apk add` transaction (#73, again).
+            let name = apk_name(package);
+            let needle = name.clone();
+            run_ok("apk", &["search", "-x", "-q", &name], move |out| {
+                out.lines().any(|l| l.trim() == needle)
+            })
+            .await
+        }
         None => false,
     }
 }
@@ -458,7 +711,9 @@ enum Action {
 
 async fn transact(action: Action, packages: &[&str]) -> Result<(), String> {
     let Some(inst) = installer().await else {
-        return Err("No supported package manager found (looked for apt-get, dnf, yum)".into());
+        return Err(
+            "No supported package manager found (looked for apt-get, dnf, yum, apk)".into(),
+        );
     };
     if packages.is_empty() {
         return Ok(());
@@ -470,45 +725,67 @@ async fn transact(action: Action, packages: &[&str]) -> Result<(), String> {
         return Err(why);
     }
 
-    let rpm = manager().await == PkgMgr::Rpm;
-    // Translation can COLLAPSE several Debian names onto one RPM package — the
+    let mgr = manager().await;
+    // Translation can COLLAPSE several Debian names onto one package — the
     // three Dovecot protocol packages become one `dovecot`, and all three
-    // ModSecurity spellings become one `nginx-mod-modsecurity`. Both managers
-    // tolerate a repeated name, but emitting `dovecot dovecot dovecot` makes
+    // ModSecurity spellings become one `nginx-mod-modsecurity`. Every manager
+    // tolerates a repeated name, but emitting `dovecot dovecot dovecot` makes
     // the logged command look like a bug to whoever reads it next.
     let mut names: Vec<String> = Vec::with_capacity(packages.len());
     for p in packages {
-        let name = if rpm { rpm_name(p).to_string() } else { (*p).to_string() };
+        let name = match mgr {
+            PkgMgr::Rpm => rpm_name(p).to_string(),
+            PkgMgr::Apk => apk_name(p),
+            _ => (*p).to_string(),
+        };
         if !names.contains(&name) {
             names.push(name);
         }
     }
 
     let mut args: Vec<String> = Vec::new();
-    match (&action, inst.is_apt()) {
-        (Action::Install, true) => {
-            // --force-confnew: take the maintainer's config when one conflicts.
-            // dnf has no equivalent knob — it writes .rpmnew alongside and keeps
-            // yours — so this policy is deliberately NOT emulated on the RPM
-            // side rather than approximated into something that silently
-            // differs. Stated here because a reader comparing the two branches
-            // will otherwise assume the omission is an oversight.
-            args.push("-o".into());
-            args.push("Dpkg::Options::=--force-confnew".into());
-            args.push("install".into());
-            args.push("-y".into());
+    if inst.is_apk() {
+        // `apk` takes no `-y` (add/del are non-interactive) and has no
+        // equivalent of apt's `--force-confnew`: it writes `.apk-new` beside a
+        // modified config and keeps yours, so the policy is not emulated.
+        // `--update-cache` refreshes a stale index inside the same transaction
+        // — the difference between a package that exists being installed and
+        // "unable to select packages".
+        match action {
+            Action::Install => {
+                args.push("add".into());
+                args.push("--update-cache".into());
+            }
+            Action::Remove => {
+                args.push("del".into());
+            }
         }
-        (Action::Install, false) => {
-            args.push("install".into());
-            args.push("-y".into());
-        }
-        (Action::Remove, true) => {
-            args.push("purge".into());
-            args.push("-y".into());
-        }
-        (Action::Remove, false) => {
-            args.push("remove".into());
-            args.push("-y".into());
+    } else {
+        match (&action, inst.is_apt()) {
+            (Action::Install, true) => {
+                // --force-confnew: take the maintainer's config when one conflicts.
+                // dnf has no equivalent knob — it writes .rpmnew alongside and keeps
+                // yours — so this policy is deliberately NOT emulated on the RPM
+                // side rather than approximated into something that silently
+                // differs. Stated here because a reader comparing the two branches
+                // will otherwise assume the omission is an oversight.
+                args.push("-o".into());
+                args.push("Dpkg::Options::=--force-confnew".into());
+                args.push("install".into());
+                args.push("-y".into());
+            }
+            (Action::Install, false) => {
+                args.push("install".into());
+                args.push("-y".into());
+            }
+            (Action::Remove, true) => {
+                args.push("purge".into());
+                args.push("-y".into());
+            }
+            (Action::Remove, false) => {
+                args.push("remove".into());
+                args.push("-y".into());
+            }
         }
     }
     args.extend(names.iter().cloned());
@@ -545,13 +822,24 @@ async fn transact(action: Action, packages: &[&str]) -> Result<(), String> {
 }
 
 /// Refresh the package index. apt needs this before a repo added moments ago is
-/// visible; dnf reads repo metadata on demand and needs nothing.
+/// visible; dnf reads repo metadata on demand and needs nothing. `apk` keeps a
+/// cached index that `apk update` refreshes, and `transact` also passes
+/// `--update-cache` so a stale one cannot fail an install.
 pub async fn refresh_index() {
-    if let Some(Installer::AptGet) = installer().await {
-        let _ = safe_command_unsandboxed("apt-get", &[])
-            .arg("update")
-            .output_with_timeout(INSTALL_TIMEOUT)
-            .await;
+    match installer().await {
+        Some(Installer::AptGet) => {
+            let _ = safe_command_unsandboxed("apt-get", &[])
+                .arg("update")
+                .output_with_timeout(INSTALL_TIMEOUT)
+                .await;
+        }
+        Some(Installer::Apk) => {
+            let _ = safe_command_unsandboxed("apk", &[])
+                .arg("update")
+                .output_with_timeout(INSTALL_TIMEOUT)
+                .await;
+        }
+        _ => {}
     }
 }
 
@@ -628,7 +916,7 @@ pub async fn no_installer_reason(what: &str) -> Option<String> {
         Some(_) => None,
         None => Some(format!(
             "{what} is not possible on this box — no supported package manager was found \
-             (looked for apt-get, dnf and yum). Install one, or install the service with \
+             (looked for apt-get, dnf, yum and apk). Install one, or install the service with \
              your own tooling and the panel will detect the result."
         )),
     }
@@ -658,7 +946,9 @@ pub async fn ufw_refusal_reason() -> Option<String> {
                 .to_string(),
         ),
         _ => match manager().await {
-            PkgMgr::Dpkg => None,
+            // Debian and Alpine both package UFW and neither boots with
+            // another firewall already enforcing.
+            PkgMgr::Dpkg | PkgMgr::Apk => None,
             // rpm box with no firewalld running: still refuse, because UFW is
             // not this family's firewall and installing it invites the same
             // split-brain the moment firewalld is switched on.

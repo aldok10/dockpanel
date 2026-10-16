@@ -272,6 +272,7 @@ async fn apply_updates(Json(body): Json<ApplyRequest>) -> Response {
             Some(Installer::AptGet) => "apt-get",
             Some(Installer::Dnf) => "dnf",
             Some(Installer::Yum) => "yum",
+            Some(Installer::Apk) => "apk",
             None => {
                 let line = serde_json::json!({"type":"line","line":"No supported package manager found"});
                 let done = serde_json::json!({"type":"done","success":false,"reboot_required":false});
@@ -281,6 +282,7 @@ async fn apply_updates(Json(body): Json<ApplyRequest>) -> Response {
             }
         };
         let is_apt = installer_bin == "apt-get";
+        let is_apk = installer_bin == "apk";
         let mut cmd = safe_command_unsandboxed(installer_bin, &[]);
 
         if has_packages {
@@ -291,10 +293,23 @@ async fn apply_updates(Json(body): Json<ApplyRequest>) -> Response {
             // that isn't currently present at all; `upgrade <name>` only
             // touches something already installed, matching what "apply
             // this update" is actually supposed to do.
-            cmd.arg(if is_apt { "install" } else { "upgrade" }).arg("-y");
-            for pkg_name in &packages {
-                cmd.arg(pkg_name);
+            //
+            // Alpine's `apk add -u` is apt's behaviour (install, or upgrade to
+            // the candidate), and `--update-cache` closes the one gap apk has
+            // here: a stale local index would report a package as unavailable.
+            if is_apk {
+                cmd.args(["add", "-u", "--update-cache"]);
+                for pkg_name in &packages {
+                    cmd.arg(pkg_name);
+                }
+            } else {
+                cmd.arg(if is_apt { "install" } else { "upgrade" }).arg("-y");
+                for pkg_name in &packages {
+                    cmd.arg(pkg_name);
+                }
             }
+        } else if is_apk {
+            cmd.args(["upgrade", "--update-cache"]);
         } else {
             cmd.args(["upgrade", "-y"]);
         }

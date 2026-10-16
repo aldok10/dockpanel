@@ -847,13 +847,14 @@ pub fn render_site_config(
 
 /// Write a per-site PHP-FPM pool config with resource limits.
 ///
-/// Debian-shaped layout only (`/etc/php/{version}/fpm/pool.d`) — the RHEL
-/// family has no per-version pool directory to write into (one `php-fpm`
-/// package serves whichever stream is active), so this never runs there in
-/// practice: `nginx.rs::put_site()` only calls it for a socket path that
-/// resolved to the Debian shape in the first place. If that ever changes,
-/// this early return keeps a RHEL call a no-op (degrading to the shared
-/// pool) rather than an error.
+/// The pool directory and the socket path are both **family-specific** and come
+/// from `pkg` rather than being spelled here: Debian's tree is
+/// `/etc/php/{version}/fpm/pool.d` with sockets under `/run/php/`, Alpine's is
+/// `/etc/php{XY}/php-fpm.d` with sockets at `/run/php-fpm{XY}-*.sock`. The
+/// RHEL family has neither (one `php-fpm` package serves whichever stream is
+/// active), so this stays a silent no-op there — `nginx.rs::put_site()` only
+/// calls it for a socket that resolved against a real pool tree in the first
+/// place.
 pub fn write_php_pool_config(
     domain: &str,
     php_version: &str,
@@ -861,10 +862,9 @@ pub fn write_php_pool_config(
     max_workers: u32,
     pool_owner: Option<(&str, &str)>,
 ) -> Result<(), String> {
-    let pool_dir = format!("/etc/php/{php_version}/fpm/pool.d");
-    if !std::path::Path::new(&pool_dir).exists() {
-        return Ok(()); // Debian pool.d tree absent (RHEL, or PHP not installed) — skip silently
-    }
+    let Some(pool_dir) = crate::services::pkg::php_fpm_pool_dir(php_version) else {
+        return Ok(()); // No pool tree for this family/version — skip silently
+    };
 
     // Sanitize domain for use as pool name (replace dots with underscores)
     let pool_name = domain.replace('.', "_");
@@ -873,14 +873,35 @@ pub fn write_php_pool_config(
     // `services::sftp_accounts`), so the pool that reads/writes it must run as
     // that same identity — `www-data` would lose write access the moment the
     // site's directory is re-chowned. `None` (every non-SFTP site, the common
-    // case) keeps the original shared identity.
+    // case) is the shared identity spelled literally here because that is the
+    // panel-wide contract, not a per-site account.
     let (user, group) = pool_owner.unwrap_or(("www-data", "www-data"));
+    // One Alpine-only correction. A stock Alpine box ships the `www-data`
+    // GROUP (gid 82, with nginx in it) but not the USER, and PHP-FPM refuses to
+    // start a pool whose user does not exist — it exits the whole master, so a
+    // missing account is not a degraded site but every site on the box. Where
+    // the account is genuinely absent the pool falls back to `nobody` (Alpine's
+    // unprivileged default) rather than writing a config that cannot start.
+    // `init::ensure_web_user` creates the account at agent startup, so this is
+    // the second line of defence, not the normal path — and on Debian, and on
+    // any Alpine box that heal has reached, it resolves to the same `www-data`.
+    let fallback_user;
+    let fallback_group;
+    let (user, group) = if user == "www-data" && !crate::services::init::has_web_user() {
+        fallback_user = crate::services::init::web_user();
+        fallback_group = crate::services::init::web_group();
+        (fallback_user.as_str(), fallback_group.as_str())
+    } else {
+        (user, group)
+    };
+
+    let pool_socket = crate::services::pkg::php_fpm_pool_socket(php_version, &pool_name);
 
     let config = format!(
         r#"[{pool_name}]
 user = {user}
 group = {group}
-listen = /run/php/php{php_version}-fpm-{pool_name}.sock
+listen = {pool_socket}
 listen.owner = {user}
 listen.group = {group}
 listen.mode = 0660
@@ -905,13 +926,15 @@ php_admin_value[max_execution_time] = 300
     std::fs::write(&pool_path, &config)
         .map_err(|e| format!("Failed to write FPM pool config: {e}"))?;
 
-    tracing::info!("PHP-FPM pool config written: {pool_path} (user={user}, workers={max_workers}, memory={memory_mb}M)");
+    tracing::info!("PHP-FPM pool config written: {pool_path} (user={user}, workers={max_workers}, memory={memory_mb}M, socket={pool_socket})");
     Ok(())
 }
 
 /// Reload PHP-FPM for a given version.
 pub async fn reload_php_fpm(php_version: &str) -> Result<(), String> {
-    let service = format!("php{php_version}-fpm");
+    // Under whichever name this family uses: `php8.3-fpm` on Debian,
+    // `php-fpm83` on Alpine.
+    let service = crate::services::pkg::service_name(&format!("php{php_version}-fpm")).await;
     let output = safe_command("systemctl")
         .args(["reload", &service])
         .output()

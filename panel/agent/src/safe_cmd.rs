@@ -33,8 +33,30 @@ pub const DOCKER_CONFIG_DIR: &str = "/var/lib/dockpanel/docker";
 ///
 /// Callers that need additional env vars (e.g. `PGPASSWORD`) should add them
 /// via `.env("KEY", "value")` **after** calling this function.
+/// Create a `Command` with a sanitized environment, resolving `systemctl` and
+/// `journalctl` through the init layer first.
+///
+/// On a systemd box (and for every other binary) this is exactly
+/// `Command::new(binary)`. On OpenRC — Alpine — those two names do not exist,
+/// so [`crate::services::init::dispatch_target`] points the command at this
+/// same binary in `__dockpanel-initctl` mode; the arguments the caller appends
+/// afterwards are untouched, and the dispatcher translates them into
+/// `rc-service`/`rc-update` calls. See `services::init` for why the
+/// translation happens here rather than at each of the ~150 call sites.
+fn base_command(binary: &str) -> (std::ffi::OsString, Vec<std::ffi::OsString>) {
+    match crate::services::init::dispatch_target(binary) {
+        Some((exe, prefix)) => (exe.into_os_string(), prefix),
+        None => (
+            std::ffi::OsString::from(binary),
+            Vec::new(),
+        ),
+    }
+}
+
 pub fn safe_command(binary: &str) -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::new(binary);
+    let (program, prefix) = base_command(binary);
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(prefix);
     cmd.env_clear();
     cmd.env("PATH", SAFE_PATH);
     cmd.env("HOME", "/root");
@@ -49,7 +71,9 @@ pub fn safe_command(binary: &str) -> tokio::process::Command {
 /// Same safety guarantees as [`safe_command`] but for blocking contexts
 /// (e.g. `app_process.rs` which writes systemd units synchronously).
 pub fn safe_command_sync(binary: &str) -> std::process::Command {
-    let mut cmd = std::process::Command::new(binary);
+    let (program, prefix) = base_command(binary);
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(prefix);
     cmd.env_clear();
     cmd.env("PATH", SAFE_PATH);
     cmd.env("HOME", "/root");
@@ -156,17 +180,60 @@ fn escape_dollar_for_systemd_run(a: &std::ffi::OsStr) -> std::ffi::OsString {
 
 pub struct UnsandboxedCommand {
     argv: Vec<std::ffi::OsString>,
+    /// `Some` when this box has no systemd, and then it holds the inner
+    /// command's own argv (`[binary, args…]`) rather than a `systemd-run`
+    /// invocation. See [`UnsandboxedCommand::direct_command`].
+    direct: Option<Vec<std::ffi::OsString>>,
+    /// Environment handed to the inner binary on the direct path.
+    env: Vec<(String, String)>,
 }
 
 impl UnsandboxedCommand {
     fn new(binary: &str, extra_env: &[(&str, &str)]) -> Self {
         Self {
             argv: unsandboxed_prefix(binary, extra_env),
+            direct: (!crate::services::init::has_systemd()).then(|| {
+                vec![std::ffi::OsString::from(binary)]
+            }),
+            env: extra_env
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
         }
+    }
+
+    /// The inner command, for the no-systemd path.
+    ///
+    /// There is nothing to escape *from* here: the OpenRC runscripts this panel
+    /// installs do not apply `ProtectSystem=strict`, so the agent already has
+    /// the whole filesystem and running the binary directly is the whole
+    /// operation — no transient unit, no `--wait`, and (the part that matters)
+    /// no silent failure on a box where `systemd-run` does not exist at all.
+    fn direct_command(&self) -> tokio::process::Command {
+        let argv = self
+            .direct
+            .as_ref()
+            .expect("direct_command is only called when `direct` is Some");
+        let mut cmd = tokio::process::Command::new(&argv[0]);
+        cmd.args(&argv[1..]);
+        cmd.env_clear();
+        cmd.env("PATH", SAFE_PATH);
+        cmd.env("HOME", "/root");
+        cmd.env("LANG", "C.UTF-8");
+        cmd.env("LC_ALL", "C.UTF-8");
+        cmd.env("DEBIAN_FRONTEND", "noninteractive");
+        cmd.env("DOCKER_CONFIG", DOCKER_CONFIG_DIR);
+        for (k, v) in &self.env {
+            cmd.env(k, v);
+        }
+        cmd
     }
 
     /// Append one argument to the **inner** binary.
     pub fn arg<S: AsRef<std::ffi::OsStr>>(&mut self, a: S) -> &mut Self {
+        if let Some(direct) = self.direct.as_mut() {
+            direct.push(a.as_ref().to_os_string());
+        }
         self.argv.push(escape_dollar_for_systemd_run(a.as_ref()));
         self
     }
@@ -178,6 +245,9 @@ impl UnsandboxedCommand {
         S: AsRef<std::ffi::OsStr>,
     {
         for a in args {
+            if let Some(direct) = self.direct.as_mut() {
+                direct.push(a.as_ref().to_os_string());
+            }
             self.argv.push(escape_dollar_for_systemd_run(a.as_ref()));
         }
         self
@@ -185,6 +255,13 @@ impl UnsandboxedCommand {
 
     /// Run to completion, returning the inner command's status and output.
     pub async fn output(&mut self) -> std::io::Result<std::process::Output> {
+        if self.direct.is_some() {
+            let mut cmd = self.direct_command();
+            // Same reason as the systemd path below: a caller-side timeout
+            // drops this future, and the child must not be left orphaned.
+            cmd.kill_on_drop(true);
+            return cmd.output().await;
+        }
         let cap = Capture::new()?;
         let mut cmd = tokio::process::Command::new("systemd-run");
         cmd.env_clear();
@@ -244,6 +321,22 @@ impl UnsandboxedCommand {
         &mut self,
         timeout: std::time::Duration,
     ) -> Result<std::process::Output, String> {
+        if let Some(direct) = self.direct.as_ref() {
+            // No transient unit exists to stop, and none needs to: the child
+            // here IS our child, so the `kill_on_drop(true)` inside `output`
+            // reaps the real work the moment the timeout drops the future.
+            // This is the one place the no-systemd path is *stricter* than
+            // systemd's — there, stopping the right thing needed a unit name.
+            let binary = direct[0].to_string_lossy().into_owned();
+            return match tokio::time::timeout(timeout, self.output()).await {
+                Ok(Ok(out)) => Ok(out),
+                Ok(Err(e)) => Err(format!("{binary} could not be run: {e}")),
+                Err(_) => Err(format!(
+                    "{binary} timed out after {}s and was killed",
+                    timeout.as_secs()
+                )),
+            };
+        }
         let (binary, unit) = insert_unit_arg(&mut self.argv);
 
         match tokio::time::timeout(timeout, self.output()).await {
@@ -275,6 +368,9 @@ impl UnsandboxedCommand {
     /// one ordered-per-stream channel, which is what that endpoint already did
     /// with its two reader tasks.
     pub fn spawn_streaming(&mut self) -> std::io::Result<StreamingRun> {
+        if self.direct.is_some() {
+            return self.spawn_streaming_direct();
+        }
         let cap = Capture::new()?;
         let mut cmd = tokio::process::Command::new("systemd-run");
         cmd.env_clear();
@@ -325,6 +421,55 @@ impl UnsandboxedCommand {
         });
 
         Ok(StreamingRun { lines, status })
+    }
+
+    /// The no-systemd [`Self::spawn_streaming`]: the child's own pipes are the
+    /// stream, so there is no capture file to tail and no poll interval —
+    /// every line is delivered as it is produced.
+    fn spawn_streaming_direct(&mut self) -> std::io::Result<StreamingRun> {
+        let mut cmd = self.direct_command();
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        cmd.kill_on_drop(true);
+        let mut child = cmd.spawn()?;
+
+        let (tx, lines) = tokio::sync::mpsc::channel::<String>(128);
+        let mut readers = Vec::new();
+        if let Some(out) = child.stdout.take() {
+            readers.push(tokio::spawn(pipe_lines(out, tx.clone())));
+        }
+        if let Some(err) = child.stderr.take() {
+            readers.push(tokio::spawn(pipe_lines(err, tx.clone())));
+        }
+        drop(tx);
+
+        let (status_tx, status) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let result = child.wait().await;
+            // Join before sending the status, so a caller that drains lines and
+            // then awaits `status` cannot miss a trailing line.
+            for reader in readers {
+                let _ = reader.await;
+            }
+            let _ = status_tx.send(result);
+        });
+
+        Ok(StreamingRun { lines, status })
+    }
+}
+
+/// Read an owned pipe to EOF, forwarding each line.
+async fn pipe_lines<R>(reader: R, tx: tokio::sync::mpsc::Sender<String>)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncBufReadExt;
+    let mut lines = tokio::io::BufReader::new(reader).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        if tx.send(line).await.is_err() {
+            break;
+        }
     }
 }
 
@@ -397,17 +542,29 @@ async fn tail_lines(
 /// (e.g. `services/smtp.rs::ensure_msmtp` which installs msmtp via apt).
 pub struct UnsandboxedCommandSync {
     argv: Vec<std::ffi::OsString>,
+    direct: Option<Vec<std::ffi::OsString>>,
+    env: Vec<(String, String)>,
 }
 
 impl UnsandboxedCommandSync {
     fn new(binary: &str, extra_env: &[(&str, &str)]) -> Self {
         Self {
             argv: unsandboxed_prefix(binary, extra_env),
+            direct: (!crate::services::init::has_systemd()).then(|| {
+                vec![std::ffi::OsString::from(binary)]
+            }),
+            env: extra_env
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
         }
     }
 
     /// Append one argument to the **inner** binary.
     pub fn arg<S: AsRef<std::ffi::OsStr>>(&mut self, a: S) -> &mut Self {
+        if let Some(direct) = self.direct.as_mut() {
+            direct.push(a.as_ref().to_os_string());
+        }
         self.argv.push(escape_dollar_for_systemd_run(a.as_ref()));
         self
     }
@@ -419,6 +576,9 @@ impl UnsandboxedCommandSync {
         S: AsRef<std::ffi::OsStr>,
     {
         for a in args {
+            if let Some(direct) = self.direct.as_mut() {
+                direct.push(a.as_ref().to_os_string());
+            }
             self.argv.push(escape_dollar_for_systemd_run(a.as_ref()));
         }
         self
@@ -426,6 +586,21 @@ impl UnsandboxedCommandSync {
 
     /// Run to completion, returning the inner command's status and output.
     pub fn output(&mut self) -> std::io::Result<std::process::Output> {
+        if let Some(direct) = self.direct.as_ref() {
+            let mut cmd = std::process::Command::new(&direct[0]);
+            cmd.args(&direct[1..]);
+            cmd.env_clear();
+            cmd.env("PATH", SAFE_PATH);
+            cmd.env("HOME", "/root");
+            cmd.env("LANG", "C.UTF-8");
+            cmd.env("LC_ALL", "C.UTF-8");
+            cmd.env("DEBIAN_FRONTEND", "noninteractive");
+            cmd.env("DOCKER_CONFIG", DOCKER_CONFIG_DIR);
+            for (k, v) in &self.env {
+                cmd.env(k, v);
+            }
+            return cmd.output();
+        }
         let cap = Capture::new()?;
         let mut cmd = std::process::Command::new("systemd-run");
         cmd.env_clear();

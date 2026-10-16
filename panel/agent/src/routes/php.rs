@@ -10,7 +10,9 @@ use crate::safe_cmd::{safe_command, safe_command_unsandboxed};
 use super::AppState;
 
 /// Allowed PHP versions (distro repos, deb.sury.org, or ondrej/php PPA).
-const ALLOWED_VERSIONS: &[&str] = &["8.1", "8.2", "8.3", "8.4", "8.5"];
+/// The versions the PHP screens offer. `pub(crate)` because `nginx.rs::put_site`
+/// walks it to find a default for a PHP site that names no version.
+pub(crate) const ALLOWED_VERSIONS: &[&str] = &["8.1", "8.2", "8.3", "8.4", "8.5"];
 
 /// PHP extensions to install with each version — each is installed only if
 /// this apt source actually has a candidate for it. Newer PHP releases build
@@ -160,6 +162,83 @@ async fn install_version_rpm(
     Ok(Json(settle(version, "was installed").await))
 }
 
+/// Install a PHP version on Alpine via `apk`.
+///
+/// The Alpine sibling of [`install_version_rpm`], and the same shape: check the
+/// version is actually offered before touching the box, install the core (which
+/// must succeed), then only the extensions the repositories really have — an
+/// extension name that does not exist fails the whole `apk add` transaction.
+///
+/// Alpine tracks one PHP minor per stable release branch, so unlike Debian
+/// there is no third-party repository to reach for when a version is missing:
+/// the honest answer is "this branch does not carry it", which is what the
+/// operator is told.
+async fn install_version_alpine(
+    version: &str,
+) -> Result<Json<InstallResponse>, (StatusCode, Json<InstallResponse>)> {
+    use crate::services::pkg;
+
+    let fail = |status: StatusCode, msg: String| {
+        (
+            status,
+            Json(InstallResponse {
+                success: false,
+                message: msg,
+                version: version.to_string(),
+            }),
+        )
+    };
+
+    let offered = pkg::apk_php_versions().await;
+    if !offered.is_empty() && !offered.iter().any(|v| v == version) {
+        return Err(fail(
+            StatusCode::NOT_IMPLEMENTED,
+            format!(
+                "PHP {version} is not offered by this system's package repositories. \
+                 Available versions here: {}. Alpine builds one PHP minor per stable \
+                 release branch, so an older or newer minor is not installable from apk.",
+                offered.join(", ")
+            ),
+        ));
+    }
+
+    tracing::info!("Installing PHP {version} with apk (core + available extensions)");
+
+    // The UI and this file speak the Debian spelling (`php8.3-fpm`) because
+    // that is the vocabulary the whole panel uses; `pkg::install` translates
+    // to `php83-fpm` for this family. Passing the Alpine name here would make
+    // the translation map — the one place that knows — the only thing that
+    // does not go through it.
+    let core = [
+        format!("php{version}-fpm"),
+        format!("php{version}-cli"),
+        format!("php{version}-common"),
+    ];
+    let core_refs: Vec<&str> = core.iter().map(String::as_str).collect();
+    pkg::install(&core_refs)
+        .await
+        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("apk add failed:\n{e}")))?;
+
+    let exts: Vec<String> = COMMON_EXTENSIONS
+        .iter()
+        .map(|e| format!("php{version}-{e}"))
+        .collect();
+    let ext_refs: Vec<&str> = exts.iter().map(String::as_str).collect();
+    let skipped = pkg::install_available(&ext_refs)
+        .await
+        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, format!("PHP {version} extension install failed: {e}")))?;
+    if !skipped.is_empty() {
+        tracing::info!("PHP {version}: no apk candidate for {}", skipped.join(" "));
+    }
+
+    start_fpm(version).await;
+
+    tracing::info!("PHP {version} installed and started");
+    Ok(Json(
+        settle(version, "was installed with FPM and all available extensions").await,
+    ))
+}
+
 /// Enable and start this version's FPM unit, under whichever name the family uses.
 async fn start_fpm(version: &str) {
     let unit = crate::services::pkg::service_name(&format!("php{version}-fpm")).await;
@@ -167,6 +246,14 @@ async fn start_fpm(version: &str) {
         .args(["enable", "--now", &unit])
         .output()
         .await;
+    // On Alpine this gives the version a unix socket nginx can reach, because
+    // the stock pool listens on TCP 127.0.0.1:9000 (see
+    // `pkg::ensure_php_fpm_socket`). A no-op on Debian, whose packaging
+    // already created the socket. Placed here, rather than in each caller,
+    // because every path that makes PHP usable goes through this function —
+    // including the "already installed" branch, which is the one an Alpine box
+    // with PHP already present actually takes.
+    let _ = crate::services::pkg::ensure_php_fpm_socket(version).await;
 }
 
 /// Report on what an install actually achieved, judged by the thing that matters.
@@ -261,6 +348,17 @@ async fn install_version(
             ));
         }
         return install_version_rpm(version).await;
+    }
+
+    // Alpine carries one PHP package per minor version, like Debian — but its
+    // package names, its repositories and its service manager are all its own,
+    // and every branch below this point is apt machinery (apt-cache,
+    // deb.sury.org, ppa:ondrej/php). Before this guard an Alpine box fell
+    // straight through to the "Unsupported distro" refusal, which told the
+    // operator to *"Install PHP 8.3 manually"* — on a box whose PHP 8.3 was
+    // already installed, enabled and serving.
+    if crate::services::pkg::manager().await == crate::services::pkg::PkgMgr::Apk {
+        return install_version_alpine(version).await;
     }
 
     // Ensure php{version}-fpm is available from some apt source. On Debian 13
@@ -465,15 +563,26 @@ async fn list_extensions(Path(version): Path<String>) -> Result<Json<serde_json:
 
     // List available (installable) extensions. The query differs per family and
     // so does the prefix to strip: Debian's packages are `php8.3-gd`, the RHEL
-    // family's are `php-gd`. Asking apt-cache on a dnf box does not error
+    // family's are `php-gd`, and Alpine's are `php83-gd` (with PECL extensions
+    // under `php83-pecl-*`). Asking apt-cache on a dnf box does not error
     // loudly — `.ok()` swallows it and the operator simply sees an empty list
     // of extensions they could install, with nothing saying why.
-    let rpm = crate::services::pkg::manager().await == crate::services::pkg::PkgMgr::Rpm;
+    let mgr = crate::services::pkg::manager().await;
+    let rpm = mgr == crate::services::pkg::PkgMgr::Rpm;
     let (prefix, avail_output) = if rpm {
         (
             "php-".to_string(),
             safe_command("dnf")
                 .args(["-q", "list", "--available", "php-*"])
+                .output()
+                .await,
+        )
+    } else if mgr == crate::services::pkg::PkgMgr::Apk {
+        let digits = version.replace('.', "");
+        (
+            format!("php{digits}-"),
+            safe_command("apk")
+                .args(["search", "-q", &format!("php{digits}-*")])
                 .output()
                 .await,
         )

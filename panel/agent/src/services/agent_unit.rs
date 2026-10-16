@@ -63,8 +63,28 @@ use std::path::Path;
 /// this module exists.
 pub const AGENT_UNIT: &str = include_str!("../../dockpanel-agent.service");
 
+/// The canonical OpenRC runscript, compiled in from the file the installers
+/// deploy on Alpine.
+///
+/// The same single-source rule as [`AGENT_UNIT`], for the same reason: the
+/// runscript is what the fleet's Alpine members run, and a copy that lives only
+/// in an installer heredoc drifts the moment the binary changes.
+pub const AGENT_RUNSCRIPT: &str = include_str!("../../dockpanel-agent.openrc");
+
+/// The unit/runscript text this box's service manager actually reads.
+pub fn unit_for_this_init() -> &'static str {
+    if crate::services::init::has_openrc() {
+        AGENT_RUNSCRIPT
+    } else {
+        AGENT_UNIT
+    }
+}
+
 /// Where systemd reads the agent's unit from on every install path.
 const UNIT_PATH: &str = "/etc/systemd/system/dockpanel-agent.service";
+
+/// Where OpenRC reads the agent's runscript from.
+const RUNSCRIPT_PATH: &str = "/etc/init.d/dockpanel-agent";
 
 /// Directories the unit's `ReadWritePaths=` names, with any `-` prefix stripped.
 ///
@@ -88,6 +108,14 @@ pub fn read_write_paths(unit: &str) -> Vec<&str> {
 /// box (`setup.sh` copies the same file) and every fleet member from the second
 /// boot onward.
 pub async fn heal_agent_unit() {
+    // Alpine: the OpenRC runscript, not a unit file. Same three guards, minus
+    // the ones that only exist because systemd caches unit files — OpenRC reads
+    // a runscript at each start, so a written file is already in effect and
+    // there is nothing to reload or to ask about.
+    if crate::services::init::has_openrc() {
+        heal_agent_runscript();
+        return;
+    }
     // Only ever reconcile a unit that is already there. Writing one where none
     // exists would mean installing the agent as a service on a box that chose
     // to run it some other way.
@@ -141,6 +169,37 @@ pub async fn heal_agent_unit() {
     // Guard 3 — deliberately no restart. See the module header.
     tracing::info!(
         "Healed {UNIT_PATH} to the compiled-in unit (sandbox + ReadWritePaths); \
+         it takes effect at the next agent restart"
+    );
+}
+
+/// Bring the on-disk OpenRC runscript up to the compiled-in one.
+///
+/// The Alpine half of [`heal_agent_unit`], and deliberately simpler: there is
+/// no `daemon-reload` to call and no `LoadError` to ask about, because OpenRC
+/// parses a runscript when it starts the service rather than caching it in
+/// PID1's memory. The one guard that survives is "only reconcile a runscript
+/// that is already there" — writing one where none exists would mean
+/// installing the agent as a service on a box that chose to run it another
+/// way, and nothing here restarts the agent (the self-update does).
+fn heal_agent_runscript() {
+    if !Path::new(RUNSCRIPT_PATH).exists() {
+        return;
+    }
+    let Ok(current) = std::fs::read_to_string(RUNSCRIPT_PATH) else {
+        return;
+    };
+    if current == AGENT_RUNSCRIPT {
+        return;
+    }
+    if let Err(e) = std::fs::write(RUNSCRIPT_PATH, AGENT_RUNSCRIPT) {
+        tracing::warn!("agent runscript heal: could not write {RUNSCRIPT_PATH}: {e}");
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(RUNSCRIPT_PATH, std::fs::Permissions::from_mode(0o755));
+    tracing::info!(
+        "Healed {RUNSCRIPT_PATH} to the compiled-in runscript; \
          it takes effect at the next agent restart"
     );
 }

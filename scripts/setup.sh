@@ -699,8 +699,18 @@ install_dependencies() {
         #            the agent and operator muscle memory still reach for it).
         #   iproute2 — BusyBox `ip` has no `route get`, which is how the
         #            interface IP for a domain-bound vhost is found.
-        run "Installing base packages (${BASE_PKGS}, bash, shadow, grep, iproute2)" \
-            pkg_install curl openssl ca-certificates openssh-client gnupg bash shadow grep iproute2
+        #   rsync  — the agent's site clone/git-deploy/staging paths all shell
+        #            out to it. It is on every Debian and RHEL base image, which
+        #            is why nothing ever declared it; Alpine does not ship it, so
+        #            a clone or a git deploy on Alpine would fail at the copy.
+        #   sudo   — WP-CLI runs as the site owner (`sudo -u www-data wp …`,
+        #            routes/nginx.rs, services/wordpress.rs). Debian and RHEL
+        #            base images have sudo; Alpine has neither sudo nor runuser,
+        #            so those actions would fail on a box where everything else
+        #            about the site works. Root needs no sudoers entry to use
+        #            `-u`.
+        run "Installing base packages (${BASE_PKGS}, bash, shadow, grep, iproute2, rsync, sudo)" \
+            pkg_install curl openssl ca-certificates openssh-client gnupg bash shadow grep iproute2 rsync sudo
     else
         # RHEL-family names the ssh client package openssh-clients (plural).
         run "Installing base packages (${BASE_PKGS})" \
@@ -764,6 +774,39 @@ enabled=1
 gpgcheck=1
 gpgkey=https://download.docker.com/linux/centos/gpg
 REPOEOF
+}
+
+# ── www-data user (Alpine) ───────────────────────────────────────────────
+ensure_www_data_user() {
+    # Debian and RHEL packages create `www-data`; Alpine ships only the GROUP
+    # (gid 82, with nginx as a member), which is why `id nginx` looks like the
+    # account is there while `chown www-data:www-data`, the PHP-FPM pool's
+    # `user =` line and the agent's `sudo -u www-data` all fail. The panel names
+    # that account in ~50 places, so it creates it rather than teaching every
+    # one of them a second name for the same thing.
+    #
+    # The agent does this again at startup (`services::init::ensure_web_user`),
+    # for boxes whose install predates this function and for fleet members;
+    # both are idempotent, and doing it here means a fresh install is correct
+    # before the agent has ever run — PHP-FPM refuses to start a pool whose
+    # user is missing, so the ordering matters on the first PHP site.
+    [ "$INIT" = "openrc" ] || return 0
+
+    if ! grep -q '^www-data:' /etc/group; then
+        addgroup -S www-data
+    fi
+    if grep -q '^www-data:' /etc/passwd; then
+        log "www-data user already present"
+        return 0
+    fi
+    # BusyBox adduser (Alpine's /usr/sbin/adduser): -S system account, -D no
+    # password, -H no home directory, -G the group that already exists,
+    # -s a shell that cannot log in.
+    if adduser -S -D -H -G www-data -s /sbin/nologin www-data; then
+        log "Created www-data user (Alpine ships the group only)"
+    else
+        warn "Could not create the www-data user — PHP-FPM pools will run as nobody"
+    fi
 }
 
 install_docker() {
@@ -1693,6 +1736,39 @@ while [ $# -gt 0 ]; do
 done
 
 rc=0
+
+# These two verbs take no service operands, so they are answered BEFORE the
+# per-service loop below — see the note in install-agent.sh's shim. In the loop
+# they would be code that never runs (`svcs` is empty for them), which is how
+# `list-units` came to print nothing and how the panel came to report "No
+# PHP-FPM service installed on this host" on a box where it is running.
+if [ "$verb" = "list-units" ]; then
+    for f in /etc/init.d/*; do
+        [ -f "$f" ] || continue
+        s=$(basename "$f")
+        if [ -e "/run/openrc/started/$s" ]; then
+            act=active; sub=running
+        else
+            act=inactive; sub=dead
+        fi
+        printf '%s.service loaded %s %s\n' "$s" "$act" "$sub"
+    done
+    exit 0
+fi
+if [ "$verb" = "list-unit-files" ]; then
+    for f in /etc/init.d/*; do
+        [ -f "$f" ] || continue
+        s=$(basename "$f")
+        if [ -e "/etc/runlevels/default/$s" ]; then
+            st=enabled
+        else
+            st=disabled
+        fi
+        printf '%s.service\t%s\n' "$s" "$st"
+    done
+    exit 0
+fi
+
 for one in $svcs; do
     s=$(translate "$one")
     case "$verb" in
@@ -2920,6 +2996,7 @@ main() {
     preflight_checks
     check_source
     install_dependencies
+    ensure_www_data_user
     install_docker
     install_nginx
     install_node

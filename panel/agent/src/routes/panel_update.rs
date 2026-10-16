@@ -287,30 +287,80 @@ async fn run_update_subprocess(target: String, mode: UpdateMode) {
             .unwrap_or(0)
     );
 
-    let mut cmd = Command::new("systemd-run");
-    cmd.arg("--quiet")
-        .arg("--collect")
-        .arg(format!("--unit={unit}"))
-        .arg(format!("--setenv=DOCKPANEL_VERSION={target}"));
+    let mut cmd = if crate::services::init::has_systemd() {
+        let mut c = Command::new("systemd-run");
+        c.arg("--quiet")
+            .arg("--collect")
+            .arg(format!("--unit={unit}"))
+            .arg(format!("--setenv=DOCKPANEL_VERSION={target}"));
+        // Env travels as --setenv on this path because the work is handed to
+        // PID1, not inherited from us.
+        match mode {
+            UpdateMode::FullPanel => {
+                c.arg("--setenv=INSTALL_FROM_RELEASE=1")
+                    .arg("--setenv=DOCKPANEL_NO_SELF_REFRESH=1")
+                    .arg("--setenv=DOCKPANEL_UPDATE_DETACHED=1");
+            }
+            UpdateMode::AgentOnly => {
+                c.arg("--setenv=DOCKPANEL_AGENT_UPDATE_DETACHED=1");
+            }
+        }
+        c
+    } else {
+        // OpenRC — there is no `systemd-run --unit`, and the property that
+        // mattered (the updater outliving this process) has to come from
+        // elsewhere. `setsid -f` gives it a new session, so it is not in this
+        // process's group and is reparented to PID 1 the moment the update
+        // stops the agent — OpenRC's supervise-daemon signals the pid it
+        // started, not a cgroup, so a detached session survives.
+        //
+        // Its output goes to a LOG FILE rather than a pipe: the updater
+        // restarts this very process, and a pipe whose read end dies with us
+        // would SIGPIPE the update halfway through. The verdict file below is
+        // what the panel reads for the outcome, so losing the live tail on
+        // Alpine costs the log stream, not the truth.
+        let mut c = Command::new("setsid");
+        c.arg("-f");
+        c.env("DOCKPANEL_VERSION", &target);
+        match mode {
+            UpdateMode::FullPanel => {
+                c.env("INSTALL_FROM_RELEASE", "1")
+                    .env("DOCKPANEL_NO_SELF_REFRESH", "1")
+                    .env("DOCKPANEL_UPDATE_DETACHED", "1");
+            }
+            UpdateMode::AgentOnly => {
+                c.env("DOCKPANEL_AGENT_UPDATE_DETACHED", "1");
+            }
+        }
+        c
+    };
 
     match mode {
         UpdateMode::FullPanel => {
-            cmd.arg("--setenv=INSTALL_FROM_RELEASE=1")
-                .arg("--setenv=DOCKPANEL_NO_SELF_REFRESH=1")
-                .arg("--setenv=DOCKPANEL_UPDATE_DETACHED=1")
-                .arg("bash")
-                .arg(UPDATE_SCRIPT);
+            cmd.arg("bash").arg(UPDATE_SCRIPT);
         }
         UpdateMode::AgentOnly => {
-            cmd.arg("--setenv=DOCKPANEL_AGENT_UPDATE_DETACHED=1")
-                .arg("bash")
-                .arg(AGENT_UPDATE_SCRIPT_PATH);
+            cmd.arg("bash").arg(AGENT_UPDATE_SCRIPT_PATH);
         }
     }
 
     cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::null());
+    if !crate::services::init::has_systemd() {
+        // Detached path: keep the updater's output where an operator can read
+        // it after the restart, and give it a descriptor that does not die with
+        // this process.
+        if let Ok(log) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/var/log/dockpanel-update.log")
+        {
+            if let Ok(err) = log.try_clone() {
+                cmd.stdout(Stdio::from(log)).stderr(Stdio::from(err));
+            }
+        }
+    }
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,

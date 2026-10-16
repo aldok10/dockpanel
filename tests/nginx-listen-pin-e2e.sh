@@ -88,7 +88,14 @@ check "setup.sh calls it after certbot succeeds" "$(grep -c '^        normalize_
 # F4: a reload cannot move an already-bound 0.0.0.0:443 listener to <ip>:443 —
 # nginx inherits the old socket and the rewrite silently no-ops. Proven on a
 # live box: reload left the panel broken, restart fixed it.
-if grep -q 'systemctl restart nginx' "$SETUP"; then R=yes; else R=no; fi
+#
+# ⚠ The verb must still be a RESTART. The Alpine work routed this call through
+# the portable `svc_restart` helper — `systemctl restart nginx` on the systemd
+# families, `rc-service nginx restart` on OpenRC — because a bare `systemctl`
+# does not exist on an OpenRC box and the installer's whole service layer had to
+# go through one door. The literal spelling moved; the arm's subject (restart,
+# never reload) did not, and a reload in either spelling still fails it.
+if grep -qE '(systemctl restart nginx|svc_restart nginx)' "$SETUP"; then R=yes; else R=no; fi
 check "setup.sh RESTARTS nginx (a reload would no-op the rebind)" "$R" "yes"
 if grep -q 'NGINX_NEEDS_RESTART' "$UPDATE"; then R=yes; else R=no; fi
 check "update.sh restarts too, for boxes already broken" "$R" "yes"
