@@ -1330,6 +1330,40 @@ async fn remove_redirect(
 // Password Protection (htpasswd)
 // ──────────────────────────────────────────────────────────────
 
+/// Write a site's basic-auth include atomically.
+///
+/// The `.`-prefixed staging name is load-bearing. The vhost pulls this directory
+/// in with the mask `<domain>.conf*`, so a leftover `<domain>.conf.restore`
+/// would itself be included as a SECOND copy of the file: harmless for the
+/// server-scope form (nginx takes the last duplicate directive) and fatal for a
+/// sub-path, where two `location /admin` blocks in one server block are exactly
+/// the error this feature is not allowed to produce.
+fn write_auth_include(auth_file: &str, content: &str) -> std::io::Result<()> {
+    let target = std::path::Path::new(auth_file);
+    let dir = target
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("/etc/nginx/auth"));
+    let name = target
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("auth.conf");
+    let tmp = dir.join(format!(".{name}.pending"));
+    std::fs::write(&tmp, content)?;
+    if let Err(e) = std::fs::rename(&tmp, auth_file) {
+        std::fs::remove_file(&tmp).ok();
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Put the include back exactly as it was, or remove it when there was none.
+fn restore_auth_include(auth_file: &str, previous: Option<&str>) -> bool {
+    match previous {
+        Some(prev) => write_auth_include(auth_file, prev).is_ok(),
+        None => std::fs::remove_file(auth_file).is_ok(),
+    }
+}
+
 #[derive(Deserialize)]
 struct PasswordProtectRequest {
     domain: String,
@@ -1379,58 +1413,117 @@ async fn password_protect(
     std::fs::write(&htpasswd_file, lines.join("\n") + "\n")
         .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e}")))?;
 
-    // Add auth_basic to nginx config via include
+    // Where the protection lives: one include file per site, pulled in by the
+    // vhost itself (`include /etc/nginx/auth/<domain>.conf*` is in the template).
+    // The old shape also inserted that include line into the site's rendered
+    // vhost, which is half of why a failure here left the whole box untestable.
     let auth_conf_dir = "/etc/nginx/auth";
     std::fs::create_dir_all(auth_conf_dir).ok();
     let auth_file = format!("{auth_conf_dir}/{}.conf", body.domain);
 
-    let path = if body.path.is_empty() { "/" } else { &body.path };
+    let path = if body.path.is_empty() { "/" } else { body.path.as_str() };
     if !path.starts_with('/') || path.contains(|c: char| c.is_whitespace() || c == ';' || c == '{' || c == '}' || c == '\n' || c == '\r') {
         return Err(api_err(StatusCode::BAD_REQUEST, "Invalid path format"));
     }
-    let auth_block = format!(
-        "location {} {{\n    auth_basic \"Restricted\";\n    auth_basic_user_file {};\n    try_files $uri $uri/ =404;\n}}\n",
-        path, htpasswd_file
-    );
 
-    // Check if auth block for this path already exists
-    let existing_auth = std::fs::read_to_string(&auth_file).unwrap_or_default();
-    if !existing_auth.contains(&format!("location {} ", path)) {
-        std::fs::write(&auth_file, format!("{existing_auth}{auth_block}")).ok();
-    }
+    // Whole site → server-scope directives, with NO `location` wrapper.
+    //
+    // Every vhost this panel renders already defines `location /` (try_files and
+    // the PHP handler), and a second one in the same server block is fatal:
+    //   nginx: [emerg] duplicate location "/" in /etc/nginx/auth/<domain>.conf
+    // That is exactly how this feature used to fail on every attempt. `auth_basic`
+    // is valid in the server context and covers every location, the PHP handler
+    // included, which is what "protect this site" means. A sub-path still needs a
+    // location block: that is the only way nginx scopes auth to a prefix.
+    let auth_block = if path == "/" {
+        format!("auth_basic \"Restricted\";\nauth_basic_user_file {htpasswd_file};\n")
+    } else {
+        format!(
+            "location {} {{\n    auth_basic \"Restricted\";\n    auth_basic_user_file {};\n    try_files $uri $uri/ =404;\n}}\n",
+            path, htpasswd_file
+        )
+    };
 
-    // Include in site config if not already
-    let site_conf = format!("{}/{}.conf", services::nginx::sites_dir(), body.domain);
-    let site_content = std::fs::read_to_string(&site_conf).unwrap_or_default();
-    if !site_content.contains(&format!("include /etc/nginx/auth/{}.conf", body.domain)) {
-        if let Some(pos) = site_content.rfind('}') {
-            let include_line = format!(
-                "    include /etc/nginx/auth/{}.conf;\n",
-                body.domain
-            );
-            let new_content = format!(
-                "{}{}{}",
-                &site_content[..pos],
-                include_line,
-                &site_content[pos..]
-            );
-            std::fs::write(&site_conf, new_content).ok();
+    let previous_auth = std::fs::read_to_string(&auth_file).ok();
+    let existing_auth = previous_auth.clone().unwrap_or_default();
+    // `/` is a header line, not a block, so match at the line start: an indented
+    // copy of the same directive inside a sub-path's location must not pass for
+    // having protected the whole site.
+    let already_protected = if path == "/" {
+        existing_auth.lines().any(|l| l.starts_with("auth_basic"))
+    } else {
+        existing_auth.contains(&format!("location {path} "))
+    };
+    if !already_protected {
+        if let Err(e) = write_auth_include(&auth_file, &format!("{existing_auth}{auth_block}")) {
+            return Err(api_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to write {auth_file}: {e}"),
+            ));
         }
     }
+
+    // A vhost rendered before the template carried the include needs it added
+    // once — without this, protection would "succeed" on those sites while
+    // nothing ever read the file. Anything rendered since gets it from the
+    // template, so this is a one-time repair, not the mechanism.
+    let site_conf = format!("{}/{}.conf", services::nginx::sites_dir(), body.domain);
+    let site_content = std::fs::read_to_string(&site_conf).unwrap_or_default();
+    let previous_site = if site_content.contains("/etc/nginx/auth/") {
+        None
+    } else if let Some(pos) = site_content.rfind('}') {
+        let include_line = format!("    include /etc/nginx/auth/{}.conf*;\n", body.domain);
+        let new_content = format!(
+            "{}{}{}",
+            &site_content[..pos],
+            include_line,
+            &site_content[pos..]
+        );
+        std::fs::write(&site_conf, new_content).ok().map(|_| site_content)
+    } else {
+        None
+    };
+
+    let put_back = || {
+        let restored = restore_auth_include(&auth_file, previous_auth.as_deref());
+        if let Some(prev) = previous_site.as_deref() {
+            services::nginx::restore_or_remove(&site_conf, Some(prev));
+        }
+        restored
+    };
 
     match services::nginx::test_config().await {
         Ok(output) if output.success => {
             if let Err(e) = services::nginx::reload().await {
+                let restored = put_back();
                 return Err(api_err(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("Config saved but nginx reload failed: {e}"),
+                    &format!(
+                        "Config saved but nginx reload failed: {e}{}",
+                        services::nginx::restore_note(restored)
+                    ),
                 ));
             }
         }
-        _ => {
+        Ok(output) => {
+            let restored = put_back();
             return Err(api_err(
                 StatusCode::BAD_REQUEST,
-                "Nginx config test failed",
+                &format!(
+                    "Nginx config test failed: {}{}",
+                    output.stderr,
+                    services::nginx::restore_note(restored)
+                ),
+            ));
+        }
+        Err(e) => {
+            let restored = put_back();
+            return Err(api_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!(
+                    "Failed to test config: {e}{}",
+                    services::nginx::restore_note(restored)
+                ),
             ));
         }
     }
@@ -1454,17 +1547,31 @@ async fn list_protected(Path(domain): Path<String>) -> Result<Json<serde_json::V
     let htpasswd_file = format!("/etc/nginx/htpasswd/{domain}");
     let users_content = std::fs::read_to_string(&htpasswd_file).unwrap_or_default();
 
-    let paths: Vec<String> = content
+    // Only real location lines count. The old filter matched any line
+    // CONTAINING "location ", so a comment that merely mentioned one — or the
+    // `location /` inside a note about this very feature — was reported as a
+    // protected path. A block starts with `location ` after indentation and ends
+    // with `{`.
+    let paths_content: Vec<String> = content
         .lines()
-        .filter(|l| l.contains("location "))
+        .map(|l| l.trim_start())
+        .filter(|l| l.starts_with("location ") && l.ends_with('{'))
         .filter_map(|l| {
-            l.split("location ")
-                .nth(1)?
-                .split(' ')
+            l.strip_prefix("location ")?
+                .split_whitespace()
                 .next()
                 .map(|s| s.to_string())
         })
         .collect();
+    // The whole-site form has no `location` line at all: it is `auth_basic`
+    // written at column 0 and pulled into the server block by the vhost's
+    // include. Reporting it as the path it protects is what keeps the panel's own
+    // list from showing a protected site as unprotected.
+    let mut paths: Vec<String> = Vec::new();
+    if content.lines().any(|l| l.starts_with("auth_basic")) {
+        paths.push("/".to_string());
+    }
+    paths.extend(paths_content);
 
     let users: Vec<String> = users_content
         .lines()
@@ -1490,39 +1597,83 @@ async fn remove_protection(
     let auth_file = format!("/etc/nginx/auth/{domain}.conf");
     let content = std::fs::read_to_string(&auth_file).unwrap_or_default();
 
-    // Remove the location block for this path
+    // Remove the block for this path.
+    //
+    // `/` is the whole-site form: header lines, no braces to walk. A sub-path is
+    // still a `location` block and is removed by brace counting.
     let mut cleaned = String::new();
-    let mut skip = false;
-    let mut brace_count: i32 = 0;
-    for line in content.lines() {
-        if line.contains(&format!("location {} ", path)) || line.contains(&format!("location {path} ")) {
-            skip = true;
-            brace_count = 0;
-        }
-        if skip {
-            brace_count += line.matches('{').count() as i32;
-            brace_count -= line.matches('}').count() as i32;
-            if brace_count <= 0 && line.contains('}') {
-                skip = false;
+    if path == "/" {
+        for line in content.lines() {
+            if line.starts_with("auth_basic") {
                 continue;
             }
-            continue;
+            cleaned.push_str(line);
+            cleaned.push('\n');
         }
-        cleaned.push_str(line);
-        cleaned.push('\n');
+    } else {
+        let mut skip = false;
+        let mut brace_count: i32 = 0;
+        for line in content.lines() {
+            if line.contains(&format!("location {} ", path)) || line.contains(&format!("location {path} ")) {
+                skip = true;
+                brace_count = 0;
+            }
+            if skip {
+                brace_count += line.matches('{').count() as i32;
+                brace_count -= line.matches('}').count() as i32;
+                if brace_count <= 0 && line.contains('}') {
+                    skip = false;
+                    continue;
+                }
+                continue;
+            }
+            cleaned.push_str(line);
+            cleaned.push('\n');
+        }
     }
 
-    std::fs::write(&auth_file, cleaned).ok();
+    let previous_auth = std::fs::read_to_string(&auth_file).ok();
+    if let Err(e) = write_auth_include(&auth_file, &cleaned) {
+        return Err(api_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to write {auth_file}: {e}"),
+        ));
+    }
+
     match services::nginx::test_config().await {
         Ok(output) if output.success => {
             if let Err(e) = services::nginx::reload().await {
+                let restored = restore_auth_include(&auth_file, previous_auth.as_deref());
                 return Err(api_err(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("Config saved but nginx reload failed: {e}"),
+                    &format!(
+                        "Config saved but nginx reload failed: {e}{}",
+                        services::nginx::restore_note(restored)
+                    ),
                 ));
             }
         }
-        _ => {}
+        Ok(output) => {
+            let restored = restore_auth_include(&auth_file, previous_auth.as_deref());
+            return Err(api_err(
+                StatusCode::BAD_REQUEST,
+                &format!(
+                    "Nginx config test failed: {}{}",
+                    output.stderr,
+                    services::nginx::restore_note(restored)
+                ),
+            ));
+        }
+        Err(e) => {
+            let restored = restore_auth_include(&auth_file, previous_auth.as_deref());
+            return Err(api_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!(
+                    "Failed to test config: {e}{}",
+                    services::nginx::restore_note(restored)
+                ),
+            ));
+        }
     }
 
     tracing::info!("Password protection removed from {domain} path {path}");

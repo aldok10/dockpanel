@@ -404,7 +404,7 @@ that reads the source and fails if the fix is undone — including the shapes th
 are easy to undo by accident. The mail pins assert, among other things, that the
 sandbox was **not** widened to include `/etc/opendkim.conf`, since widening it
 would have "fixed" the bug while destroying the reason the bug was
-survivable. One-hundred-thirty-seven suites, **4545 assertions**, all green at the current commit:
+survivable. One-hundred-thirty-eight suites, **4571 assertions**, all green at the current commit:
 
 | Suite | Assertions |
 |---|---|
@@ -424,6 +424,7 @@ survivable. One-hundred-thirty-seven suites, **4545 assertions**, all green at t
 | `dns01-renewal-pin-e2e.sh` | 63 |
 | `acme-account-identity-pin-e2e.sh` | 20 |
 | `nginx-listen-pin-e2e.sh` | 17 |
+| `password-protect-pin-e2e.sh` | 26 |
 | `rpm-install-pin-e2e.sh` | 71 |
 | `mail-rpm-pin-e2e.sh` | 22 |
 | `cpu-metric-pin-e2e.sh` | 17 |
