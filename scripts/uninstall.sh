@@ -20,7 +20,7 @@ echo ""
 echo -e "${YELLOW}${BOLD}DockPanel Uninstaller${NC}"
 echo ""
 echo "This will remove:"
-echo "  - Agent and API binaries and systemd services"
+echo "  - Agent and API binaries and their services (systemd units or OpenRC runscripts)"
 echo "  - PostgreSQL container and data volume"
 echo "  - Nginx panel config"
 echo "  - Config directory (/etc/dockpanel)"
@@ -54,6 +54,30 @@ systemctl disable dockpanel-api 2>/dev/null || true
 rm -f /etc/systemd/system/dockpanel-api.service
 rm -f /usr/local/bin/dockpanel-api
 
+# The OpenRC equivalents. An Alpine install has runscripts, not units, and
+# leaving them behind would leave rc-service pointing at deleted binaries.
+if command -v rc-service &> /dev/null; then
+    for svc in dockpanel-agent dockpanel-api; do
+        if [ -x "/etc/init.d/$svc" ]; then
+            echo -e "${GREEN}[+]${NC} Removing OpenRC service: $svc"
+            rc-service "$svc" stop 2>/dev/null || true
+            # rc-update reads the runscript, so deregister before deleting it.
+            rc-update del "$svc" default 2>/dev/null || true
+            rm -f "/etc/init.d/$svc"
+        fi
+    done
+fi
+
+# The systemctl/journalctl shims setup.sh installs on non-systemd boxes. Only
+# ours are removed — a real systemctl lives in /usr/bin and is never touched.
+for shim in /usr/local/bin/systemctl /usr/local/bin/journalctl; do
+    if [ -f "$shim" ] && grep -q 'DockPanel' "$shim" 2>/dev/null; then
+        rm -f "$shim"
+    fi
+done
+
+rm -f /etc/periodic/daily/dockpanel-certbot-renew
+
 systemctl daemon-reload 2>/dev/null || true
 
 # Remove PostgreSQL container and volume
@@ -81,7 +105,11 @@ done
 echo -e "${GREEN}[+]${NC} Removing nginx config..."
 rm -f /etc/nginx/sites-enabled/dockpanel-panel.conf
 rm -f /etc/nginx/conf.d/dockpanel-panel.conf
-nginx -t > /dev/null 2>&1 && (nginx -s reload 2>/dev/null || systemctl reload nginx 2>/dev/null) || true
+# Alpine writes vhosts into http.d when the sites-enabled include could not be
+# placed; the parked default server is left parked (restoring it is a one-liner
+# and it may be wanted).
+rm -f /etc/nginx/http.d/dockpanel-panel.conf
+nginx -t > /dev/null 2>&1 && (nginx -s reload 2>/dev/null || systemctl reload nginx 2>/dev/null || rc-service nginx reload 2>/dev/null) || true
 
 # Remove CLI binary
 echo -e "${GREEN}[+]${NC} Removing CLI binary..."

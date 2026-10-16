@@ -38,8 +38,12 @@ elif command -v dnf &> /dev/null; then
 elif command -v yum &> /dev/null; then
     PKG_INSTALL="yum install -y"
     PKG_UPDATE="yum check-update || true"
+elif command -v apk &> /dev/null; then
+    # Alpine. `apk add` needs no -y and takes its index from `apk update`.
+    PKG_INSTALL="apk add"
+    PKG_UPDATE="apk update"
 else
-    echo -e "${RED}Error: No supported package manager found (apt/dnf/yum)${NC}"
+    echo -e "${RED}Error: No supported package manager found (apt/dnf/yum/apk)${NC}"
     exit 1
 fi
 
@@ -48,6 +52,14 @@ if ! command -v git &> /dev/null; then
     echo -e "${GREEN}[+]${NC} Installing git..."
     $PKG_UPDATE > /dev/null 2>&1
     $PKG_INSTALL git > /dev/null 2>&1
+fi
+
+# Alpine ships BusyBox ash, not bash, and everything below (setup.sh, the
+# update path, the shebangs) is bash. Nothing else in this bootstrap needs it,
+# which is exactly why it has to be here rather than somewhere later.
+if ! command -v bash &> /dev/null; then
+    echo -e "${GREEN}[+]${NC} Installing bash..."
+    $PKG_INSTALL bash > /dev/null 2>&1
 fi
 
 # Clone or update repo

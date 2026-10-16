@@ -38,6 +38,28 @@ if [ -z "${DOCKPANEL_UPDATE_DETACHED:-}" ] && command -v systemd-run >/dev/null 
     fi
 fi
 
+# ── Init system ───────────────────────────────────────────────────────────
+# setup.sh installs OpenRC runscripts plus a `systemctl` shim on a box that has
+# no systemd, so the calls below resolve through that shim and mean what they
+# mean on a systemd box. If neither is present yet — an upgrade onto a box that
+# never ran the new setup.sh, or a box with no service manager at all — a no-op
+# stand-in keeps `set -e` from turning "systemctl: not found" into an aborted
+# update on the first call. The panel keeps running; only the service actions
+# are skipped, and the message says so rather than failing silently.
+INIT_MGR="systemd"
+if ! command -v systemctl > /dev/null 2>&1; then
+    if command -v rc-service > /dev/null 2>&1; then
+        INIT_MGR="openrc"
+    else
+        INIT_MGR="none"
+        echo "[!] No service manager here (no systemd, no OpenRC) — service actions"
+        echo "    are skipped. Start the panel by hand once this update finishes:"
+        echo "      /usr/local/bin/dockpanel-agent &"
+        echo "      set -a; . /etc/dockpanel/api.env; set +a; /usr/local/bin/dockpanel-api &"
+        systemctl() { return 0; }
+    fi
+fi
+
 # ── The verdict file ──────────────────────────────────────────────────────
 # Why this exists (F1, s231→s282): the panel orchestrator spawns this script and
 # waits on the child. But the block above `exec systemd-run`s without `--wait`,

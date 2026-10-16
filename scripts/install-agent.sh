@@ -97,8 +97,13 @@ NR_EOF
         PKG_MGR="dnf"
     elif command -v yum &> /dev/null; then
         PKG_MGR="yum"
+    elif command -v apk &> /dev/null; then
+        # Alpine. bash/shadow ride along for the same reason setup.sh installs
+        # them: BusyBox ash cannot run the update path, and BusyBox has adduser
+        # but not the useradd/usermod the agent shells out to.
+        PKG_MGR="apk"
     else
-        echo "Error: No supported package manager found (apt/dnf/yum)"
+        echo "Error: No supported package manager found (apt/dnf/yum/apk)"
         exit 1
     fi
 }
@@ -111,8 +116,21 @@ pkg_install() {
             ;;
         dnf) dnf install -y -q "$@" > /dev/null 2>&1 ;;
         yum) yum install -y -q "$@" > /dev/null 2>&1 ;;
+        apk) apk add "$@" > /dev/null 2>&1 ;;
     esac
 }
+
+# Which manager runs services on this box: systemd, OpenRC, or neither.
+# The agent is installed as a service either way, and the systemctl shim below
+# is what lets the agent's own systemctl calls work on an OpenRC box.
+INIT_MGR="systemd"
+if ! command -v systemctl > /dev/null 2>&1; then
+    if command -v rc-service > /dev/null 2>&1 && command -v rc-update > /dev/null 2>&1; then
+        INIT_MGR="openrc"
+    else
+        INIT_MGR="none"
+    fi
+fi
 
 # Install dependencies
 echo "[2/7] Installing dependencies..."
@@ -150,11 +168,22 @@ REPOEOF
                 docker-buildx-plugin docker-compose-plugin
             ;;
         *)
-            curl -fsSL https://get.docker.com | sh > /dev/null 2>&1
+            if [ "$PKG_MGR" = "apk" ]; then
+                # get.docker.com has no Alpine support and there is no
+                # docker-ce repo for it: the packages come from community.
+                pkg_install docker docker-cli-compose
+            else
+                curl -fsSL https://get.docker.com | sh > /dev/null 2>&1
+            fi
             ;;
     esac
 fi
-systemctl enable --now docker > /dev/null 2>&1 || true
+if [ "$INIT_MGR" = "systemd" ]; then
+    systemctl enable --now docker > /dev/null 2>&1 || true
+else
+    rc-update add docker default > /dev/null 2>&1 || true
+    rc-service docker start > /dev/null 2>&1 || true
+fi
 
 # Say so, rather than dying at "[2/7] Installing dependencies..." with every
 # stream sent to /dev/null. That is exactly how the RHEL failure above stayed
@@ -175,6 +204,12 @@ fi
 # and failed from another with no difference the operator could see. Issue #93.
 pkg_install curl openssl sshpass
 
+# Alpine ships BusyBox ash only, and this script is bash (arrays, [[ ]],
+# case-in-string). Nothing below works without it.
+if [ "$PKG_MGR" = "apk" ] && ! command -v bash &> /dev/null; then
+    pkg_install bash
+fi
+
 # Create directories
 echo "[3/7] Creating directories..."
 mkdir -p /etc/dockpanel/ssl
@@ -184,6 +219,10 @@ mkdir -p /var/backups/dockpanel
 mkdir -p /var/lib/dockpanel/git
 
 # Ensure socket directory persists across reboots
+# mkdir -p first: /etc/tmpfiles.d is a systemd path and does not exist on an
+# OpenRC box, where writing it would fail the whole script under `set -e` for a
+# file nothing reads. The runscript written below recreates the directory.
+mkdir -p /etc/tmpfiles.d
 echo "d /run/dockpanel 0755 root root -" > /etc/tmpfiles.d/dockpanel.conf
 
 # Save agent token and server ID
@@ -289,7 +328,7 @@ fi
 # binds the agent socket and never returns. Without the bound, this installer
 # hangs for ever at "[7/7]" against an older release instead of refusing, which
 # is what it did when first driven on a real box (s271).
-echo "[7/7] Installing systemd service..."
+echo "[7/7] Installing service ($INIT_MGR)..."
 if ! timeout 15 /usr/local/bin/dockpanel-agent --print-unit > /tmp/dockpanel-agent.service.$$ 2>/dev/null \
    || ! grep -q '^ExecStart=/usr/local/bin/dockpanel-agent' /tmp/dockpanel-agent.service.$$; then
     rm -f /tmp/dockpanel-agent.service.$$
@@ -319,6 +358,155 @@ for d in $AGENT_RWP; do
     [ -d "$d" ] || mkdir -p "$d" 2>/dev/null || true
 done
 
+# On a box with no systemd the unit above is inert — OpenRC reads
+# /etc/init.d runscripts — and the agent's OWN service calls (`systemctl restart
+# nginx`, reload PHP-FPM, is-active checks, the diagnostics page) fail with
+# ENOENT, because that is the name the Rust code calls. So an OpenRC member gets
+# a runscript here and a systemctl shim in /usr/local/bin.
+#
+# The unit file is still written (and still fetched from the binary): its
+# ReadWritePaths list above is the single source of truth for which directories
+# must exist, and that list is worth having even where nothing reads the unit.
+if [ "$INIT_MGR" != "systemd" ]; then
+    cat > /etc/init.d/dockpanel-agent << 'AGENTEOF'
+#!/sbin/openrc-run
+# Managed by DockPanel — written by scripts/install-agent.sh.
+name="dockpanel-agent"
+description="DockPanel Agent"
+
+command="/usr/local/bin/dockpanel-agent"
+supervisor="supervise-daemon"
+respawn_delay=5
+respawn_max=0
+pidfile="/run/dockpanel-agent.pid"
+output_log="/var/log/dockpanel-agent.log"
+error_log="/var/log/dockpanel-agent.log"
+
+depend() {
+    need net
+    use dns docker nginx
+}
+
+start_pre() {
+    # The agent resolves `systemctl` from PATH; that name is the shim below.
+    export PATH="/usr/local/sbin:/usr/local/bin:$PATH"
+    mkdir -p /run/dockpanel /var/lib/dockpanel/git
+    if [ -r /etc/dockpanel/agent.env ]; then
+        set -a
+        . /etc/dockpanel/agent.env
+        set +a
+    fi
+    export RUST_LOG="${RUST_LOG:-info}"
+}
+
+start_post() {
+    sleep 1
+    chgrp nginx /var/run/dockpanel/agent.sock 2>/dev/null
+    chmod 660 /var/run/dockpanel/agent.sock 2>/dev/null
+    return 0
+}
+AGENTEOF
+    chmod 755 /etc/init.d/dockpanel-agent
+    touch /var/log/dockpanel-agent.log
+    chmod 640 /var/log/dockpanel-agent.log
+
+    if [ ! -e /usr/local/bin/systemctl ]; then
+        cat > /usr/local/bin/systemctl << 'SHIMEOF'
+#!/bin/sh
+# DockPanel systemctl shim for OpenRC — installed by scripts/install-agent.sh.
+# Translates the systemctl verbs the agent uses onto rc-service/rc-update. Not a
+# systemd implementation: unit files are not read and `show -p …` answers from a
+# fixed table. scripts/setup.sh installs the same shim on a panel box.
+set -u
+[ $# -eq 0 ] && exit 1
+verb="$1"; shift
+
+translate() {
+    case "$1" in
+        php[0-9]*-fpm)
+            v=$(printf '%s' "$1" | sed -n 's/^php\([0-9]*\)\.\([0-9]*\)-fpm$/\1\2/p')
+            if [ -n "$v" ] && [ -x "/etc/init.d/php-fpm$v" ]; then printf 'php-fpm%s' "$v"; return; fi
+            for s in /etc/init.d/php-fpm*; do [ -x "$s" ] && { basename "$s"; return; }; done
+            printf '%s' "$1"
+            ;;
+        *.service) printf '%s' "${1%.service}" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+now=0; value_only=0; prop=""; svcs=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --now) now=1 ;;
+        --value) value_only=1 ;;
+        -p|--property) shift; prop="${1:-}" ;;
+        --quiet|-q|--no-pager|--full|--force|-f) : ;;
+        --*) : ;;
+        *) svcs="$svcs $1" ;;
+    esac
+    shift
+done
+
+rc=0
+for one in $svcs; do
+    s=$(translate "$one")
+    case "$verb" in
+        start)    rc-service "$s" start || rc=$? ;;
+        stop)     rc-service "$s" stop || rc=$? ;;
+        restart)  rc-service "$s" restart || rc=$? ;;
+        reload|try-reload-or-restart)
+                  rc-service "$s" reload 2>/dev/null || rc-service "$s" restart || rc=$? ;;
+        enable)   rc-update add "$s" default || rc=$? ;;
+        disable)  rc-update del "$s" default 2>/dev/null || true ;;
+        is-active)
+                  if rc-service "$s" status > /dev/null 2>&1; then echo active; else echo inactive; rc=3; fi ;;
+        is-enabled)
+                  if [ -e "/etc/runlevels/default/$s" ]; then echo enabled; else echo disabled; rc=1; fi ;;
+        status)   rc-service "$s" status || rc=$? ;;
+        show)
+                  if [ "$prop" = "LoadError" ]; then
+                      [ "$value_only" = "1" ] && : || echo "LoadError="
+                  else
+                      [ "$value_only" = "1" ] && : || echo "Id=$s"
+                  fi ;;
+        list-unit-files|list-units|daemon-reload|reset-failed|kill|mask|unmask) : ;;
+        *) echo "systemctl (DockPanel OpenRC shim): unsupported verb '$verb'" >&2; exit 1 ;;
+    esac
+done
+
+if [ "$verb" = "enable" ] && [ "$now" = "1" ]; then
+    for one in $svcs; do
+        rc-service "$(translate "$one")" start > /dev/null 2>&1 || true
+    done
+fi
+
+exit $rc
+SHIMEOF
+        chmod 755 /usr/local/bin/systemctl
+    fi
+
+    if [ ! -e /usr/local/bin/journalctl ]; then
+        cat > /usr/local/bin/journalctl << 'JEOF'
+#!/bin/sh
+# DockPanel journalctl shim for OpenRC — prints the tail of the agent's log.
+set -u
+n=20
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -n|--lines) shift; n="${1:-20}" ;;
+        *) : ;;
+    esac
+    shift
+done
+[ -r /var/log/dockpanel-agent.log ] && tail -n "$n" /var/log/dockpanel-agent.log
+exit 0
+JEOF
+        chmod 755 /usr/local/bin/journalctl
+    fi
+
+    echo "  OpenRC service + systemctl shim installed"
+fi
+
 # Allow agent port through firewall. Check what is ACTUALLY ENFORCING first
 # (firewall-cmd --state, not just "is the binary installed") — the same
 # split setup.sh's detect_firewall() already guards against (s265): a box can
@@ -332,30 +520,50 @@ elif command -v ufw &> /dev/null; then
     ufw allow ${AGENT_PORT}/tcp > /dev/null 2>&1 || true
 fi
 
-# Start agent. "The command ran" is not the success condition — "the unit is
+# Start agent. "The command ran" is not the success condition — "the service is
 # active" is. install_powerdns ended in `let _ = systemctl restart` and hid three
 # separate bugs behind that silence for two releases (lesson #45), so this
-# installer polls and shows the failing journal line rather than printing a
-# success banner over a crash loop. `activating` is tolerated because a unit
-# with Restart=always can be caught mid-cycle by a single probe.
-systemctl daemon-reload
-systemctl enable dockpanel-agent >/dev/null 2>&1 || true
-systemctl start dockpanel-agent || true
+# installer polls and shows the failing log line rather than printing a success
+# banner over a crash loop. A service caught mid-restart is tolerated, because a
+# restarting service reports no state for a moment either way.
+if [ "$INIT_MGR" = "systemd" ]; then
+    systemctl daemon-reload
+    systemctl enable dockpanel-agent >/dev/null 2>&1 || true
+    systemctl start dockpanel-agent || true
 
-AGENT_OK=0
-for _ in $(seq 1 15); do
-    STATE=$(systemctl is-active dockpanel-agent 2>/dev/null || true)
-    if [[ "$STATE" == "active" ]]; then AGENT_OK=1; break; fi
-    [[ "$STATE" == "failed" ]] && break
-    sleep 1
-done
+    AGENT_OK=0
+    for _ in $(seq 1 15); do
+        STATE=$(systemctl is-active dockpanel-agent 2>/dev/null || true)
+        if [[ "$STATE" == "active" ]]; then AGENT_OK=1; break; fi
+        [[ "$STATE" == "failed" ]] && break
+        sleep 1
+    done
 
-if [[ "$AGENT_OK" != "1" ]]; then
-    echo ""
-    echo "Error: dockpanel-agent did not start (systemctl is-active: $(systemctl is-active dockpanel-agent 2>/dev/null || echo unknown))"
-    echo "Last journal lines:"
-    journalctl -u dockpanel-agent -n 15 --no-pager 2>/dev/null || true
-    exit 1
+    if [[ "$AGENT_OK" != "1" ]]; then
+        echo ""
+        echo "Error: dockpanel-agent did not start (systemctl is-active: $(systemctl is-active dockpanel-agent 2>/dev/null || echo unknown))"
+        echo "Last journal lines:"
+        journalctl -u dockpanel-agent -n 15 --no-pager 2>/dev/null || true
+        exit 1
+    fi
+else
+    rc-update add dockpanel-agent default >/dev/null 2>&1 || true
+    rc-service dockpanel-agent restart >/dev/null 2>&1 \
+        || rc-service dockpanel-agent start >/dev/null 2>&1 || true
+
+    AGENT_OK=0
+    for _ in $(seq 1 15); do
+        if rc-service dockpanel-agent status >/dev/null 2>&1; then AGENT_OK=1; break; fi
+        sleep 1
+    done
+
+    if [[ "$AGENT_OK" != "1" ]]; then
+        echo ""
+        echo "Error: dockpanel-agent did not start (rc-service dockpanel-agent status: stopped)"
+        echo "Last log lines (/var/log/dockpanel-agent.log):"
+        tail -n 15 /var/log/dockpanel-agent.log 2>/dev/null || true
+        exit 1
+    fi
 fi
 
 echo ""

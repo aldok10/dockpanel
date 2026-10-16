@@ -2,22 +2,29 @@
 #
 # DockPanel Setup
 # Installs DockPanel on a fresh server.
-# Supports: Ubuntu 20+, Debian 11+, CentOS 9+, Rocky 9+, Fedora 39+, Amazon Linux 2023
+# Supports: Ubuntu 20+, Debian 11+, CentOS 9+, Rocky 9+, Fedora 39+, Amazon Linux 2023,
+#           Alpine 3.19+ (OpenRC and apk instead of systemd and apt)
 # Architectures: x86_64, ARM64 (aarch64)
 #
 # Architecture:
 #   - PostgreSQL 16 (Docker container on port 5450)
-#   - Agent (Rust binary, systemd, Unix socket)
-#   - API (Rust binary, systemd, port 3080)
+#   - Agent (Rust binary, service-managed, Unix socket)
+#   - API (Rust binary, service-managed, port 3080)
 #   - CLI (Rust binary, /usr/local/bin/dockpanel)
 #   - Frontend (Vite build, served by nginx)
 #   - Nginx (reverse proxy + static files)
+#
+# Service manager: systemd where present, OpenRC on Alpine. Both are driven
+# through the svc_* helpers below, so nothing here names one of them directly.
+# Where there is neither, the panel is installed and the commands to run it by
+# hand are printed instead of a service that silently never starts.
 #
 # Usage:
 #   bash scripts/setup.sh                         # Interactive (asks for domain)
 #   PANEL_DOMAIN=panel.example.com bash scripts/setup.sh  # Non-interactive with domain
 #   INSTALL_FROM_RELEASE=1 bash scripts/setup.sh  # Download pre-built binaries
 #   PANEL_PORT=9090 bash scripts/setup.sh         # Custom port (no domain)
+#   DOCKPANEL_SKIP_FIREWALL=1 bash scripts/setup.sh  # Leave the firewall alone
 #
 set -euo pipefail
 
@@ -174,6 +181,112 @@ SVC_FAIL=()
 svc_ok()   { SVC_OK+=("$1"); }
 svc_fail() { SVC_FAIL+=("$1"); }
 
+# ── Init system ──────────────────────────────────────────────────────────
+# Two things about the box used to be taken for granted here: that a service is
+# started with systemctl, and that the package manager is apt/dnf/yum. Alpine is
+# neither — it installs with apk and boots with OpenRC — so this block detects
+# what the box actually has and every call site below goes through the svc_*
+# helpers rather than naming one init system. setup.sh fits the panel to the box
+# instead of assuming the box.
+#
+#   systemd — units in /etc/systemd/system, driven by systemctl
+#   openrc  — runscripts in /etc/init.d, driven by rc-service/rc-update
+#   none    — no service manager reachable (bare container, chroot). Everything
+#             is installed and the exact commands to run the panel by hand are
+#             printed at the end, rather than a "success" over three services
+#             that were never started.
+detect_init() {
+    if command -v systemctl > /dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        INIT="systemd"
+    elif command -v rc-service > /dev/null 2>&1 && command -v rc-update > /dev/null 2>&1; then
+        INIT="openrc"
+    else
+        INIT="none"
+    fi
+}
+
+# Debian's php8.4-fpm is Alpine's php-fpm84. The agent asks for the Debian
+# spelling by name (services/nginx.rs builds `php{version}-fpm`), so the mapping
+# has to happen somewhere — here, and in the systemctl shim written by
+# create_services, which is the copy the agent actually reaches.
+alpine_service_name() {
+    local v
+    v=$(printf '%s' "$1" | sed -n 's/^php\([0-9]*\)\.\([0-9]*\)-fpm$/\1\2/p')
+    if [ -n "$v" ]; then printf 'php-fpm%s' "$v"; else printf '%s' "$1"; fi
+}
+
+# The name this init system knows a service by.
+service_name_for() {
+    if [ "$INIT" = "openrc" ]; then alpine_service_name "$1"; else printf '%s' "$1"; fi
+}
+
+svc_start() {
+    case "$INIT" in
+        systemd) systemctl start "$@" ;;
+        openrc)  local s; for s in "$@"; do rc-service "$s" start; done ;;
+        *)       return 1 ;;
+    esac
+}
+
+svc_stop() {
+    case "$INIT" in
+        systemd) systemctl stop "$@" ;;
+        openrc)  local s; for s in "$@"; do rc-service "$s" stop; done ;;
+        *)       return 1 ;;
+    esac
+}
+
+svc_restart() {
+    case "$INIT" in
+        systemd) systemctl restart "$@" ;;
+        openrc)  local s; for s in "$@"; do rc-service "$s" restart; done ;;
+        *)       return 1 ;;
+    esac
+}
+
+# reload when the runscript can, restart when it cannot. OpenRC runscripts only
+# support reload if they define the function; rc-service says so by failing.
+svc_reload() {
+    case "$INIT" in
+        systemd) systemctl reload "$@" ;;
+        openrc)  local s; for s in "$@"; do rc-service "$s" reload 2>/dev/null || rc-service "$s" restart; done ;;
+        *)       return 1 ;;
+    esac
+}
+
+svc_enable() {
+    case "$INIT" in
+        systemd) systemctl enable "$@" ;;
+        openrc)  local s; for s in "$@"; do rc-update add "$s" default; done ;;
+        *)       return 1 ;;
+    esac
+}
+
+svc_disable() {
+    case "$INIT" in
+        systemd) systemctl disable "$@" ;;
+        openrc)  local s; for s in "$@"; do rc-update del "$s" default 2>/dev/null || true; done ;;
+        *)       return 1 ;;
+    esac
+}
+
+# enable + start, best-effort: a missing runscript must not abort an install
+# that is otherwise fine.
+svc_enable_now() {
+    svc_enable "$@" > /dev/null 2>&1 || true
+    svc_start "$@" > /dev/null 2>&1 || true
+}
+
+# Prints the same vocabulary systemctl does (active/inactive/failed/activating)
+# because callers below branch on those words, not on an exit code.
+svc_is_active() {
+    case "$INIT" in
+        systemd) systemctl is-active "$1" 2>/dev/null || true ;;
+        openrc)  if rc-service "$1" status > /dev/null 2>&1; then echo active; else echo inactive; fi ;;
+        *)       echo inactive ;;
+    esac
+}
+
 # Wait for a unit to come up, and do not confuse "not running" with "could not ask".
 #
 # `systemctl is-active` answers three different questions with two exit codes.
@@ -193,15 +306,16 @@ svc_fail() { SVC_FAIL+=("$1"); }
 # treated as "not yet" and retried inside a bounded window.
 wait_for_unit() {
     local unit="$1" tries="${2:-20}" state
+    unit="$(service_name_for "$unit")"
     for _ in $(seq 1 "$tries"); do
-        state=$(systemctl is-active "$unit" 2>/dev/null || true)
+        state=$(svc_is_active "$unit")
         case "$state" in
             active) return 0 ;;
             failed) return 1 ;;
             *)      sleep 1 ;;
         esac
     done
-    [ "$(systemctl is-active "$unit" 2>/dev/null || true)" = "active" ]
+    [ "$(svc_is_active "$unit")" = "active" ]
 }
 
 join_comma() {
@@ -318,8 +432,12 @@ APT_EOF
         PKG_MGR="dnf"
     elif command -v yum &> /dev/null; then
         PKG_MGR="yum"
+    elif command -v apk &> /dev/null; then
+        # Alpine. `apk add` is already non-interactive (no -y flag exists) and
+        # the index refresh is a separate command that pkg_update runs.
+        PKG_MGR="apk"
     else
-        error "No supported package manager found (apt/dnf/yum)"
+        error "No supported package manager found (apt/dnf/yum/apk)"
         exit 1
     fi
 }
@@ -332,6 +450,7 @@ pkg_install() {
         apt) apt-get install -y "$@" ;;
         dnf) dnf install -y "$@" ;;
         yum) yum install -y "$@" ;;
+        apk) apk add "$@" ;;
     esac
 }
 
@@ -340,7 +459,18 @@ pkg_update() {
         apt) apt-get update -y ;;
         dnf) dnf check-update || true ;;
         yum) yum check-update || true ;;
+        apk) apk update ;;
     esac
+}
+
+# True when the apk index knows this package. The Alpine counterpart of
+# apt_has_candidate, and needed for the same reason: `apk add` fails the WHOLE
+# transaction on one unknown name, so the optional extras (PHP extensions that
+# a given PHP version folds into core) have to be filtered before they are
+# handed to it. `apk search -x` matches the exact name only; `-q` drops the
+# version suffix.
+apk_has_pkg() {
+    apk search -xq "$1" > /dev/null 2>&1
 }
 
 # ── Firewall ─────────────────────────────────────────────────────────────
@@ -475,6 +605,9 @@ detect_os() {
         amzn)
             log "Detected: $PRETTY_NAME (Amazon Linux)"
             ;;
+        alpine)
+            log "Detected: $PRETTY_NAME (Alpine — apk + OpenRC)"
+            ;;
         *)
             warn "Untested OS: ${ID:-unknown} — proceeding anyway"
             ;;
@@ -529,7 +662,7 @@ install_dependencies() {
     # installer died on "nothing provides …" — while a name-availability probe
     # said all four packages were available, which is how the product came to
     # claim the packages resolved here.
-    if [ "$PKG_MGR" != "apt" ]; then
+    if [ "$PKG_MGR" = "dnf" ] || [ "$PKG_MGR" = "yum" ]; then
         run "Enabling EPEL repository" pkg_install epel-release || true
         # The repo id is `crb` on EL9+/Rocky/Alma and `powertools` on EL8.
         # Try both; neither existing is not fatal on its own.
@@ -551,6 +684,23 @@ install_dependencies() {
         # gnupg + lsb-release only exist/matter on Debian-based
         run "Installing base packages (${BASE_PKGS}, gnupg, lsb-release)" \
             pkg_install curl openssl ca-certificates openssh-client gnupg lsb-release
+    elif [ "$PKG_MGR" = "apk" ]; then
+        # Alpine's names, plus four packages that are load-bearing on this
+        # distro specifically rather than nice-to-have:
+        #
+        #   bash   — Alpine ships BusyBox ash. Every script here (and the
+        #            update path the panel runs) is bash, and the shebang is
+        #            #!/usr/bin/env bash.
+        #   shadow — provides useradd/usermod/groupadd. BusyBox has adduser but
+        #            NOT the names the agent shells out to when it creates a
+        #            site's system user.
+        #   grep   — GNU grep. BusyBox grep has no -P, and the vhost/IP probes
+        #            in this file used to depend on it (they no longer do, but
+        #            the agent and operator muscle memory still reach for it).
+        #   iproute2 — BusyBox `ip` has no `route get`, which is how the
+        #            interface IP for a domain-bound vhost is found.
+        run "Installing base packages (${BASE_PKGS}, bash, shadow, grep, iproute2)" \
+            pkg_install curl openssl ca-certificates openssh-client gnupg bash shadow grep iproute2
     else
         # RHEL-family names the ssh client package openssh-clients (plural).
         run "Installing base packages (${BASE_PKGS})" \
@@ -578,6 +728,10 @@ install_dependencies() {
         if [ "$PKG_MGR" = "apt" ]; then
             run "Installing build tools (build-essential, cmake, pkg-config, libssl-dev)" \
                 pkg_install build-essential cmake pkg-config libssl-dev
+        elif [ "$PKG_MGR" = "apk" ]; then
+            # build-base is Alpine's build-essential (gcc, g++, make, libc-dev).
+            run "Installing build tools (build-base, cmake, pkgconf, openssl-dev)" \
+                pkg_install build-base cmake pkgconf openssl-dev
         else
             run "Installing build tools (gcc, cmake, make, pkg-config, openssl-devel)" \
                 pkg_install gcc gcc-c++ cmake make pkg-config openssl-devel
@@ -633,12 +787,23 @@ install_docker() {
                 run "Installing Docker (docker-ce, el-clone repo)" \
                     bash -c 'dnf install -y --allowerasing docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin'
                 ;;
+            alpine)
+                # get.docker.com does not support Alpine at all, and there is no
+                # docker-ce repo for it: the packages come from the community
+                # repo. `docker` pulls the engine + CLI, `docker-cli-compose`
+                # is the compose v2 plugin (Alpine has no apt-style
+                # docker-compose-plugin), and docker-openrc — which carries the
+                # /etc/init.d/docker runscript this install then starts —
+                # arrives by install_if, as nginx-openrc does.
+                run "Installing Docker (apk: docker, docker-cli-compose)" \
+                    pkg_install docker docker-cli-compose
+                ;;
             *)
                 run "Installing Docker (get.docker.com — takes a minute)" \
                     bash -c 'curl -fsSL https://get.docker.com | sh'
                 ;;
         esac
-        systemctl enable --now docker > /dev/null 2>&1
+        svc_enable_now docker
         if ! command -v docker &> /dev/null; then
             error "Docker installation failed — see $INSTALL_LOG"
             exit 1
@@ -657,13 +822,20 @@ install_nginx() {
         log "Nginx already installed"
     else
         run "Installing Nginx" pkg_install nginx
-        systemctl enable --now nginx > /dev/null 2>&1
         if ! command -v nginx &> /dev/null; then
             error "Nginx installation failed — see $INSTALL_LOG"
             exit 1
         fi
         log "Nginx installed"
     fi
+
+    # Enable + start whether or not the install was ours, and NOT inside the else
+    # above: Debian's nginx package starts and enables itself, so a box that
+    # already had nginx was assumed to have it running. Alpine's arrives
+    # DISABLED with nothing having started it, which would leave the panel
+    # installed and unreachable on the very boxes this supports.
+    svc_enable_now nginx
+
     local nv
     nv=$(nginx -v 2>&1 | sed -n 's|^nginx version: nginx/\([0-9.]*\).*|\1|p')
     svc_ok "Nginx${nv:+ $nv}"
@@ -685,7 +857,13 @@ install_node() {
         # failed nodesource curl pipes nothing into `bash -` (which exits 0),
         # the `&&` then installs the distro's much-older Node, and the build
         # later dies cryptically. With pipefail the curl failure aborts here.
-        if [ "$PKG_MGR" = "apt" ]; then
+        if [ "$PKG_MGR" = "apk" ]; then
+            # NodeSource publishes deb and rpm only — nothing for Alpine. The
+            # distro's own nodejs is current enough to build the frontend with
+            # (Alpine 3.22 ships 22.x, well past the Vite requirement), and it
+            # is the only option that does not involve a third-party repo.
+            run "Installing Node.js (apk: nodejs, npm)" pkg_install nodejs npm
+        elif [ "$PKG_MGR" = "apt" ]; then
             run "Installing Node.js 20 LTS (nodesource)" \
                 bash -c 'set -o pipefail; curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && apt-get install -y nodejs'
         else
@@ -710,8 +888,16 @@ create_directories() {
     mkdir -p /var/backups/dockpanel
     mkdir -p /var/www/acme
 
-    # Ensure socket directory persists across tmpfiles cleanup/reboot
-    echo "d /run/dockpanel 0755 root root -" > /etc/tmpfiles.d/dockpanel.conf
+    # Ensure socket directory persists across tmpfiles cleanup/reboot.
+    #
+    # tmpfiles.d is a systemd mechanism: on an OpenRC box nothing reads it and
+    # /etc/tmpfiles.d may not exist at all, so writing it there would be a
+    # failure that means nothing. On OpenRC the directory is recreated by the
+    # init script written in create_services, which is the equivalent guarantee.
+    if [ "$INIT" = "systemd" ]; then
+        mkdir -p /etc/tmpfiles.d
+        echo "d /run/dockpanel 0755 root root -" > /etc/tmpfiles.d/dockpanel.conf
+    fi
 
     # Create all directories required by the agent unit's ReadWritePaths, DERIVED
     # FROM THE UNIT rather than hand-mirrored here.
@@ -734,7 +920,14 @@ create_directories() {
     _rwp="$(agent_rwp_dirs)"
     [ -n "$_rwp" ] && mkdir -p $_rwp
     # Paths the agent reaches through an escape hatch or that are not RWP entries.
-    mkdir -p /run/opendkim /var/lib/nginx /var/lib/dpkg /var/cache/apt /var/lib/apt
+    mkdir -p /run/opendkim /var/lib/nginx
+    # The panel's own package operations (and the agent unit's ReadWritePaths
+    # list) name the state directories of whichever package manager this box
+    # has, so create that family's and not the other's.
+    case "$PKG_MGR" in
+        apt) mkdir -p /var/lib/dpkg /var/cache/apt /var/lib/apt ;;
+        apk) mkdir -p /etc/apk /lib/apk/db /var/cache/apk ;;
+    esac
     mkdir -p /var/lib/dockpanel/git /var/lib/dockpanel/recordings /var/cache/nginx/fastcgi
     touch /etc/opendkim.conf /run/nginx.pid 2>/dev/null || true
 
@@ -1060,10 +1253,8 @@ download_binaries() {
     # Stop running services before overwriting their binaries. Re-running the
     # installer with services active causes `curl -o` to fail with "Text file
     # busy" (exit 23) because Linux refuses to overwrite a running executable.
-    # systemctl stop is a no-op if the unit is inactive or missing.
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl stop dockpanel-api dockpanel-agent 2>/dev/null || true
-    fi
+    # Stopping is a no-op if the service is inactive or missing.
+    svc_stop dockpanel-api dockpanel-agent || true
 
     fetch_asset "dockpanel-agent-linux-${DL_ARCH}" "$AGENT_BIN"
     chmod +x "$AGENT_BIN"
@@ -1137,9 +1328,7 @@ build_binaries() {
 
     # Stop running services so cp can overwrite their binaries (see note in
     # download_binaries — same "Text file busy" trap).
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl stop dockpanel-api dockpanel-agent 2>/dev/null || true
-    fi
+    svc_stop dockpanel-api dockpanel-agent || true
 
     # Build agent
     log "Building agent..."
@@ -1196,10 +1385,89 @@ build_frontend() {
     log "Frontend built at $FRONTEND_DIR/dist/"
 }
 
-# ── Systemd Services ─────────────────────────────────────────────────────
+# ── Services ─────────────────────────────────────────────────────────────
+# The panel is two long-running processes (agent, API) and, on systemd only, an
+# opt-in MCP server. Which service manager this box has decides how they are
+# defined and started — see detect_init. Nothing in here names systemctl
+# directly any more: the svc_* helpers above dispatch.
 create_services() {
-    header "Systemd Services"
+    header "Services"
 
+    # The API environment, written before any service definition refers to it.
+    # Agent: no file needed on a panel box (EnvironmentFile=- in the unit, i.e.
+    # "read if it exists"); that prefix is what lets one definition serve both a
+    # panel box and a fleet member.
+    local API_BASE_URL=""
+    if [ -n "$PANEL_DOMAIN" ]; then
+        API_BASE_URL="https://${PANEL_DOMAIN}"
+    fi
+
+    cat > "$CONFIG_DIR/api.env" << EOF
+DATABASE_URL=postgresql://dockpanel:${DB_PASSWORD}@127.0.0.1:${DB_PORT}/dockpanel
+JWT_SECRET=${JWT_SECRET}
+AGENT_SOCKET=/var/run/dockpanel/agent.sock
+AGENT_TOKEN=${AGENT_TOKEN}
+LISTEN_ADDR=127.0.0.1:3080
+BASE_URL=${API_BASE_URL}
+EOF
+    chmod 600 "$CONFIG_DIR/api.env"
+
+    case "$INIT" in
+        systemd) install_systemd_units ;;
+        openrc)  install_openrc_services ;;
+        *)       install_no_service_manager; return 0 ;;
+    esac
+
+    # Start agent. Enable/stop are best-effort so a re-run over a running panel
+    # converges rather than tripping over an already-stopped service.
+    svc_enable dockpanel-agent > /dev/null 2>&1 || true
+    svc_stop dockpanel-agent > /dev/null 2>&1 || true
+    svc_start dockpanel-agent > /dev/null 2>&1 || true
+
+    if wait_for_unit dockpanel-agent; then
+        log "Agent service running"
+    else
+        error "Agent failed to start"
+        service_logs dockpanel-agent
+        exit 1
+    fi
+
+    # Start API
+    svc_enable dockpanel-api > /dev/null 2>&1 || true
+    svc_stop dockpanel-api > /dev/null 2>&1 || true
+    svc_start dockpanel-api > /dev/null 2>&1 || true
+
+    if wait_for_unit dockpanel-api; then
+        log "API service running"
+    else
+        error "API failed to start"
+        service_logs dockpanel-api
+        exit 1
+    fi
+}
+
+# Last lines of a service's own log, whichever manager keeps them.
+service_logs() {
+    case "$INIT" in
+        systemd)
+            journalctl -u "$1" --no-pager -n 10 2>/dev/null || true
+            ;;
+        openrc)
+            local log="/var/log/${1}.log"
+            if [ -s "$log" ]; then
+                tail -n 10 "$log" 2>/dev/null || true
+            else
+                echo "  (no log at ${log} yet — check rc-service $1 status)"
+            fi
+            ;;
+        *)
+            echo "  (no service manager on this box — see the manual start commands in the summary)"
+            ;;
+    esac
+    return 0
+}
+
+install_systemd_units() {
     # Agent service — deploy from repo (single source of truth: panel/agent/dockpanel-agent.service)
     cp "$AGENT_SRC/dockpanel-agent.service" /etc/systemd/system/dockpanel-agent.service
     chmod 644 /etc/systemd/system/dockpanel-agent.service
@@ -1245,47 +1513,281 @@ LimitNOFILE=65535
 WantedBy=multi-user.target
 EOF
 
-    # API environment — determine BASE_URL from domain or leave empty for IP access
-    local API_BASE_URL=""
-    if [ -n "$PANEL_DOMAIN" ]; then
-        API_BASE_URL="https://${PANEL_DOMAIN}"
-    fi
-
-    cat > "$CONFIG_DIR/api.env" << EOF
-DATABASE_URL=postgresql://dockpanel:${DB_PASSWORD}@127.0.0.1:${DB_PORT}/dockpanel
-JWT_SECRET=${JWT_SECRET}
-AGENT_SOCKET=/var/run/dockpanel/agent.sock
-AGENT_TOKEN=${AGENT_TOKEN}
-LISTEN_ADDR=127.0.0.1:3080
-BASE_URL=${API_BASE_URL}
-EOF
-    chmod 600 "$CONFIG_DIR/api.env"
-
     systemctl daemon-reload
+}
 
-    # Start agent
-    systemctl enable dockpanel-agent > /dev/null 2>&1
-    systemctl restart dockpanel-agent
+# OpenRC services for Alpine (and any other box without systemd).
+#
+# The systemd units are NOT reused: OpenRC reads /etc/init.d runscripts, and a
+# .service file is inert there. What is mirrored is the behaviour that matters —
+# start, restart on failure, environment (api.env / agent.env), the socket's
+# group and mode, and the log destination — so `rc-service dockpanel-api
+# status` and `tail /var/log/dockpanel-api.log` mean what `systemctl status`
+# and `journalctl -u` mean on a systemd box.
+#
+# supervise-daemon is OpenRC's own restarter (Restart=always's equivalent); it
+# respawns the process on exit and owns the pidfile, so no start-stop-daemon
+# flags have to be guessed at.
+install_openrc_services() {
+    cat > /etc/init.d/dockpanel-agent << 'AGENTEOF'
+#!/sbin/openrc-run
+# Managed by DockPanel — rewritten by scripts/setup.sh (re-run it to refresh).
+name="dockpanel-agent"
+description="DockPanel Agent"
 
-    if wait_for_unit dockpanel-agent; then
-        log "Agent service running"
-    else
-        error "Agent failed to start"
-        journalctl -u dockpanel-agent --no-pager -n 10
-        exit 1
+command="/usr/local/bin/dockpanel-agent"
+supervisor="supervise-daemon"
+respawn_delay=5
+respawn_max=0
+pidfile="/run/dockpanel-agent.pid"
+output_log="/var/log/dockpanel-agent.log"
+error_log="/var/log/dockpanel-agent.log"
+
+depend() {
+    need net
+    use dns docker nginx
+}
+
+start_pre() {
+    # The panel and the agent resolve `systemctl` from PATH; on OpenRC boxes
+    # that name is a compatibility shim living in /usr/local/bin (see
+    # install_systemctl_shim), so PATH has to name it first.
+    export PATH="/usr/local/sbin:/usr/local/bin:$PATH"
+    mkdir -p /run/dockpanel /var/lib/dockpanel/git
+
+    # agent.env is a fleet member's file; a panel box has none, which is the
+    # same "read it if it exists" semantics the unit's EnvironmentFile=- has.
+    if [ -r /etc/dockpanel/agent.env ]; then
+        set -a
+        . /etc/dockpanel/agent.env
+        set +a
+    fi
+    export RUST_LOG="${RUST_LOG:-info}"
+}
+
+start_post() {
+    sleep 1
+    chgrp nginx /var/run/dockpanel/agent.sock 2>/dev/null
+    chmod 660 /var/run/dockpanel/agent.sock 2>/dev/null
+    return 0
+}
+AGENTEOF
+
+    cat > /etc/init.d/dockpanel-api << 'APIEOF'
+#!/sbin/openrc-run
+# Managed by DockPanel — rewritten by scripts/setup.sh (re-run it to refresh).
+name="dockpanel-api"
+description="DockPanel API"
+
+command="/usr/local/bin/dockpanel-api"
+supervisor="supervise-daemon"
+respawn_delay=5
+respawn_max=0
+pidfile="/run/dockpanel-api.pid"
+output_log="/var/log/dockpanel-api.log"
+error_log="/var/log/dockpanel-api.log"
+
+depend() {
+    need net
+    after docker
+    use dns
+    want dockpanel-agent
+}
+
+start_pre() {
+    export PATH="/usr/local/sbin:/usr/local/bin:$PATH"
+    mkdir -p /run/dockpanel
+    if [ -r /etc/dockpanel/api.env ]; then
+        set -a
+        . /etc/dockpanel/api.env
+        set +a
+    fi
+    export RUST_LOG="${RUST_LOG:-info}"
+}
+APIEOF
+
+    chmod 755 /etc/init.d/dockpanel-agent /etc/init.d/dockpanel-api
+    touch /var/log/dockpanel-agent.log /var/log/dockpanel-api.log
+    chmod 640 /var/log/dockpanel-agent.log /var/log/dockpanel-api.log
+
+    install_systemctl_shim
+}
+
+# A `systemctl` compatibility shim, installed ONLY on boxes that have no systemd.
+#
+# The panel's own code was written against systemd and calls `systemctl` by name
+# in dozens of places (panel/agent/src/services/{nginx,pkg,security,diagnostics,
+# app_process,sftp_accounts,mail}.rs): reload PHP-FPM, restart fail2ban, restart
+# sshd, ask whether a service is active, apply an app's unit. On an OpenRC box
+# every one of those calls fails with ENOENT — the feature does not degrade, it
+# reports "No such file or directory" — and the Rust code is not something this
+# script can change.
+#
+# So OpenRC gets a translator. It covers the verbs and flags the panel actually
+# passes, and translates Alpine's versioned service names (php-fpm84) to the
+# Debian spelling the agent builds (php8.4-fpm). It is deliberately NOT a
+# systemd implementation: unit files are not parsed, sandbox directives do not
+# exist here, and `show -p ...` answers from a small fixed table. Anything the
+# panel needs beyond that has to be handled in Rust.
+#
+# Never written over a real systemctl: the guard is the whole reason this is
+# safe to call unconditionally.
+install_systemctl_shim() {
+    if [ "$INIT" = "systemd" ] || command -v systemctl > /dev/null 2>&1; then
+        return 0
     fi
 
-    # Start API
-    systemctl enable dockpanel-api > /dev/null 2>&1
-    systemctl restart dockpanel-api
+    cat > /usr/local/bin/systemctl << 'SHIMEOF'
+#!/bin/sh
+# DockPanel systemctl shim for OpenRC — installed by scripts/setup.sh.
+# Translates the systemctl verbs the panel uses onto rc-service/rc-update.
+set -u
 
-    if wait_for_unit dockpanel-api; then
-        log "API service running"
-    else
-        error "API failed to start"
-        journalctl -u dockpanel-api --no-pager -n 10
-        exit 1
+# php8.4-fpm (the name the agent builds) → php-fpm84 (Alpine's runscript).
+translate() {
+    case "$1" in
+        php[0-9]*-fpm)
+            v=$(printf '%s' "$1" | sed -n 's/^php\([0-9]*\)\.\([0-9]*\)-fpm$/\1\2/p')
+            if [ -n "$v" ] && [ -x "/etc/init.d/php-fpm$v" ]; then
+                printf 'php-fpm%s' "$v"
+                return
+            fi
+            for s in /etc/init.d/php-fpm*; do
+                if [ -x "$s" ]; then
+                    basename "$s"
+                    return
+                fi
+            done
+            printf '%s' "$1"
+            ;;
+        *.service)
+            printf '%s' "${1%.service}"
+            ;;
+        *)
+            printf '%s' "$1"
+            ;;
+    esac
+}
+
+if [ $# -eq 0 ]; then
+    exit 1
+fi
+
+verb="$1"
+shift
+
+now=0
+value_only=0
+prop=""
+svcs=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --now) now=1 ;;
+        --value) value_only=1 ;;
+        -p|--property) shift; prop="${1:-}" ;;
+        --quiet|-q|--no-pager|--full|--force|-f|--system|--user) : ;;
+        --*) : ;;
+        *) svcs="$svcs $1" ;;
+    esac
+    shift
+done
+
+rc=0
+for one in $svcs; do
+    s=$(translate "$one")
+    case "$verb" in
+        start)    rc-service "$s" start || rc=$? ;;
+        stop)     rc-service "$s" stop || rc=$? ;;
+        restart)  rc-service "$s" restart || rc=$? ;;
+        reload|try-reload-or-restart)
+                  rc-service "$s" reload 2>/dev/null || rc-service "$s" restart || rc=$? ;;
+        enable)   rc-update add "$s" default || rc=$? ;;
+        disable)  rc-update del "$s" default 2>/dev/null || true ;;
+        mask|unmask) : ;;
+        is-active)
+                  if rc-service "$s" status > /dev/null 2>&1; then
+                      echo active
+                  else
+                      echo inactive; rc=3
+                  fi ;;
+        is-enabled)
+                  if [ -e "/etc/runlevels/default/$s" ]; then
+                      echo enabled
+                  else
+                      echo disabled; rc=1
+                  fi ;;
+        is-failed)
+                  if rc-service "$s" status > /dev/null 2>&1; then echo active; else echo failed; fi ;;
+        status)   rc-service "$s" status || rc=$? ;;
+        show)
+                  # The agent asks `show dockpanel-agent -p LoadError --value` to
+                  # decide whether the unit it just wrote is loadable. There is no
+                  # unit file here, so there is nothing to reject: answer with an
+                  # empty LoadError, which is what "fine" looks like.
+                  if [ "$prop" = "LoadError" ]; then
+                      [ "$value_only" = "1" ] && : || echo "LoadError="
+                  else
+                      [ "$value_only" = "1" ] && : || echo "Id=$s"
+                  fi ;;
+        list-unit-files|list-units) : ;;
+        daemon-reload|reset-failed|kill|set-property) : ;;
+        *)
+                  echo "systemctl (DockPanel OpenRC shim): unsupported verb '$verb'" >&2
+                  exit 1 ;;
+    esac
+done
+
+if [ "$verb" = "enable" ] && [ "$now" = "1" ]; then
+    for one in $svcs; do
+        s=$(translate "$one")
+        rc-service "$s" start > /dev/null 2>&1 || true
+    done
+fi
+
+exit $rc
+SHIMEOF
+
+    chmod 755 /usr/local/bin/systemctl
+
+    # journalctl is reached for by the panel's diagnostics too; a shim that
+    # drains the OpenRC logs is better than "No such file or directory".
+    if [ ! -e /usr/local/bin/journalctl ]; then
+        cat > /usr/local/bin/journalctl << 'JEOF'
+#!/bin/sh
+# DockPanel journalctl shim for OpenRC — prints the tail of the log named by -u.
+set -u
+unit=""
+n=20
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -u|--unit) shift; unit="${1:-}" ;;
+        -n|--lines) shift; n="${1:-20}" ;;
+        *) : ;;
+    esac
+    shift
+done
+if [ -n "$unit" ] && [ -r "/var/log/${unit}.log" ]; then
+    tail -n "$n" "/var/log/${unit}.log"
+elif [ -r /var/log/messages ]; then
+    tail -n "$n" /var/log/messages
+fi
+exit 0
+JEOF
+        chmod 755 /usr/local/bin/journalctl
     fi
+
+    log "systemctl/journalctl compatibility shims installed for OpenRC"
+}
+
+# No service manager at all (bare container, chroot). Installing nothing here
+# and saying so beats printing a success banner over services that were never
+# started — and the operator gets the exact commands to run instead.
+install_no_service_manager() {
+    warn "No service manager found (no systemd, no OpenRC) — the panel will not"
+    warn "start automatically on this box. Start it by hand:"
+    warn "  /usr/local/bin/dockpanel-agent > /var/log/dockpanel-agent.log 2>&1 &"
+    warn "  set -a; . /etc/dockpanel/api.env; set +a; /usr/local/bin/dockpanel-api > /var/log/dockpanel-api.log 2>&1 &"
+    svc_fail "Service manager (start the panel by hand)"
 }
 
 # ── Panel TLS ────────────────────────────────────────────────────────────
@@ -1295,9 +1797,34 @@ EOF
 # cleartext on the exact path the README advertises. A self-signed certificate
 # is not a trusted certificate, but a browser warning the operator can reason
 # about beats a password nobody can see leaving the machine.
+# Every address this box answers on, IPv4 and IPv6, one per line.
+#
+# `hostname -I` is the obvious way to ask and the wrong one: BusyBox's hostname
+# (Alpine, and every minimal container) has no -I at all — it prints "unrecognized
+# option: I" and exits non-zero. `ip -o addr` is present wherever iproute2 is,
+# which setup.sh installs, and the literal-hostname fallback covers a box with
+# neither.
+local_ip_addresses() {
+    if command -v ip > /dev/null 2>&1; then
+        ip -o addr show 2>/dev/null | awk '
+            $3 == "inet" || $3 == "inet6" {
+                split($4, a, "/"); if (a[1] != "127.0.0.1" && a[1] != "::1") print a[1]
+            }' || true
+    elif command -v hostname > /dev/null 2>&1; then
+        hostname -I 2>/dev/null | tr ' ' '\n' | grep -v '^$' || true
+    fi
+}
+
+# The address this box would use to reach the internet — i.e. the one on the
+# default route, which is the address an operator's browser reaches it on.
+interface_ip() {
+    ip route get 8.8.8.8 2>/dev/null | awk '
+        { for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit } }' || true
+}
+
 detect_server_ip() {
     curl -sf --max-time 5 https://api.ipify.org 2>/dev/null || \
-    hostname -I 2>/dev/null | awk '{print $1}' || \
+    local_ip_addresses | head -1 || \
     echo ""
 }
 
@@ -1322,7 +1849,7 @@ generate_self_signed_panel_cert() {
     local san="DNS:localhost,IP:127.0.0.1"
     [ -n "$ip" ] && san="${san},IP:${ip}"
     local local_ip
-    for local_ip in $(hostname -I 2>/dev/null || true); do
+    for local_ip in $(local_ip_addresses); do
         # IPv4/IPv6 literals only, and never repeat one already listed.
         case ",${san}," in
             *",IP:${local_ip},"*) continue ;;
@@ -1347,6 +1874,82 @@ generate_self_signed_panel_cert() {
     return 1
 }
 
+# ── Nginx layout ─────────────────────────────────────────────────────────
+# True when this nginx's nginx.conf already pulls in /etc/nginx/sites-enabled.
+nginx_reads_sites_enabled() {
+    awk '/^[[:space:]]*include[[:space:]]+\/etc\/nginx\/sites-enabled\/\*\.conf;/ { found = 1 } END { exit !found }' \
+        /etc/nginx/nginx.conf 2>/dev/null
+}
+
+# Insert `include /etc/nginx/sites-enabled/*.conf;` INSIDE the http block.
+#
+# Position is the whole point: appending at end-of-file lands the include at
+# main context, and a `server {}` block is only legal inside `http`, so every
+# vhost it pulled in would be a config error rather than a site. The brace count
+# finds the http block's real closing brace — a nested block's `}` ends sooner,
+# which is the bug that once left half a server block commented out on RHEL.
+add_sites_enabled_include() {
+    awk '
+      { lines[NR] = $0 }
+      /^[[:space:]]*http[[:space:]]*\{/ { http = NR }
+      END {
+        if (!http) { for (i = 1; i <= NR; i++) print lines[i]; exit 1 }
+        depth = 0; close_line = 0
+        for (i = http; i <= NR; i++) {
+          depth += gsub(/\{/, "{", lines[i]) - gsub(/\}/, "}", lines[i])
+          if (depth <= 0) { close_line = i; break }
+        }
+        if (!close_line) { for (i = 1; i <= NR; i++) print lines[i]; exit 1 }
+        for (i = 1; i <= NR; i++) {
+          if (i == close_line) print "    include /etc/nginx/sites-enabled/*.conf;"
+          print lines[i]
+        }
+      }
+    ' /etc/nginx/nginx.conf > /etc/nginx/nginx.conf.dockpanel-new &&
+        mv /etc/nginx/nginx.conf.dockpanel-new /etc/nginx/nginx.conf
+    rm -f /etc/nginx/nginx.conf.dockpanel-new
+}
+
+# Put this box's nginx on the layout the rest of the product already speaks.
+#
+# Alpine's nginx puts vhosts in /etc/nginx/http.d and includes `conf.d/*.conf`
+# from the MAIN context, where a `server {}` block is a syntax error — so
+# neither directory this script used to write to is where a vhost belongs. The
+# agent (Rust) probes for /etc/nginx/sites-enabled and, absent that, falls back
+# to /etc/nginx/conf.d; both are wrong here, and patching the agent is not this
+# script's job. So the box is made to look like the layout the agent already
+# understands: sites-available/sites-enabled, included from the http block.
+# That is Debian's convention, which means the panel's own vhost, every
+# agent-written site vhost, and every parked (disabled) vhost land exactly where
+# the code that reads them expects to find them.
+#
+# Guarded on the include actually landing: a sites-enabled directory that
+# nginx.conf does not include is worse than no directory at all — the panel
+# writes a vhost into it, nginx -t passes, and the site simply never exists.
+prepare_nginx_layout() {
+    if [ -d /etc/nginx/sites-enabled ] || [ ! -d /etc/nginx/http.d ]; then
+        return 0
+    fi
+
+    mkdir -p /etc/nginx/sites-available
+
+    if nginx_reads_sites_enabled; then
+        mkdir -p /etc/nginx/sites-enabled
+    elif add_sites_enabled_include; then
+        mkdir -p /etc/nginx/sites-enabled
+        log "nginx: now reads site vhosts from /etc/nginx/sites-enabled"
+    else
+        warn "Could not add the sites-enabled include to nginx.conf — writing vhosts to http.d instead"
+    fi
+
+    # Alpine ships a catch-all server on :80 in http.d that answers for every
+    # unconfigured name — Debian's sites-enabled/default plays the same role.
+    # Parked rather than deleted, so nothing is lost if it is wanted back.
+    if [ -f /etc/nginx/http.d/default.conf ]; then
+        mv -f /etc/nginx/http.d/default.conf /etc/nginx/http.d/default.conf.disabled
+    fi
+}
+
 # ── Nginx for Panel ──────────────────────────────────────────────────────
 configure_nginx() {
     header "Configuring Nginx"
@@ -1360,9 +1963,14 @@ configure_nginx() {
         NGINX_GROUP="root"
     fi
 
+    # ── Alpine's nginx layout ────────────────────────────────────────────
+    prepare_nginx_layout
+
     # Determine config directory
     if [ -d /etc/nginx/sites-enabled ]; then
         NGINX_CONF="/etc/nginx/sites-enabled/dockpanel-panel.conf"
+    elif [ -d /etc/nginx/http.d ]; then
+        NGINX_CONF="/etc/nginx/http.d/dockpanel-panel.conf"
     elif [ -d /etc/nginx/conf.d ]; then
         NGINX_CONF="/etc/nginx/conf.d/dockpanel-panel.conf"
     else
@@ -1398,7 +2006,7 @@ configure_nginx() {
         # `[::]:443 ssl`) become the de-facto default for IPv6 traffic and serve their own
         # WP/canonical-redirect responses for the panel domain.
         local BIND_IP
-        BIND_IP=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'src \K\S+' || true)
+        BIND_IP=$(interface_ip)
         if [ -n "$BIND_IP" ]; then
             LISTEN_DIRECTIVE="listen ${BIND_IP}:80;
     listen [::]:80;"
@@ -1580,7 +2188,7 @@ NGINXEOF
 
     # Test and restart (full restart needed to release port bindings from removed default site)
     if nginx -t > /dev/null 2>&1; then
-        systemctl restart nginx
+        svc_restart nginx
         log "Nginx configured — panel on port $PANEL_PORT"
     else
         error "Nginx config test failed"
@@ -1645,9 +2253,38 @@ cleanup_php_repo() {
     run "Refreshing package index" apt-get update -y || true
 }
 
+# The name of the PHP-FPM runscript on this Alpine box, e.g. php-fpm84.
+#
+# Alpine versions the runscript (php-fpm84) while Debian versions the unit
+# (php8.4-fpm), and the agent speaks the Debian spelling. Prefer the runscript
+# matching the PHP that is actually installed, then any php-fpmNN that exists
+# (the unversioned `php-fpm` meta can land a runscript whose name does not match
+# the `php` binary on PATH), then the bare name.
+alpine_php_fpm_service() {
+    local v svc
+    v=$(php -r 'echo PHP_MAJOR_VERSION.PHP_MINOR_VERSION;' 2>/dev/null || true)
+    if [ -n "$v" ] && [ -x "/etc/init.d/php-fpm${v}" ]; then
+        printf 'php-fpm%s' "$v"
+        return
+    fi
+    for svc in /etc/init.d/php-fpm*; do
+        if [ -x "$svc" ]; then
+            basename "$svc"
+            return
+        fi
+    done
+    printf 'php-fpm'
+}
+
 install_php() {
     if command -v php &> /dev/null; then
         log "PHP already installed: $(php -v | head -1 | awk '{print $2}')"
+        # Present is not the same as RUNNING. On Alpine a pre-existing php84-fpm
+        # arrives disabled, so a panel install over it would report PHP ready
+        # and hand every PHP site a 502. Cheap and idempotent to assert.
+        if [ "$INIT" != "systemd" ]; then
+            svc_enable_now "$(alpine_php_fpm_service)"
+        fi
         svc_ok "PHP $(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null) (FPM)"
         return
     fi
@@ -1711,11 +2348,42 @@ install_php() {
         fi
 
         if [ -n "$PHP_VER" ]; then
-            systemctl enable --now "php${PHP_VER}-fpm" > /dev/null 2>&1
+            svc_enable_now "php${PHP_VER}-fpm"
             log "PHP ${PHP_VER} installed with FPM"
             svc_ok "PHP ${PHP_VER} (FPM)"
         else
             warn "PHP could not be installed — WordPress/PHP sites need it; retry later from Settings → Services"
+            svc_fail "PHP-FPM"
+        fi
+    elif [ "$PKG_MGR" = "apk" ]; then
+        # Alpine's PHP lives in community as one package per version plus a
+        # `php-<ext>` meta per extension. The extension list is filtered against
+        # the index for exactly the reason apt_has_candidate exists on the
+        # Debian side: `apk add` fails the whole transaction on a single name it
+        # cannot resolve, so one retired extension would cost the entire PHP
+        # install rather than just itself.
+        local php_exts="" e
+        for e in mysqli pgsql curl gd mbstring xml zip bcmath intl opcache session; do
+            if apk_has_pkg "php-${e}"; then
+                php_exts="$php_exts php-${e}"
+            else
+                warn "php-${e} is not in this Alpine branch's index — skipping it"
+            fi
+        done
+        # shellcheck disable=SC2086
+        if run "Installing PHP (apk: php-fpm, php-cli + extensions)" \
+                pkg_install php-fpm php-cli $php_exts; then
+            # The runscript is versioned (php-fpm84), and the agent asks for the
+            # Debian spelling (php8.4-fpm). Both spellings are resolved here so
+            # this install starts the service the box actually has, and the
+            # systemctl shim resolves the agent's requests to the same one.
+            local php_fpm_svc
+            php_fpm_svc="$(alpine_php_fpm_service)"
+            svc_enable_now "$php_fpm_svc"
+            log "PHP $(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null) installed with FPM ($php_fpm_svc)"
+            svc_ok "PHP $(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null) (FPM)"
+        else
+            warn "PHP could not be installed — retry later from Settings → Services"
             svc_fail "PHP-FPM"
         fi
     else
@@ -1748,13 +2416,44 @@ install_php() {
         # list is not the all-or-nothing hazard the apt side has to guard
         # against. Verified against a real dnf at s266.
         if run "Installing PHP (distro packages)" pkg_install php-fpm php-cli php-common php-mysqlnd php-pgsql php-xml php-mbstring php-curl php-zip php-gd; then
-            systemctl enable --now php-fpm > /dev/null 2>&1
+            svc_enable_now php-fpm
             log "PHP installed with FPM"
             svc_ok "PHP $(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null) (FPM)"
         else
             warn "PHP could not be installed — retry later from Settings → Services"
             svc_fail "PHP-FPM"
         fi
+    fi
+}
+
+# Keep the certificate renewed, in whichever way this box schedules things.
+#
+# On systemd that is certbot.timer. Alpine has no systemd and Alpine's certbot
+# package ships no timer, so without this an Alpine panel would silently lose
+# its certificate ~90 days after install — the exact failure mode auto-renewal
+# exists to prevent. OpenRC boxes get the /etc/periodic/daily hook instead,
+# which crond (an OpenRC service, started at boot) picks up.
+schedule_certbot_renewal() {
+    if [ "$INIT" = "systemd" ]; then
+        svc_enable_now certbot.timer
+        log "Certbot installed with auto-renewal (certbot.timer)"
+        return
+    fi
+
+    if [ -d /etc/periodic/daily ]; then
+        cat > /etc/periodic/daily/dockpanel-certbot-renew << 'CRONEOF'
+#!/bin/sh
+# Managed by DockPanel — rewritten by scripts/setup.sh and update.sh.
+# On a systemd box certbot.timer does this; this hook is the OpenRC/crond
+# equivalent. `renew` is a no-op until a certificate is within 30 days of
+# expiry, so running it daily costs one cheap check.
+certbot renew --quiet >> /var/log/dockpanel-certbot-renew.log 2>&1
+CRONEOF
+        chmod +x /etc/periodic/daily/dockpanel-certbot-renew
+        log "Certbot installed with auto-renewal (/etc/periodic/daily)"
+    else
+        warn "Certbot installed, but no renewal schedule was set up on this box"
+        warn "Add a daily 'certbot renew' to your scheduler — certificates expire in 90 days"
     fi
 }
 
@@ -1766,9 +2465,15 @@ install_recommended_services() {
 
     # Certbot (needed for SSL certificates)
     if ! command -v certbot &> /dev/null; then
-        if run "Installing Certbot" pkg_install certbot python3-certbot-nginx; then
-            systemctl enable --now certbot.timer > /dev/null 2>&1
-            log "Certbot installed with auto-renewal"
+        # Alpine packages the nginx plugin separately (certbot-nginx) and has no
+        # python3-certbot-nginx, which is Debian's name for the same thing.
+        local certbot_pkgs="certbot python3-certbot-nginx"
+        if [ "$PKG_MGR" = "apk" ]; then
+            certbot_pkgs="certbot certbot-nginx"
+        fi
+        # shellcheck disable=SC2086
+        if run "Installing Certbot" pkg_install $certbot_pkgs; then
+            schedule_certbot_renewal
             svc_ok "Certbot"
         else
             warn "Certbot failed to install — SSL provisioning will not work until it is"
@@ -1789,43 +2494,57 @@ install_recommended_services() {
     # unreachable from any browser — while the installer printed
     # "installed successfully" and an https:// URL. Two firewalls is not a
     # hardening measure, it is an outage nobody can see.
-    case "$FW_MGR" in
-        firewalld)
-            log "Firewall: firewalld is already active — using it (not installing UFW)"
-            svc_ok "firewalld"
-            ;;
-        ufw)
-            log "UFW already installed"
-            svc_ok "UFW"
-            ;;
-        none)
-            if run "Installing UFW firewall" pkg_install ufw; then
-                ufw default deny incoming > /dev/null 2>&1
-                ufw default allow outgoing > /dev/null 2>&1
-                ufw allow 22/tcp > /dev/null 2>&1
-                ufw --force enable > /dev/null 2>&1
-                FW_MGR="ufw"
-                log "UFW installed and enabled"
-                svc_ok "UFW"
-            else
-                warn "UFW failed to install — no firewall is active"
-                svc_fail "UFW"
-            fi
-            ;;
-    esac
-
-    # Ensure panel ports are open in whichever firewall is actually enforcing.
-    if fw_allow 80/tcp && fw_allow 443/tcp; then
-        local opened="80, 443"
-        if [ -n "$PANEL_PORT" ] && [ "$PANEL_PORT" != "80" ] && [ "$PANEL_PORT" != "443" ]; then
-            fw_allow "${PANEL_PORT}/tcp" && opened="$opened, $PANEL_PORT"
-        fi
-        fw_reload
-        log "Firewall ($FW_MGR): ports $opened allowed"
-    elif [ "$FW_MGR" = "none" ]; then
-        log "Firewall: none active — nothing to open"
+    #
+    # DOCKPANEL_SKIP_FIREWALL=1 leaves the firewall entirely alone. A default-deny
+    # policy is only safe when the installer can see every port the operator
+    # reaches the box on — a panel managed on a non-standard SSH port, or behind
+    # a provider firewall, is exactly where it cannot, and enabling one anyway
+    # locks the operator out of the machine that was just configured for them.
+    if [ "${DOCKPANEL_SKIP_FIREWALL:-0}" = "1" ]; then
+        log "Firewall: left alone (DOCKPANEL_SKIP_FIREWALL=1)"
     else
-        warn "Firewall ($FW_MGR): could not open 80/443 — the panel may be unreachable"
+        case "$FW_MGR" in
+            firewalld)
+                log "Firewall: firewalld is already active — using it (not installing UFW)"
+                svc_ok "firewalld"
+                ;;
+            ufw)
+                log "UFW already installed"
+                svc_ok "UFW"
+                ;;
+            none)
+                if run "Installing UFW firewall" pkg_install ufw; then
+                    ufw default deny incoming > /dev/null 2>&1
+                    ufw default allow outgoing > /dev/null 2>&1
+                    ufw allow 22/tcp > /dev/null 2>&1
+                    ufw --force enable > /dev/null 2>&1
+                    # ufw's own unit brings the rules back at boot on Debian; on
+                    # an OpenRC box nothing else would, so the runscript has to be
+                    # enabled or the firewall is gone after the next reboot.
+                    svc_enable_now ufw
+                    FW_MGR="ufw"
+                    log "UFW installed and enabled"
+                    svc_ok "UFW"
+                else
+                    warn "UFW failed to install — no firewall is active"
+                    svc_fail "UFW"
+                fi
+                ;;
+        esac
+
+        # Ensure panel ports are open in whichever firewall is actually enforcing.
+        if fw_allow 80/tcp && fw_allow 443/tcp; then
+            local opened="80, 443"
+            if [ -n "$PANEL_PORT" ] && [ "$PANEL_PORT" != "80" ] && [ "$PANEL_PORT" != "443" ]; then
+                fw_allow "${PANEL_PORT}/tcp" && opened="$opened, $PANEL_PORT"
+            fi
+            fw_reload
+            log "Firewall ($FW_MGR): ports $opened allowed"
+        elif [ "$FW_MGR" = "none" ]; then
+            log "Firewall: none active — nothing to open"
+        else
+            warn "Firewall ($FW_MGR): could not open 80/443 — the panel may be unreachable"
+        fi
     fi
 
     # Fail2Ban (intrusion prevention)
@@ -1846,7 +2565,7 @@ enabled = true
 [nginx-limit-req]
 enabled = true
 F2BEOF
-            systemctl enable --now fail2ban > /dev/null 2>&1
+            svc_enable_now fail2ban
             log "Fail2Ban installed with SSH + Nginx jails"
             svc_ok "Fail2Ban"
         else
@@ -1854,6 +2573,14 @@ F2BEOF
             svc_fail "Fail2Ban"
         fi
     else
+        # Already installed is not already RUNNING. Debian's package starts
+        # and enables fail2ban on install, so a box that already had it was
+        # assumed to have it active; Alpine's arrives stopped and unregistered,
+        # which the panel's own diagnostics then reports as "fail2ban is not
+        # active" over an install that claimed all recommended services ready.
+        # Unlike the ufw case below this cannot lock anyone out — fail2ban bans
+        # on repeated auth failures rather than denying by default.
+        svc_enable_now fail2ban
         log "Fail2Ban already installed"
         svc_ok "Fail2Ban"
     fi
@@ -1882,7 +2609,7 @@ normalize_panel_listen() {
     [ -f "$conf" ] || return 0
 
     local bind_ip
-    bind_ip=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'src \K\S+' || true)
+    bind_ip=$(interface_ip)
     # No default route: every vhost falls back to wildcard, so they already agree.
     [ -n "$bind_ip" ] || return 0
 
@@ -1900,7 +2627,7 @@ normalize_panel_listen() {
     # <ip>:443 — nginx inherits the old socket and the change silently
     # no-ops, leaving a config on disk that disagrees with what is running.
     # Only a restart rebinds.
-    systemctl restart nginx > /dev/null 2>&1 || true
+    svc_restart nginx > /dev/null 2>&1 || true
 
     # Trust the socket, not the restart's exit code.
     if command -v ss > /dev/null 2>&1 && ! ss -ltn "( sport = :443 )" 2>/dev/null | grep -c "${bind_ip}:443" >/dev/null; then
@@ -1993,11 +2720,28 @@ print_summary() {
     echo -e "                  dockpanel --help"
     echo ""
     echo -e "  ${BOLD}Service commands:${NC}"
-    echo -e "    Agent status:   systemctl status dockpanel-agent"
-    echo -e "    API status:     systemctl status dockpanel-api"
-    echo -e "    Agent logs:     journalctl -u dockpanel-agent -f"
-    echo -e "    API logs:       journalctl -u dockpanel-api -f"
-    echo -e "    Restart all:    systemctl restart dockpanel-agent dockpanel-api"
+    case "$INIT" in
+        systemd)
+            echo -e "    Agent status:   systemctl status dockpanel-agent"
+            echo -e "    API status:     systemctl status dockpanel-api"
+            echo -e "    Agent logs:     journalctl -u dockpanel-agent -f"
+            echo -e "    API logs:       journalctl -u dockpanel-api -f"
+            echo -e "    Restart all:    systemctl restart dockpanel-agent dockpanel-api"
+            ;;
+        openrc)
+            echo -e "    Agent status:   rc-service dockpanel-agent status"
+            echo -e "    API status:     rc-service dockpanel-api status"
+            echo -e "    Agent logs:     tail -f /var/log/dockpanel-agent.log"
+            echo -e "    API logs:       tail -f /var/log/dockpanel-api.log"
+            echo -e "    Restart all:    rc-service dockpanel-agent restart; rc-service dockpanel-api restart"
+            echo -e "    ${DIM}Both are enabled in the default runlevel, so they survive a reboot.${NC}"
+            ;;
+        *)
+            echo -e "    No service manager on this box — start them by hand:"
+            echo -e "    Agent:          /usr/local/bin/dockpanel-agent &"
+            echo -e "    API:            set -a; . ${CONFIG_DIR}/api.env; set +a; /usr/local/bin/dockpanel-api &"
+            ;;
+    esac
     echo ""
     echo -e "  ${BOLD}Paths:${NC}"
     echo -e "    Config:         ${CONFIG_DIR}/"
@@ -2087,6 +2831,13 @@ BKEOF
     # contains "$BACKUP_SCRIPT" — so without it, re-running setup on an older
     # box kept the unhardened 0644 line AND added this one, giving two daily
     # dumps of the same database, one of them world-readable in mode.
+    #
+    # Alpine's BusyBox crontab keeps its tables in /var/spool/cron/crontabs
+    # (a directory the package does not necessarily create) and its daemon is
+    # an OpenRC service rather than a timer — so the directory is made and
+    # crond is started, or the job is written and never runs.
+    mkdir -p /var/spool/cron/crontabs 2>/dev/null || true
+    svc_enable_now crond
     (crontab -l 2>/dev/null \
         | grep -v "$BACKUP_SCRIPT" \
         | grep -v 'pg_dump -U dockpanel.*/var/backups/dockpanel/db'; \
@@ -2118,6 +2869,7 @@ main() {
 
     detect_pkg_manager
     detect_firewall
+    detect_init
 
     # Auto-detect: if no source available, use release binaries
     if [ "$INSTALL_FROM_RELEASE" != "1" ] && [ ! -d "$AGENT_SRC/src" ]; then
@@ -2225,8 +2977,8 @@ main() {
     sleep 3
 
     # Start services (may already be started by create_services)
-    systemctl start dockpanel-agent 2>/dev/null
-    systemctl start dockpanel-api 2>/dev/null
+    svc_start dockpanel-agent > /dev/null 2>&1 || true
+    svc_start dockpanel-api > /dev/null 2>&1 || true
     sleep 2
 
     install_recommended_services
