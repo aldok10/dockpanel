@@ -679,5 +679,58 @@ else
 fi
 
 echo
+echo "== §14  the database payload cannot reach a document root on ANY tar (s373) =="
+
+# The restore path excluded the payload with `--exclude .dockpanel-backup`, written
+# and tested against GNU tar. BusyBox tar (Alpine) accepts that flag, matches the
+# pattern ANCHORED, and honours it only in the spelling that matches the member
+# name it sees. The create side archives the site root as `.`, so the payload's
+# members arrive as `./.dockpanel-backup/…` — GNU's spelling does not match them
+# there, and the dumps were extracted into the document root, where nginx serves
+# them. The agent's own unit test caught it on Alpine; these arms hold both halves
+# of the repair in the source, because the unit test needs a BusyBox box to fail.
+AGENT_BK=panel/agent/src/services/backups.rs
+if ! AGBK=$(subj "$AGENT_BK"); then
+  bad "§14 could not read $AGENT_BK"
+else
+  RESTORE=$(printf '%s\n' "$AGBK" | sed -n '/async fn restore_inner/,/^}$/p')
+  if [ -z "$RESTORE" ]; then
+    bad "§14 could not extract restore_inner from $AGENT_BK"
+  else
+    # Both spellings, and the wildcard of each: one tar honours one form, the other
+    # tar the other. A single `--exclude` is the defect, not a style choice.
+    n=$(count "$RESTORE" '"--exclude"')
+    if [ "$n" -ge 4 ]; then
+      ok "§14a the extraction excludes the payload in both anchored spellings ($n patterns)"
+    else
+      bad "§14a only $n --exclude pattern(s) in restore_inner — the bare spelling is the GNU one, and a tar that matches members as './$PAYLOAD_DIR/…' ignores it, extracting database dumps into the document root"
+    fi
+    # And the invariant is enforced, not trusted: whatever the tar did, a payload
+    # under the document root is removed before the restore reports success.
+    if has "$RESTORE" 'remove_dir_all\(&stray_payload\)'; then
+      ok "§14b a payload that still landed in the document root is removed"
+    else
+      bad "§14b restore_inner does not remove a stray instance of the payload from the document root — the exclusion is then only as reliable as the tar on the box"
+    fi
+    # If it cannot be removed, that is NOT a successful restore.
+    if has "$RESTORE" 'could not be removed'; then
+      ok "§14c …and a removal that fails fails the restore rather than reporting success"
+    else
+      bad "§14c a failed removal is swallowed — the restore would report success with database dumps sitting in the document root"
+    fi
+    # The order is what makes the removal safe: the dumps were already staged for
+    # the database step, so the webroot copy is redundant. Extract first and the
+    # sweep would be destroying the only copy.
+    p_payload=$(printf '%s\n' "$RESTORE" | grep -nE 'extract_payload\(' | head -1 | cut -d: -f1)
+    p_files=$(printf '%s\n' "$RESTORE" | grep -nE '"xzf"' | head -1 | cut -d: -f1)
+    if [ -n "$p_payload" ] && [ -n "$p_files" ] && [ "$p_payload" -lt "$p_files" ]; then
+      ok "§14d the payload is staged (line $p_payload) before the files are extracted (line $p_files)"
+    else
+      bad "§14d the payload is not staged before the document-root extraction (payload=$p_payload, files=$p_files) — the removal in §14b would be deleting the restore's only copy of the dumps"
+    fi
+  fi
+fi
+
+echo
 echo "backup-truth: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

@@ -703,8 +703,18 @@ async fn restore_inner(
             .args([
                 "xzf", filepath_str,
                 "--no-same-owner", "--no-same-permissions",
+                // BOTH spellings, and the reason is not tidiness. The create side
+                // archives the site root as `.`, so the payload's members arrive
+                // as `./.dockpanel-backup/…`. BusyBox tar (Alpine) matches these
+                // patterns ANCHORED: `--exclude .dockpanel-backup` is accepted,
+                // ignored, and the dumps land in the document root. GNU tar wants
+                // the bare spelling for that same member. Each tar honours one;
+                // passing both costs nothing and the sweep below enforces the
+                // invariant either way.
                 "--exclude", PAYLOAD_DIR,
+                "--exclude", &format!("./{PAYLOAD_DIR}"),
                 "--exclude", &format!("{PAYLOAD_DIR}/*"),
+                "--exclude", &format!("./{PAYLOAD_DIR}/*"),
                 "-C", site_root_str,
             ])
             .kill_on_drop(true)
@@ -725,6 +735,27 @@ async fn restore_inner(
         return Err("Restore completed but site directory is empty".to_string());
     }
     report.files_restored = true;
+
+    // Keep the invariant rather than trusting the flags above: one tar honours a
+    // spelling the other ignores, and a database dump under the document root is
+    // SERVED, not merely stored. The dumps were already staged in step 1, so
+    // nothing is lost by removing this copy — and if it cannot be removed, this is
+    // not a successful restore.
+    let stray_payload = site_root.join(PAYLOAD_DIR);
+    if stray_payload.exists() {
+        match std::fs::remove_dir_all(&stray_payload) {
+            Ok(()) => tracing::warn!(
+                "tar extracted the backup payload into the document root for {domain} \
+                 (this box's tar ignored --exclude); removed {}",
+                stray_payload.display()
+            ),
+            Err(e) => {
+                return Err(format!(
+                    "the database payload was extracted into the document root and could not be removed: {e}"
+                ))
+            }
+        }
+    }
 
     // 3. Restore each database the archive carries.
     let db_dir = stage.join(PAYLOAD_DIR).join("db");

@@ -404,7 +404,7 @@ that reads the source and fails if the fix is undone — including the shapes th
 are easy to undo by accident. The mail pins assert, among other things, that the
 sandbox was **not** widened to include `/etc/opendkim.conf`, since widening it
 would have "fixed" the bug while destroying the reason the bug was
-survivable. One-hundred-thirty-eight suites, **4571 assertions**, all green at the current commit:
+survivable. One-hundred-thirty-nine suites, **4604 assertions**, all green at the current commit:
 
 | Suite | Assertions |
 |---|---|
@@ -425,6 +425,7 @@ survivable. One-hundred-thirty-eight suites, **4571 assertions**, all green at t
 | `acme-account-identity-pin-e2e.sh` | 20 |
 | `nginx-listen-pin-e2e.sh` | 17 |
 | `password-protect-pin-e2e.sh` | 26 |
+| `site-alias-pin-e2e.sh` | 29 |
 | `rpm-install-pin-e2e.sh` | 71 |
 | `mail-rpm-pin-e2e.sh` | 22 |
 | `cpu-metric-pin-e2e.sh` | 17 |
@@ -446,7 +447,7 @@ survivable. One-hundred-thirty-eight suites, **4571 assertions**, all green at t
 | `migration-analyze-async-pin-e2e.sh` | 28 |
 | `php-install-from-picker-pin-e2e.sh` | 43 |
 | `provision-log-ownership-pin-e2e.sh` | 41 |
-| `backup-truth-pin-e2e.sh` | 54 |
+| `backup-truth-pin-e2e.sh` | 58 |
 | `scheme-and-import-pin-e2e.sh` | 35 |
 | `domain-claim-pin-e2e.sh` | 60 |
 | `mail-authorisation-pin-e2e.sh` | 30 |

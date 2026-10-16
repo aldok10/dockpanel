@@ -571,6 +571,17 @@ async fn delete_site(
         }
     }
 
+    // The alias store goes with the site. Left behind, it would be re-read by the
+    // render the moment a site on this domain is created again — silently putting
+    // names back on a vhost nobody attached them to, and one of those names may by
+    // then belong to another tenant, which is the very thing the add-time guard
+    // exists to refuse.
+    let alias_store = format!("{}/{domain}", services::nginx::aliases_dir());
+    if std::path::Path::new(&alias_store).exists() {
+        std::fs::remove_file(&alias_store).ok();
+        tracing::info!("Removed domain alias store: {alias_store}");
+    }
+
     // PHP-FPM pool configs (all versions)
     for version in &["8.1", "8.2", "8.3", "8.4", "8.5"] {
         let pool_path = format!("/etc/php/{version}/fpm/pool.d/{pool_name}.conf");
@@ -1690,10 +1701,97 @@ struct AliasRequest {
     alias: String,
 }
 
+/// Persist an alias set and put it into service, rolling BOTH files back if nginx
+/// will not take the result.
+///
+/// Two files move here (the store the next render reads, and the rendered vhost
+/// nginx reads now), so two files are restored. The old handlers reverted the
+/// vhost only — `add` left a failed test with no rollback at all, and `remove`
+/// swallowed one and answered 200 anyway — and neither touched a store, because
+/// there was none: the alias existed solely inside the file it was about to be
+/// wiped from by the next rewrite.
+async fn apply_aliases(domain: &str, previous: &[String], next: &[String]) -> Result<(), ApiErr> {
+    let target = services::nginx::vhost_target(domain);
+    let conf_path = target.path().to_string();
+    let previous_conf = std::fs::read_to_string(&conf_path).ok();
+
+    let rollback = || {
+        services::nginx::write_alias_store(domain, previous).ok();
+        let restored = services::nginx::restore_or_remove(&conf_path, previous_conf.as_deref());
+        services::nginx::restore_note(restored)
+    };
+
+    // The store is what the NEXT render reads; patching the file now is what makes
+    // the alias answer immediately.
+    services::nginx::write_alias_store(domain, next).map_err(|e| {
+        api_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to record the alias: {e}"),
+        )
+    })?;
+
+    let Some(conf) = previous_conf.as_deref() else {
+        services::nginx::write_alias_store(domain, previous).ok();
+        return Err(api_err(StatusCode::NOT_FOUND, "Site config not found"));
+    };
+
+    let updated = services::nginx::with_server_names(conf, domain, next);
+    // Staged under a DOT-prefixed name beside the vhost. The live directory is the
+    // one nginx's own `include` sweeps, and it is not only this panel's
+    // `sites-enabled/*.conf`: Debian's default nginx.conf carries a bare
+    // `sites-enabled/*`, which would parse a leftover `<domain>.conf.pending` from
+    // a crash between these two calls as a second server block for the site. Same
+    // reason the password-protection include stages its own file under a dot.
+    let tmp = match conf_path.rsplit_once('/') {
+        Some((dir, name)) => format!("{dir}/.{name}.pending"),
+        None => format!("{conf_path}.pending"),
+    };
+    if let Err(e) = std::fs::write(&tmp, &updated) {
+        rollback();
+        return Err(api_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e}")));
+    }
+    if let Err(e) = std::fs::rename(&tmp, &conf_path) {
+        std::fs::remove_file(&tmp).ok();
+        rollback();
+        return Err(api_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e}")));
+    }
+
+    // A parked vhost is not read by nginx, so a disabled site keeps the store and
+    // picks the name up when it is re-enabled — no test or reload is owed.
+    if !target.is_live() {
+        return Ok(());
+    }
+
+    match services::nginx::test_config().await {
+        Ok(output) if output.success => match services::nginx::reload().await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let note = rollback();
+                Err(api_err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("Alias saved but nginx reload failed: {e}{note}"),
+                ))
+            }
+        },
+        Ok(output) => {
+            let note = rollback();
+            Err(api_err(
+                StatusCode::BAD_REQUEST,
+                &format!("Nginx config test failed: {}{note}", output.stderr),
+            ))
+        }
+        Err(e) => {
+            let note = rollback();
+            Err(api_err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("Failed to test config: {e}{note}"),
+            ))
+        }
+    }
+}
+
 /// POST /nginx/aliases/add — Add a domain alias to a site.
-async fn add_alias(
-    Json(body): Json<AliasRequest>,
-) -> Result<Json<serde_json::Value>, ApiErr> {
+async fn add_alias(Json(body): Json<AliasRequest>) -> Result<Json<serde_json::Value>, ApiErr> {
     if body.domain.is_empty() || body.alias.is_empty() {
         return Err(api_err(StatusCode::BAD_REQUEST, "Missing fields"));
     }
@@ -1704,55 +1802,19 @@ async fn add_alias(
         return Err(api_err(StatusCode::BAD_REQUEST, "Invalid alias domain format"));
     }
 
-    let site_conf = format!("{}/{}.conf", services::nginx::sites_dir(), body.domain);
-    let content = std::fs::read_to_string(&site_conf)
-        .map_err(|_| api_err(StatusCode::NOT_FOUND, "Site config not found"))?;
-
-    // Add alias to server_name line
-    let new_content = content.replace(
-        &format!("server_name {};", body.domain),
-        &format!("server_name {} {};", body.domain, body.alias),
-    );
-
-    if new_content == content {
-        return Err(api_err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Could not find server_name directive",
-        ));
+    let current = services::nginx::aliases_for(&body.domain);
+    if current.iter().any(|a| a == &body.alias) {
+        // Idempotent: re-adding a name a site already answers on is not an error,
+        // and re-writing the vhost for it would only risk a needless reload.
+        return Ok(Json(serde_json::json!({ "ok": true, "alias": body.alias })));
     }
 
-    let tmp = format!("{site_conf}.tmp");
-    std::fs::write(&tmp, &new_content)
-        .map_err(|e| api_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e}")))?;
-    std::fs::rename(&tmp, &site_conf).map_err(|e| {
-        std::fs::remove_file(&tmp).ok();
-        api_err(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e}"))
-    })?;
-
-    match services::nginx::test_config().await {
-        Ok(output) if output.success => {
-            if let Err(e) = services::nginx::reload().await {
-                return Err(api_err(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("Config saved but nginx reload failed: {e}"),
-                ));
-            }
-        }
-        _ => {
-            // Revert
-            std::fs::write(&site_conf, &content).ok();
-            if let Err(e) = services::nginx::reload().await {
-                tracing::warn!("Nginx reload failed during alias rollback for {}: {e}", body.domain);
-            }
-            return Err(api_err(
-                StatusCode::BAD_REQUEST,
-                "Nginx test failed — alias reverted",
-            ));
-        }
-    }
+    let mut next = current.clone();
+    next.push(body.alias.clone());
+    apply_aliases(&body.domain, &current, &next).await?;
 
     tracing::info!("Domain alias added: {} → {}", body.alias, body.domain);
-    Ok(Json(serde_json::json!({ "ok": true })))
+    Ok(Json(serde_json::json!({ "ok": true, "alias": body.alias })))
 }
 
 /// GET /nginx/aliases/{domain} — List domain aliases.
@@ -1760,30 +1822,9 @@ async fn list_aliases(Path(domain): Path<String>) -> Result<Json<serde_json::Val
     if !super::is_valid_domain(&domain) {
         return Err(api_err(StatusCode::BAD_REQUEST, "Invalid domain format"));
     }
-    let site_conf = format!("{}/{domain}.conf", services::nginx::sites_dir());
-    let content = std::fs::read_to_string(&site_conf).unwrap_or_default();
-
-    let mut aliases: Vec<String> = Vec::new();
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("server_name ") {
-            let names_part = trimmed
-                .strip_prefix("server_name ")
-                .unwrap_or("")
-                .trim_end_matches(';')
-                .trim();
-            for name in names_part.split_whitespace() {
-                if name != domain {
-                    aliases.push(name.to_string());
-                }
-            }
-        }
-    }
-
-    // Deduplicate
-    aliases.sort();
-    aliases.dedup();
-
+    // The store, not the vhost: reading the vhost is what made an alias look
+    // present right up until the rewrite that dropped it.
+    let aliases = services::nginx::aliases_for(&domain);
     Ok(Json(serde_json::json!({ "aliases": aliases })))
 }
 
@@ -1802,37 +1843,21 @@ async fn remove_alias(
     if alias.is_empty() {
         return Err(api_err(StatusCode::BAD_REQUEST, "Alias required"));
     }
-
-    let site_conf = format!("{}/{domain}.conf", services::nginx::sites_dir());
-    let content = std::fs::read_to_string(&site_conf)
-        .map_err(|_| api_err(StatusCode::NOT_FOUND, "Site config not found"))?;
-
-    // Remove alias from server_name lines
-    let new_content = content
-        .replace(&format!(" {alias}"), "")
-        .replace(&format!("{alias} "), "");
-
-    std::fs::write(&site_conf, &new_content).ok();
-
-    match services::nginx::test_config().await {
-        Ok(output) if output.success => {
-            if let Err(e) = services::nginx::reload().await {
-                return Err(api_err(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("Config saved but nginx reload failed: {e}"),
-                ));
-            }
-        }
-        _ => {
-            std::fs::write(&site_conf, &content).ok();
-            if let Err(e) = services::nginx::reload().await {
-                tracing::warn!("Nginx reload failed during alias removal rollback for {domain}: {e}");
-            }
-        }
+    if !super::is_valid_domain(alias) {
+        return Err(api_err(StatusCode::BAD_REQUEST, "Invalid alias domain format"));
     }
 
+    let current = services::nginx::aliases_for(&domain);
+    let next: Vec<String> = current.iter().filter(|a| *a != alias).cloned().collect();
+    if next.len() == current.len() {
+        // Nothing named that alias is configured; saying so beats a 404 that the
+        // UI would render as a failure of the removal itself.
+        return Ok(Json(serde_json::json!({ "ok": true, "alias": alias })));
+    }
+    apply_aliases(&domain, &current, &next).await?;
+
     tracing::info!("Domain alias removed: {alias} from {domain}");
-    Ok(Json(serde_json::json!({ "ok": true })))
+    Ok(Json(serde_json::json!({ "ok": true, "alias": alias })))
 }
 
 // ──────────────────────────────────────────────────────────────

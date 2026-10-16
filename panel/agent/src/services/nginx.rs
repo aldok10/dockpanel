@@ -714,6 +714,127 @@ fn is_safe_php_socket(socket: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || "/-_.".contains(c))
 }
 
+// ─── Domain aliases ────────────────────────────────────────────────────────
+//
+// An alias is a second name a site answers on. It has to survive a REWRITE: the
+// vhost is regenerated from these templates by every settings save, SSL renewal,
+// security-hardening pass and auto-heal, so an alias that lives only in the
+// rendered file is an alias with a timer on it. That is what this was —
+// `POST /nginx/aliases/add` appended the name to the `server_name` line it found
+// on disk, and the next rewrite served the site without it while the operator's
+// second hostname stopped resolving and the panel listed nothing.
+//
+// The store below is what the render reads, so the name is re-applied every time
+// the vhost is generated. It is a file rather than a `sites` column because the
+// agent is already the authority the backend asks (`GET /nginx/aliases/{domain}`)
+// and an add has to take effect on a live box without a backend migration.
+
+/// Directory holding one store file per domain, one alias per line.
+pub fn aliases_dir() -> &'static str {
+    "/etc/nginx/aliases"
+}
+
+/// The recorded aliases for `domain`: validated, de-duplicated, in order.
+///
+/// The store is authoritative. When it is absent the vhost's own `server_name`
+/// lines are the fallback, which is how an alias added before this store existed
+/// gets carried forward instead of being dropped by the first rewrite after the
+/// upgrade.
+pub fn aliases_for(domain: &str) -> Vec<String> {
+    let file = format!("{}/{domain}", aliases_dir());
+    let names: Vec<String> = match std::fs::read_to_string(&file) {
+        Ok(content) => content.lines().map(|l| l.trim().to_string()).collect(),
+        Err(_) => {
+            let conf = std::fs::read_to_string(vhost_target(domain).path()).unwrap_or_default();
+            conf.lines()
+                .filter_map(|line| line.trim().strip_prefix("server_name "))
+                .flat_map(|rest| {
+                    rest.trim_end_matches(';')
+                        .split_whitespace()
+                        .map(|s| s.to_string())
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        }
+    };
+    sanitize_aliases(names, domain)
+}
+
+/// Drop anything that is not a usable name: the domain itself, blanks, and
+/// anything [`crate::routes::is_valid_domain`] rejects.
+///
+/// This is an injection gate, not a tidier. The name is rendered into a
+/// root-owned `server_name` directive, so a stray space or newline from a
+/// hand-edited store file would become a second directive.
+fn sanitize_aliases(names: Vec<String>, domain: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for name in names {
+        if name.is_empty() || name == domain {
+            continue;
+        }
+        if !crate::routes::is_valid_domain(&name) {
+            tracing::warn!("Ignoring invalid domain alias {name:?} for {domain}");
+            continue;
+        }
+        if !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    out
+}
+
+/// Put `domain` plus every alias into `content`'s `server_name` line(s).
+///
+/// Line-scoped on purpose. The old implementation was two `str::replace` calls
+/// over the whole file, which deleted the name wherever that text appeared (a
+/// comment, a log path, a `custom_nginx` body) — and, because `add` matched the
+/// literal `server_name <domain>;`, a site could never hold more than one alias.
+/// A line whose first name is not this domain belongs to somebody else's snippet
+/// and is left alone.
+pub fn with_server_names(content: &str, domain: &str, aliases: &[String]) -> String {
+    let mut out = String::with_capacity(content.len() + 64);
+    for line in content.lines() {
+        let trimmed = line.trim_start();
+        let own_line = trimmed
+            .strip_prefix("server_name ")
+            .map(|rest| rest.trim_end_matches(';').split_whitespace().next() == Some(domain))
+            .unwrap_or(false);
+        if !own_line {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        let indent = &line[..line.len() - trimmed.len()];
+        out.push_str(indent);
+        out.push_str("server_name ");
+        out.push_str(domain);
+        for alias in aliases {
+            out.push(' ');
+            out.push_str(alias);
+        }
+        out.push_str(";\n");
+    }
+    out
+}
+
+/// Write a domain's alias store atomically (one alias per line).
+pub fn write_alias_store(domain: &str, aliases: &[String]) -> std::io::Result<()> {
+    let dir = std::path::Path::new(aliases_dir());
+    std::fs::create_dir_all(dir)?;
+    let file = dir.join(domain);
+    let tmp = dir.join(format!(".{domain}.pending"));
+    let mut body = aliases.join("\n");
+    if !body.is_empty() {
+        body.push('\n');
+    }
+    std::fs::write(&tmp, body)?;
+    if let Err(e) = std::fs::rename(&tmp, &file) {
+        std::fs::remove_file(&tmp).ok();
+        return Err(e);
+    }
+    Ok(())
+}
+
 /// Render the appropriate nginx config for a site.
 pub fn render_site_config(
     templates: &Tera,
@@ -744,6 +865,10 @@ pub fn render_site_config(
 
     let mut ctx = Context::new();
     ctx.insert("domain", domain);
+    // Re-applied on EVERY render — that is what makes an alias outlive the
+    // rewrite that regenerates this vhost. Composed here rather than left to the
+    // alias handler, which can only patch the file it happens to find.
+    ctx.insert("aliases", &aliases_for(domain).join(" "));
     ctx.insert("root", config.root.as_deref().unwrap_or("/var/www"));
     ctx.insert("bind_ip", &detect_bind_ip());
     ctx.insert("runtime", &config.runtime);
@@ -1272,5 +1397,68 @@ mod tests {
         assert_eq!(sanitize_header_value("x\" always; location /p { }"), "x always; location /p  ");
         assert!(!sanitize_header_value("a\"b\\c{d}").contains('"'));
         assert!(!sanitize_header_value("a\"b\\c{d}").contains('\\'));
+    }
+
+    // ── domain aliases — survive the rewrite, not just the add ──────────
+    //
+    // The store is what makes an alias outlive a render, so these hold the two
+    // halves apart: the name is added to every `server_name` this domain owns, and
+    // it is not removed from anywhere else in the file.
+
+    #[test]
+    fn every_server_name_of_the_domain_takes_the_alias() {
+        // A real vhost has two — the :80 redirect and the :443 body — and an alias
+        // that reaches only one of them answers on HTTP but not HTTPS.
+        let conf = "server {\n    listen 80;\n    server_name a.example;\n}\n\
+                    server {\n    listen 443 ssl;\n    server_name a.example;\n}\n";
+        let out = with_server_names(conf, "a.example", &["b.example".to_string()]);
+        assert_eq!(out.matches("server_name a.example b.example;").count(), 2, "{out}");
+    }
+
+    #[test]
+    fn removal_leaves_the_bare_domain_behind() {
+        let conf = "server {\n    server_name a.example b.example;\n}\n";
+        let out = with_server_names(conf, "a.example", &[]);
+        assert!(out.contains("server_name a.example;"), "{out}");
+        assert!(!out.contains("b.example"), "{out}");
+    }
+
+    #[test]
+    fn a_foreign_server_name_line_is_left_alone() {
+        // `custom_nginx` lands in the same server block; a name that is not this
+        // domain belongs to whoever wrote it.
+        let conf = "server {\n    server_name a.example;\n    server_name internal.example;\n}\n";
+        let out = with_server_names(conf, "a.example", &["b.example".to_string()]);
+        assert!(out.contains("server_name internal.example;"), "{out}");
+    }
+
+    #[test]
+    fn the_alias_is_only_touched_where_it_names_the_site() {
+        // The old handler ran `str::replace(" {alias}", "")` over the whole file,
+        // which also edited comments, log paths and any custom snippet that
+        // mentioned the name.
+        let conf = "server {\n    server_name a.example b.example;\n\
+                    access_log /var/log/nginx/b.example.access.log;\n\
+                    # answers as b.example too\n}\n";
+        let out = with_server_names(conf, "a.example", &[]);
+        assert!(out.contains("server_name a.example;"), "{out}");
+        assert!(out.contains("/var/log/nginx/b.example.access.log;"), "{out}");
+        assert!(out.contains("# answers as b.example too"), "{out}");
+    }
+
+    #[test]
+    fn an_alias_that_is_not_a_domain_never_reaches_the_config() {
+        // This value is rendered into a root-owned directive: a space or a newline
+        // in it would become a second nginx directive, and the domain itself is not
+        // an alias of itself.
+        let names = vec![
+            "a.example".to_string(),        // the site, not an alias of itself
+            "".to_string(),                 // blank line in a hand-edited store
+            "b.example".to_string(),        // the one real alias
+            "b.example".to_string(),        // duplicate
+            "x; return 301 https://evil".to_string(),
+            "two words.example".to_string(),
+        ];
+        assert_eq!(sanitize_aliases(names, "a.example"), vec!["b.example".to_string()]);
     }
 }
