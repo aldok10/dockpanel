@@ -223,7 +223,21 @@ fn apk_name(debian: &str) -> String {
     match debian {
         "pdns-server" => "pdns".into(),
         "redis-server" => "redis".into(),
-        "dovecot-imapd" | "dovecot-pop3d" | "dovecot-lmtpd" => "dovecot".into(),
+        // Unlike RPM, Alpine does NOT ship one package for the whole Dovecot
+        // suite: the base `dovecot` carries the server and IMAP, but POP3 and
+        // LMTP are separate subpackages (`dovecot-pop3d`, `dovecot-lmtpd`) —
+        // the same split Debian has. Collapsing all three onto `dovecot` left
+        // `protocols = imap pop3 lmtp` naming protocols whose binaries were
+        // never installed, so POP3 was dead and, worse, LMTP — the transport
+        // Postfix delivers virtual mailboxes with — could not run, deferring
+        // every message forever while both services reported active.
+        "dovecot-imapd" => "dovecot".into(),
+        "dovecot-pop3d" => "dovecot-pop3d".into(),
+        "dovecot-lmtpd" => "dovecot-lmtpd".into(),
+        // Alpine names the OpenDKIM CLI tools `opendkim-utils`, not
+        // `opendkim-tools`; a missing name aborts the whole `apk add`
+        // transaction, so the mail install died before writing a single file.
+        "opendkim-tools" => "opendkim-utils".into(),
         "python3-certbot-nginx" => "certbot-nginx".into(),
         other => match split_php_package(other) {
             Some((version, ext)) => {
