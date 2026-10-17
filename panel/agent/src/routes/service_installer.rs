@@ -1383,9 +1383,9 @@ install -m 0644 objs/ngx_http_modsecurity_module.so /usr/lib/nginx/modules/
     }
 
     // The module has to be loaded before any `modsecurity` directive is valid.
-    // Alpine's nginx includes `/etc/nginx/modules/*.conf`; a directive there is
-    // how every packaged module on this distro does it, and it keeps the line
-    // out of the user's own site configs.
+    // Alpine's nginx includes every `*.conf` it finds under /etc/nginx/modules;
+    // a directive there is how every packaged module on this distro does it, and
+    // it keeps the line out of the user's own site configs.
     if let Err(e) = std::fs::create_dir_all("/etc/nginx/modules") {
         return Err(err(
             StatusCode::INTERNAL_SERVER_ERROR,
