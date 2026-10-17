@@ -99,7 +99,12 @@ pub fn mail_records(
             "@",
             domain,
             "TXT",
-            format!("v=spf1 a mx ip4:{server_ip} ~all"),
+            // No `a` term: a domain whose A record is proxied (Cloudflare, say)
+            // would then authorise that CDN's shared addresses to send as the
+            // domain — a spam signal, and an authorisation nobody intended.
+            // `mx` and the explicit `ip4:` already cover this server, and `-all`
+            // states the intent that nothing else may send.
+            format!("v=spf1 mx ip4:{server_ip} -all"),
             "300",
         )
         .with_purpose("SPF — authorises this server to send mail for the domain."),
