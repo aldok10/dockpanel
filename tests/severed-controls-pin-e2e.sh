@@ -80,11 +80,13 @@ eq "A6-control the same pattern shape DOES match the db-backups delete" \
 
 # A7: the handlers stay ownership-scoped. Wiring a caller to a handler is what
 # makes its guards reachable for the first time (#534), so the guards are pinned
-# in the same suite as the callers.
-eq "A7 delete_db_backup is still owner-scoped" \
-   "$(sed -n '/pub async fn delete_db_backup(/,/^}/p' "$BACKEND" | $G -c 's\.user_id = \$1')" "1"
-eq "A7b restore_db_backup is still owner-scoped" \
-   "$(sed -n '/pub async fn restore_db_backup(/,/^}/p' "$BACKEND" | $G -c 's\.user_id = \$1')" "1"
+# in the same suite as the callers. Ownership is now the database's OWNER — a site
+# OR a stack — so the predicate is COALESCE(s.user_id, st.user_id); a plain
+# `s.user_id = $1` here dropped every stack-owned database (GH: "Database not found").
+eq "A7 delete_db_backup is still owner-scoped (site or stack)" \
+   "$(sed -n '/pub async fn delete_db_backup(/,/^}/p' "$BACKEND" | $G -c 'COALESCE(s\.user_id, st\.user_id) = \$1')" "1"
+eq "A7b restore_db_backup is still owner-scoped (site or stack)" \
+   "$(sed -n '/pub async fn restore_db_backup(/,/^}/p' "$BACKEND" | $G -c 'COALESCE(s\.user_id, st\.user_id) = \$1')" "1"
 eq "A7c restore_volume_backup is still scoped to servers this operator runs" \
    "$(sed -n '/pub async fn restore_volume_backup(/,/^}/p' "$BACKEND" | $G -c "u\.role = 'admin'")" "1"
 

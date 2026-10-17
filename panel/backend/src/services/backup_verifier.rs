@@ -68,16 +68,23 @@ async fn tick(db: &PgPool, agents: &AgentRegistry) -> Result<(), String> {
         verify_one(db, agents, *server_id, "site", *backup_id, domain, filename, None, None).await;
     }
 
-    // Database backups resolve their server through the site that owns the database,
-    // not through `database_backups.server_id`: that column is nullable and a policy
-    // with no server writes NULL into it. `sites.server_id` is NOT NULL, so this join
-    // cannot produce an ambiguous host. Same join `create_db_backup` already makes.
+    // Database backups resolve their server through the OWNER of the database — a site
+    // OR a docker stack — not through `database_backups.server_id`: that column is
+    // nullable and a policy with no server writes NULL into it. Both owner tables carry
+    // a NOT NULL `server_id`, so a LEFT JOIN + COALESCE cannot produce an ambiguous host.
+    // A plain `JOIN sites` silently skipped every stack-owned database's archives
+    // (`d.site_id IS NULL`), so they were never auto-verified — the same blind spot
+    // `create_db_backup` and the policy executor had. NULL owners (a stack that names no
+    // server) are still excluded rather than verified against a guessed host.
     let db_backups: Vec<(Uuid, String, String, String, Uuid)> = sqlx::query_as(
-        "SELECT db.id, db.db_type, db.db_name, db.filename, s.server_id FROM database_backups db \
+        "SELECT db.id, db.db_type, db.db_name, db.filename, COALESCE(s.server_id, st.server_id) \
+         FROM database_backups db \
          JOIN databases d ON d.id = db.database_id \
-         JOIN sites s ON s.id = d.site_id \
+         LEFT JOIN sites s ON s.id = d.site_id \
+         LEFT JOIN docker_stacks st ON st.id = d.stack_id \
          LEFT JOIN backup_verifications bv ON bv.backup_type = 'database' AND bv.backup_id = db.id \
          WHERE bv.id IS NULL AND db.created_at > NOW() - INTERVAL '7 days' \
+           AND COALESCE(s.server_id, st.server_id) IS NOT NULL \
          ORDER BY db.created_at DESC LIMIT 3"
     )
     .fetch_all(db).await.map_err(|e| e.to_string())?;

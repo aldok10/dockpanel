@@ -906,11 +906,27 @@ pub async fn create_db_backup(
     AuthUser(claims): AuthUser,
     Json(req): Json<CreateDbBackupRequest>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    // Fetch database details (join with sites for user ownership and server_id)
+    // Fetch database details. A `databases` row carries exactly one owner FK
+    // (`chk_databases_owner`): a site OR a docker stack, with the other NULL. The old
+    // plain `JOIN sites` therefore resolved only site-owned rows and reported every
+    // stack-owned database (`d.site_id IS NULL` since v2.242.0's standalone-DB-for-stacks
+    // ship) as "Database not found" — even though `/databases` lists those rows and the
+    // Databases tab renders a Quick Backup button for each. LEFT JOIN both owner tables
+    // and COALESCE, the same pattern `databases.rs` list()/get() and
+    // `backup_policy_executor` already use, so the button and the scheduled leg agree
+    // about what exists.
+    //
+    // The admin arm mirrors list() too: an administrator who can SEE a tenant's database
+    // in the tab must be able to back it up, exactly as the scheduled executor does.
     let row: Option<(Uuid, String, String, String, String, Option<Uuid>)> = sqlx::query_as(
-        "SELECT d.id, d.name, d.engine, d.db_user, d.db_password_enc, s.server_id \
-         FROM databases d JOIN sites s ON d.site_id = s.id \
-         WHERE d.id = $1 AND s.user_id = $2"
+        "SELECT d.id, d.name, d.engine, d.db_user, d.db_password_enc, \
+         COALESCE(s.server_id, st.server_id) \
+         FROM databases d \
+         LEFT JOIN sites s ON d.site_id = s.id \
+         LEFT JOIN docker_stacks st ON d.stack_id = st.id \
+         WHERE d.id = $1 AND (COALESCE(s.user_id, st.user_id) = $2 OR EXISTS (SELECT 1 FROM users u, servers sv \
+         WHERE u.id = $2 AND u.role = 'admin' AND sv.id = COALESCE(s.server_id, st.server_id) \
+         AND (sv.is_local OR sv.user_id = u.id)))"
     )
     .bind(req.database_id).bind(claims.sub)
     .fetch_optional(&state.db).await
@@ -919,8 +935,9 @@ pub async fn create_db_backup(
     let (db_id, db_name, engine, user, password_enc, server_id) =
         row.ok_or_else(|| err(StatusCode::NOT_FOUND, "Database not found"))?;
 
-    // Dump on the host the SITE lives on. This handler already held the answer: the
-    // join above reads `s.server_id` and the INSERT below stamps the new row with it,
+    // Dump on the host the database's OWNER (site or stack) lives on. This handler
+    // already held the answer: the join above reads the owner's `server_id`, and the
+    // INSERT below stamps the new row with it,
     // while the dump itself went to whatever agent the caller's server switcher named
     // (an HTTP header with a local-agent fallback). So the archive was written on host
     // A and the row claimed host B — a guaranteed lie the moment the two disagree, and
@@ -1016,9 +1033,20 @@ pub async fn list_db_backups(
 ) -> Result<Json<Vec<DatabaseBackup>>, ApiError> {
     let (limit, offset) = paginate(params.limit, params.offset);
 
+    // Owner scope can't use a plain `JOIN sites`: a stack-owned database has
+    // `d.site_id IS NULL`, so its backups would be created (see create_db_backup) and
+    // then never listed. LEFT JOIN both owner tables + COALESCE, with the same admin
+    // widening list() grants. The admin arm keys off the archive's own `server_id` —
+    // that is the host the row names, so a local-box admin or the owning account's
+    // account-admin sees exactly the archives they can act on.
     let backups: Vec<DatabaseBackup> = sqlx::query_as(
         "SELECT db.* FROM database_backups db \
-         JOIN databases d ON d.id = db.database_id JOIN sites s ON d.site_id = s.id AND s.user_id = $1 \
+         JOIN databases d ON d.id = db.database_id \
+         LEFT JOIN sites s ON d.site_id = s.id \
+         LEFT JOIN docker_stacks st ON d.stack_id = st.id \
+         WHERE (COALESCE(s.user_id, st.user_id) = $1 OR EXISTS (SELECT 1 FROM users u, servers sv \
+         WHERE u.id = $1 AND u.role = 'admin' AND sv.id = db.server_id \
+         AND (sv.is_local OR sv.user_id = u.id))) \
          ORDER BY db.created_at DESC LIMIT $2 OFFSET $3"
     )
     .bind(claims.sub).bind(limit).bind(offset)
@@ -1036,8 +1064,12 @@ pub async fn delete_db_backup(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let backup: Option<DatabaseBackup> = sqlx::query_as(
         "SELECT db.* FROM database_backups db \
-         JOIN databases d ON d.id = db.database_id JOIN sites s ON d.site_id = s.id AND s.user_id = $1 \
-         WHERE db.id = $2"
+         JOIN databases d ON d.id = db.database_id \
+         LEFT JOIN sites s ON d.site_id = s.id \
+         LEFT JOIN docker_stacks st ON d.stack_id = st.id \
+         WHERE db.id = $2 AND (COALESCE(s.user_id, st.user_id) = $1 OR EXISTS (SELECT 1 FROM users u, servers sv \
+         WHERE u.id = $1 AND u.role = 'admin' AND sv.id = db.server_id \
+         AND (sv.is_local OR sv.user_id = u.id)))"
     )
     .bind(claims.sub).bind(id)
     .fetch_optional(&state.db).await
@@ -1085,8 +1117,12 @@ pub async fn restore_db_backup(
     // Look up the backup record, verify ownership
     let backup: Option<DatabaseBackup> = sqlx::query_as(
         "SELECT db.* FROM database_backups db \
-         JOIN databases d ON d.id = db.database_id JOIN sites s ON d.site_id = s.id AND s.user_id = $1 \
-         WHERE db.id = $2"
+         JOIN databases d ON d.id = db.database_id \
+         LEFT JOIN sites s ON d.site_id = s.id \
+         LEFT JOIN docker_stacks st ON d.stack_id = st.id \
+         WHERE db.id = $2 AND (COALESCE(s.user_id, st.user_id) = $1 OR EXISTS (SELECT 1 FROM users u, servers sv \
+         WHERE u.id = $1 AND u.role = 'admin' AND sv.id = db.server_id \
+         AND (sv.is_local OR sv.user_id = u.id)))"
     )
     .bind(claims.sub).bind(id)
     .fetch_optional(&state.db).await
