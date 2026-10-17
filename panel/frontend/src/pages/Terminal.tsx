@@ -148,6 +148,13 @@ const siteSnippets = [
 
 const IDLE_TIMEOUT = 30 * 60 * 1000; // 30 minutes
 const MAX_RECONNECT_ATTEMPTS = 3;
+// How long a socket must stay OPEN before it counts as a genuine recovery and
+// the reconnect backoff is reset. Resetting on `onopen` alone is what turned a
+// flapping connection into an infinite loop: a server that accepts the upgrade
+// and drops it a moment later cleared the attempt counter on every cycle, so
+// the "give up after 3" branch below could never be reached and the page
+// reconnected for ever.
+const STABLE_CONNECTION_MS = 5000;
 
 export default function Terminal() {
   const [searchParams] = useSearchParams();
@@ -171,6 +178,8 @@ export default function Terminal() {
   const intentionalClose = useRef(false);
   const reconnectAttempts = useRef(0);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  // Cleared once a connection has proven stable — see STABLE_CONNECTION_MS.
+  const stableTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
   const statusRef = useRef("");
 
   const [connected, setConnected] = useState(false);
@@ -280,13 +289,27 @@ export default function Terminal() {
         clearTimeout(reconnectTimer.current);
         reconnectTimer.current = undefined;
       }
-
-      // Cleanup previous
-      intentionalClose.current = true; // Prevent reconnect from the old socket's onclose
-      if (wsRef.current) {
-        wsRef.current.close();
-        wsRef.current = null;
+      if (stableTimer.current) {
+        clearTimeout(stableTimer.current);
+        stableTimer.current = undefined;
       }
+
+      // Cleanup previous.
+      //
+      // `wsRef.current` is cleared BEFORE the old socket is closed, and every
+      // handler below closes over the socket it was created for. That is what
+      // makes a close event from a socket we deliberately REPLACED (site change,
+      // manual Reconnect, the next auto-reconnect) recognisable as stale and
+      // ignored. The shared `intentionalClose` flag alone was not enough: it is
+      // reset synchronously, but `.close()` delivers `onclose` on a later tick —
+      // by which time the flag reads "the current connection is intentional" and
+      // the superseded socket scheduled a fresh reconnect. One extra reconnect
+      // per `connect()` call, which is the loop that produced "Connection lost.
+      // Reconnecting in 4s... (attempt 2/3)" on an otherwise healthy server.
+      intentionalClose.current = true; // Keep the old socket from reconnecting
+      const previous = wsRef.current;
+      wsRef.current = null;
+      if (previous) previous.close();
       if (xtermRef.current) {
         xtermRef.current.dispose();
         xtermRef.current = null;
@@ -382,12 +405,22 @@ export default function Terminal() {
           setConnected(true);
           setStatus("");
           setError("");
-          reconnectAttempts.current = 0;
+          // Do NOT clear the attempt counter here. A socket that opens and is
+          // dropped moments later would reset the backoff on every cycle and
+          // reconnect for ever, so the cap below could never be reached. Only a
+          // connection that survives STABLE_CONNECTION_MS counts as recovered.
+          if (stableTimer.current) clearTimeout(stableTimer.current);
+          stableTimer.current = setTimeout(() => {
+            reconnectAttempts.current = 0;
+          }, STABLE_CONNECTION_MS);
           term.clear();
           resetIdleTimer();
         };
 
         ws.onmessage = (event) => {
+          // Ignore anything a superseded socket still delivers: its xterm has
+          // already been disposed by the `connect()` that replaced it.
+          if (wsRef.current !== ws) return;
           term.write(event.data);
           // Capture output for recording (use ref to avoid stale closure)
           if (recordingRef.current) {
@@ -396,6 +429,16 @@ export default function Terminal() {
         };
 
         ws.onclose = () => {
+          // A superseded socket must not drive reconnection. `connect()` clears
+          // `wsRef.current` before replacing it, so by the time this fires for an
+          // OLD socket the ref already points at the new one — and acting on it
+          // here is exactly what spawned the extra reconnect each time.
+          if (wsRef.current !== ws) return;
+
+          if (stableTimer.current) {
+            clearTimeout(stableTimer.current);
+            stableTimer.current = undefined;
+          }
           setConnected(false);
 
           // Auto-reconnect on unexpected close
@@ -480,6 +523,7 @@ export default function Terminal() {
     return () => {
       if (idleTimer.current) clearTimeout(idleTimer.current);
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
+      if (stableTimer.current) clearTimeout(stableTimer.current);
       intentionalClose.current = true;
       wsRef.current?.close();
       xtermRef.current?.dispose();

@@ -49,6 +49,9 @@ pub fn forget_terminal(pid: i32) {
 static LAST_CONNECT: AtomicU64 = AtomicU64::new(0);
 const MAX_TERMINAL_SESSIONS: u32 = 20;
 
+/// Minimum spacing between terminal handshakes, in whole seconds.
+const TERMINAL_MIN_INTERVAL_SECS: u64 = 1;
+
 #[derive(Deserialize)]
 struct TermQuery {
     domain: Option<String>,
@@ -94,14 +97,29 @@ async fn ws_handler(
     Query(q): Query<TermQuery>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    // Rate limit: max 1 connection per second (prevents rapid reconnect storms)
+    // Rate limit: at most one terminal handshake per second, to blunt a
+    // reconnect storm.
+    //
+    // A compare-exchange loop, NOT `swap`. `swap` recorded the current second
+    // even for the request it then refused, so a refused caller pushed the
+    // window forward for everyone — including itself on its next attempt — and
+    // two handshakes arriving in the same second (two tabs, a client retrying on
+    // a second boundary) were BOTH answered 429. Here the timestamp advances
+    // only for the request that is accepted; a refused caller is judged on its
+    // own arrival time, so spacing the retries out is all it takes to be let in.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_secs();
-    let last = LAST_CONNECT.swap(now, Ordering::Relaxed);
-    if now == last {
-        return (StatusCode::TOO_MANY_REQUESTS, "Too many terminal connections").into_response();
+    let mut last = LAST_CONNECT.load(Ordering::Relaxed);
+    loop {
+        if now.saturating_sub(last) < TERMINAL_MIN_INTERVAL_SECS {
+            return (StatusCode::TOO_MANY_REQUESTS, "Too many terminal connections").into_response();
+        }
+        match LAST_CONNECT.compare_exchange_weak(last, now, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(actual) => last = actual,
+        }
     }
 
     // Enforce terminal session limit
