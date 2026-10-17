@@ -404,7 +404,7 @@ that reads the source and fails if the fix is undone — including the shapes th
 are easy to undo by accident. The mail pins assert, among other things, that the
 sandbox was **not** widened to include `/etc/opendkim.conf`, since widening it
 would have "fixed" the bug while destroying the reason the bug was
-survivable. One-hundred-forty suites, **4619 assertions**, all green at the current commit:
+survivable. One-hundred-forty-two suites, **4674 assertions**, all green at the current commit:
 
 | Suite | Assertions |
 |---|---|
@@ -412,7 +412,7 @@ survivable. One-hundred-forty suites, **4619 assertions**, all green at the curr
 | `bandwidth-quota-pin-e2e.sh` | 31 |
 | `ai-diagnosis-pin-e2e.sh` | 29 |
 | `resource-mutation-audit-log-pin-e2e.sh` | 47 |
-| `carry-sweep-pin-e2e.sh` | 89 |
+| `carry-sweep-pin-e2e.sh` | 98 |
 | `ssl-controls-pin-e2e.sh` | 137 |
 | `db-import-pin-e2e.sh` | 53 |
 | `mail-smtp-dkim-pin-e2e.sh` | 25 |
@@ -548,6 +548,8 @@ survivable. One-hundred-forty suites, **4619 assertions**, all green at the curr
 | `git-deploy-preview-status-pin-e2e.sh` | 9 |
 | `migration-url-fetch-pin-e2e.sh` | 21 |
 | `db-backup-stack-owner-pin-e2e.sh` | 15 |
+| `acme-challenge-pin-e2e.sh` | 37 |
+| `terminal-reconnect-loop-pin-e2e.sh` | 9 |
 
 **On a schedule, from outside** (`live-surfaces.yml`, daily). Every layer above
 runs because something changed, which is exactly why none of them could catch the
