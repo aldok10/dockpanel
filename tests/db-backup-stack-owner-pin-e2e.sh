@@ -36,8 +36,8 @@ DATABASES="$REPO/panel/backend/src/routes/databases.rs"
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf '  \033[0;32m✓\033[0m %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf '  \033[0;31m✗\033[0m %s\n' "$1"; }
-hasIn()    { printf '%s' "$1" | grep -qF -- "$2" && ok "$3" || bad "$3"; }
-absentIn() { printf '%s' "$1" | grep -qF -- "$2" && bad "$3" || ok "$3"; }
+hasIn()    { grep -qF -- "$2" <<< "$1" && ok "$3" || bad "$3"; }
+absentIn() { grep -qF -- "$2" <<< "$1" && bad "$3" || ok "$3"; }
 
 extract() { sed -n "/pub async fn $1(/,/^}/p" "$ORCH"; }
 

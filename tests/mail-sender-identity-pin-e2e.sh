@@ -163,15 +163,22 @@ fi
 # virtual_alias_maps values are forward targets, so a mailbox that sets
 # forwarding loses the right to send as itself and the forward target gains it —
 # and a tenant could grant another tenant send-as rights by creating an alias.
+#
+# Matched on the MAP each declaration names, NOT on its backend: the backend is
+# read from Postfix itself at run time (`postfix_map_type()`, `hash` on Debian
+# and the RHEL family, `lmdb` on Alpine), so the literal `hash:` these arms were
+# written against is gone from the source and they were passing on nothing. The
+# placeholder is what the `format!` leaves in the text.
+MT='(\{\}|hash|lmdb)'
 for wrong in POSTFIX_VIRTUAL_MAILBOX POSTFIX_VIRTUAL_ALIAS; do
-  if hasre "$AGENT_PROD" "smtpd_sender_login_maps=hash:\{$wrong\}"; then
+  if hasre "$AGENT_PROD" "smtpd_sender_login_maps=${MT}:\{$wrong\}"; then
     bad "smtpd_sender_login_maps points at $wrong — that map's VALUES are not login names"
   else
     ok "smtpd_sender_login_maps does not borrow $wrong"
   fi
 done
 
-if hasre "$AGENT_PROD" 'smtpd_sender_login_maps=hash:\{POSTFIX_SENDER_LOGIN\}'; then
+if hasre "$AGENT_PROD" "smtpd_sender_login_maps=${MT}:\{POSTFIX_SENDER_LOGIN\}"; then
   ok "the restriction reads the purpose-built map"
 else
   bad "the sender-login map is not the one the restriction names"
