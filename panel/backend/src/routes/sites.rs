@@ -841,6 +841,11 @@ pub async fn create(
             let ssl_php_preset = body.php_preset.clone();
             let ssl_root_path: Option<String> = None; // default root
             let ssl_logs = logs.clone();
+            // The DNS-01 fallback below needs the same two things the interactive
+            // door does: the key the stored Cloudflare token was sealed with, and
+            // the OWNER whose zones (and ACME contact) the order belongs to.
+            let ssl_jwt = state.config.jwt_secret.clone();
+            let ssl_owner = claims.sub;
             // Lets the terminal step below report what actually happened instead
             // of asserting success on a timer (s252 F2).
             let (ssl_tx, ssl_rx) = tokio::sync::oneshot::channel::<bool>();

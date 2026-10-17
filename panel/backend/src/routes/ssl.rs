@@ -477,6 +477,52 @@ pub async fn provision(
     })))
 }
 
+/// Write the provenance a DNS-01 certificate must carry onto its site row.
+///
+/// ⛔ ONE writer for `ssl_challenge = 'dns-01'`, and it is deliberately one.
+/// Two doors issue over DNS-01 — the interactive `/ssl/dns01` one, and the
+/// auto-SSL fallback site creation reaches for when HTTP-01 cannot work — and
+/// both must record the SAME columns, or the renewal plan reads a provenance
+/// that is only half true and reverts one of them to a challenge it cannot pass.
+///
+/// `provision_domain` is the name ORDERED, which on a wildcard is the Cloudflare
+/// ZONE and not the site: renewal branches on exactly this column, and recording
+/// the site's own domain here is the defect that once destroyed a wildcard. The
+/// zone ROW is recorded too, so renewal reaches for the credential that issued
+/// the certificate instead of re-deriving a tenant from a text subject.
+#[allow(clippy::too_many_arguments)]
+async fn record_dns01_issuance(
+    pool: &sqlx::PgPool,
+    site_id: Uuid,
+    provision_domain: &str,
+    wildcard: bool,
+    zone: &crate::routes::dns::DnsZone,
+    profile: Option<&str>,
+    cert_path: &str,
+    key_path: &str,
+    ssl_expiry: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE sites SET ssl_enabled = true, ssl_cert_path = $1, ssl_key_path = $2, \
+         ssl_expiry = $3, ssl_profile = $4, \
+         ssl_challenge = 'dns-01', ssl_cert_subject = $6, ssl_wildcard = $7, \
+         ssl_dns_zone_id = $8, \
+         ssl_renewal_at = NULL, ssl_renewal_checked_at = NULL, \
+         updated_at = NOW() WHERE id = $5",
+    )
+    .bind(cert_path)
+    .bind(key_path)
+    .bind(ssl_expiry)
+    .bind(profile)
+    .bind(site_id)
+    .bind(provision_domain)
+    .bind(wildcard)
+    .bind(zone.id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// POST /api/sites/{id}/ssl/dns01 — Provision SSL via DNS-01 challenge (Cloudflare).
 /// Supports wildcard certificates when wildcard=true.
 pub async fn provision_dns01(
@@ -618,29 +664,22 @@ pub async fn provision_dns01(
     let cert_path = result.get("cert_path").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let key_path = result.get("key_path").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
-    // Update site in DB. `provision_domain` — NOT `site.domain` — is what was
-    // ordered: for a wildcard it is the Cloudflare ZONE, and the certificate
-    // covers `{zone}` and `*.{zone}`. Recording the zone ROW as well as its name
-    // means the renewal reaches for the credential that issued this certificate
-    // instead of re-deriving a zone from a text subject, which is how a stale
-    // string could otherwise select a different tenant's Cloudflare token.
-    sqlx::query(
-        "UPDATE sites SET ssl_enabled = true, ssl_cert_path = $1, ssl_key_path = $2, \
-         ssl_expiry = $3, ssl_profile = $4, \
-         ssl_challenge = 'dns-01', ssl_cert_subject = $6, ssl_wildcard = $7, \
-         ssl_dns_zone_id = $8, \
-         ssl_renewal_at = NULL, ssl_renewal_checked_at = NULL, \
-         updated_at = NOW() WHERE id = $5",
+    // Update site in DB through the ONE writer of DNS-01 provenance — the same
+    // one the auto-SSL fallback uses, so the two doors cannot record different
+    // columns. `provision_domain` — NOT `site.domain` — is what was ordered: for
+    // a wildcard it is the Cloudflare ZONE, and the certificate covers `{zone}`
+    // and `*.{zone}`.
+    record_dns01_issuance(
+        &state.db,
+        id,
+        provision_domain,
+        wildcard,
+        &zone,
+        profile.as_deref(),
+        &cert_path,
+        &key_path,
+        ssl_expiry,
     )
-    .bind(&cert_path)
-    .bind(&key_path)
-    .bind(ssl_expiry)
-    .bind(profile.as_deref())
-    .bind(id)
-    .bind(provision_domain)
-    .bind(wildcard)
-    .bind(zone.id)
-    .execute(&state.db)
     .await
     .map_err(|e| internal_error("dns01 update", e))?;
 
@@ -888,6 +927,101 @@ pub(crate) async fn renew_over_dns01(
                 .or_else(|| crate::error::acme_order_failure(&e))
                 .unwrap_or_else(|| format!("the DNS-01 order for {subject} did not complete: {e}"))
         })
+}
+
+/// Issue a certificate over Cloudflare DNS-01 for a site the panel just created,
+/// from the auto-SSL task — the one caller that holds a pool and an agent but no
+/// `AppState`, and has no operator in front of it.
+///
+/// HTTP-01 needs the certificate authority to reach port 80 of the domain. On a
+/// box where that port is filtered — a Cloudflare-proxied origin that does not
+/// answer on 80, a network that drops it — every attempt on the ladder above
+/// fails on validation and the site is served over HTTP until someone notices.
+/// When the owner already holds a matching Cloudflare zone the panel can prove
+/// control a different way, so this door does exactly that, as the FALLBACK the
+/// auto-SSL task reaches for after HTTP-01 has exhausted its retries.
+///
+/// ⛔ It goes through the SAME call the unattended DNS-01 renewal uses
+/// (`renew_over_dns01`), so the credential it reaches for and the timeout it
+/// budgets cannot drift from the renewal that will later have to repeat this. And
+/// it writes the SAME provenance the interactive DNS-01 door writes, because that
+/// recorded challenge is what tells the next renewal to come back over DNS-01
+/// rather than assume port 80.
+///
+/// The zone is chosen by longest-suffix match, the rule the interactive door
+/// uses, so a multi-part TLD resolves to the same zone at both doors. There is no
+/// `force`: this runs before anyone has been shown a foreign-certificate refusal.
+pub(crate) async fn issue_over_dns01_for_site(
+    pool: &sqlx::PgPool,
+    jwt_secret: &str,
+    agent: &crate::services::agent::AgentHandle,
+    site_id: Uuid,
+    owner_id: Uuid,
+    domain: &str,
+) -> Result<(), String> {
+    let zones: Vec<crate::routes::dns::DnsZone> =
+        sqlx::query_as("SELECT * FROM dns_zones WHERE user_id = $1 AND provider = 'cloudflare'")
+            .bind(owner_id)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| format!("Cloudflare zone lookup failed: {e}"))?;
+
+    let zone = zones
+        .into_iter()
+        .filter(|z| domain == z.domain || domain.ends_with(&format!(".{}", z.domain)))
+        .max_by_key(|z| z.domain.len())
+        .ok_or_else(|| {
+            format!(
+                "no Cloudflare DNS zone matches {domain}, so the DNS-01 challenge could not be \
+                 used — add the zone under DNS, then retry from the site's SSL section"
+            )
+        })?;
+
+    // Resolve the profile the way the interactive door does, and RECORD it: the
+    // renewal plan reads `ssl_profile` to decide the DNS-01 last-resort margin.
+    let profile = resolve_profile(pool, None).await;
+    let result = renew_over_dns01(
+        pool,
+        jwt_secret,
+        agent,
+        domain,
+        false,
+        zone.id,
+        owner_id,
+        profile.as_deref(),
+    )
+    .await?;
+
+    let ssl_expiry = result
+        .get("expiry")
+        .and_then(|v| v.as_str())
+        .and_then(crate::helpers::parse_agent_cert_expiry);
+    let cert_path = result.get("cert_path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let key_path = result.get("key_path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+    // Same writer the interactive door uses, so the two cannot record different
+    // columns. This door is always non-wildcard: it orders the site's own domain,
+    // so the recorded subject is that domain and `ssl_wildcard` is false.
+    record_dns01_issuance(
+        pool,
+        site_id,
+        domain,
+        false,
+        &zone,
+        profile.as_deref(),
+        &cert_path,
+        &key_path,
+        ssl_expiry,
+    )
+    .await
+    .map_err(|e| format!("recording the DNS-01 certificate failed: {e}"))?;
+
+    // The agent's DNS-01 door re-renders the vhost from a body that carried only
+    // the runtime and the certificate; put the site's own settings back, the same
+    // compensation the HTTP-01 auto path applies.
+    rebuild_vhost_for_site(pool, agent, site_id).await;
+
+    Ok(())
 }
 
 /// Write down what a SUCCESSFUL renewal actually installed.
