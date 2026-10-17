@@ -74,6 +74,25 @@ If DockPanel manages the domain's DNS zone, these are created for you when you a
 
 DockPanel suggests `p=quarantine`, which asks receivers to flag suspicious mail. Once you have confirmed everything works, tightening it to `p=reject` (block spoofed email outright) is a change worth making by hand at your DNS provider.
 
+### SPF
+
+DockPanel publishes `v=spf1 mx ip4:<server> -all`. The `mx` and explicit `ip4:` terms
+authorise this server, and `-all` states that nothing else may send. There is deliberately
+no `a` term: an `a` mechanism follows your domain's A record, so on a domain whose web
+address is proxied — an orange-cloud Cloudflare record, say — it would authorise that
+CDN's shared addresses to send as your domain. That is an authorisation nobody intended,
+and receivers read a shared CDN address in an SPF record as a spam signal. If you also
+send through a relay or a second host, add its `include:` or `ip4:` before the `-all`.
+
+### Who signs outbound mail
+
+OpenDKIM signs everything DockPanel sends, using the `dockpanel` selector published in
+your DKIM record. Rspamd is installed to filter mail, not to sign it, and its signer is
+switched off on purpose: left on, it looks for keys under `/var/lib/rspamd/dkim` under a
+`dkim` selector, for which no DNS record exists, so any signature it produced could never
+verify. Both facts are recorded in the daemon and the panel's own DNS hints so the
+configuration does not drift back.
+
 ## Create Mailboxes
 
 1. Go to **Mail** > **Mailboxes**
@@ -216,6 +235,168 @@ set up and needs no second DNS record.
 > it, and the error stops the list from loading. Logging in, IMAP, POP3 and delivery are all
 > unaffected, and any desktop or phone mail client works normally against the same account. If you
 > hit this, deploy Roundcube on its own domain as described above.
+
+## Mail API (send from your apps)
+
+DockPanel runs a small REST service for sending mail from applications, so a script or app
+does not need to hold a mailbox password. Every message is injected locally, which means it is
+DKIM-signed and delivered on the same path as mail sent from the webmail — and a copy is filed
+into the sender's **Sent** folder, so it shows up in Roundcube like any other message.
+
+### Getting a token
+
+1. Log into **Webmail** (Roundcube)
+2. Open **Settings → Mail API**
+3. Click **Generate new token** and copy it — it is shown only once
+
+A token belongs to the mailbox you are signed in as and can only send as that address. Revoke
+it from the same screen when it is no longer needed.
+
+### Sending
+
+```bash
+curl -X POST https://mail-api.example.com/v1/send \
+  -H "Authorization: Bearer <TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{"to":"someone@example.com","subject":"Hello","text":"Hi there"}'
+```
+
+`to`, `cc` and `bcc` accept a single address or an array; `html` is accepted alongside or
+instead of `text`; `reply_to` is optional. `from` defaults to the token's own mailbox and is
+refused if it names any other address. The reply carries the message's `Message-ID` and the
+accepted recipient list.
+
+The same endpoint also accepts the panel's own JWT as a bearer token, for server-side callers
+that already hold one.
+
+### Endpoint
+
+The API is published at `mail-api.<domain>` as an ordinary DockPanel **site** — runtime *proxy*,
+forwarding to `127.0.0.1:8081` — so it appears under **Sites** and its certificate is issued and
+renewed like any other site's. The service itself listens on loopback only. Tokens are stored
+(hashed) in Roundcube's own database, which is all the service reads to authenticate a request.
+
+### API reference
+
+The service documents itself:
+
+* **`/docs`** — a Swagger UI listing every route with its request and response bodies, and a
+  **Try it out** button that takes your token. E.g. <https://mail-api.dsm-groups.com/docs>.
+* **`/openapi.json`** — the same description as a machine-readable OpenAPI 3.0 document, for
+  code generators and client tooling.
+
+Both are served by the daemon itself: the spec is compiled into the binary rather than served
+from disk, so it cannot come to describe a different build than the one answering requests. They
+are unauthenticated, like `/health` — a description of the API is not access to it, and every
+route they document still demands a bearer token.
+
+### Managing mail
+
+The same token manages as well as sends. What it may do follows from the mailbox it belongs
+to, and there are two levels:
+
+* **Its own mailbox** — every token. Read and change the display name, password, forwarding
+  and the out-of-office reply; list, create and delete folders and read, save, move and delete
+  the mail in them; read quota usage.
+* **The whole server** — only for mailboxes listed in `MAILAPI_ADMIN_EMAILS` in the service's
+  environment (`/etc/dockpanel/mailapi.env`). This is opt-in on purpose: a token is handed to
+  an application, and an address is not a role.
+
+`GET /v1/me` reports which level your token is at, as `admin`.
+
+Self-service, with any token:
+
+| Method | Path | Body |
+|---|---|---|
+| `GET` | `/v1/me` | — |
+| `PUT` | `/v1/me` | `{"display_name": "…"}` |
+| `POST` | `/v1/me/password` | `{"new_password": "…"}` |
+| `GET`/`PUT` | `/v1/me/forward` | `{"forward_to": "…"}` — an empty string clears it |
+| `GET`/`PUT` | `/v1/me/autoresponder` | `{"enabled": true, "subject": "…", "body": "…"}` |
+| `GET` | `/v1/me/quota` | — |
+| `GET` | `/v1/me/folders` | — |
+| `POST` | `/v1/me/folders` | `{"name": "Archive"}`, or `INBOX/Sub` to nest |
+| `DELETE` | `/v1/me/folders?name=Archive` | — |
+| `GET` | `/v1/me/messages?folder=Sent` | — |
+| `POST` | `/v1/me/messages` | `{"folder": "Drafts", "to": "…", "subject": "…", "text": "…", "flags": ["\\Draft"]}` |
+| `GET` | `/v1/me/messages/{uid}?folder=Drafts` | — |
+| `DELETE` | `/v1/me/messages/{uid}?folder=INBOX` | `permanent=true` expunges instead of trashing |
+| `POST` | `/v1/me/messages/{uid}/move` | `{"folder": "Trash", "to": "INBOX"}` |
+| `POST` | `/v1/me/messages/{uid}/flags` | `{"folder": "INBOX", "add": ["Seen"], "remove": ["Flagged"]}` |
+| `POST` | `/v1/me/trash/empty` | — |
+
+The folder to delete is a query parameter rather than a path segment because folder names
+legitimately contain `/`. `INBOX`, `Sent` and `Trash` are refused.
+
+Messages are addressed the same way, by `folder`: `Drafts`, `Sent` and `Trash` are folders
+rather than routes, so the same handful of calls reads and manages all of them — and every
+other folder besides. `GET /v1/me/messages` lists a folder newest first, with `limit` and
+`offset` over that order, and reports each message's `uid`, which is what the rest of these
+take. A `uid` belongs to its folder: a message moved to another folder gets that folder's
+next `uid`, so re-read it after a move.
+
+* **Saving a draft** is `POST /v1/me/messages` with `folder: "Drafts"` and `flags: ["\\Draft"]`.
+  It is not a send: the message is written into the folder and stays there. It takes the same
+  fields as `/v1/send` — the same code builds both — except that no recipient is required.
+* **A delete is a move to `Trash`.** `DELETE` with `permanent=true` expunges instead, and a
+  message already in `Trash` is expunged either way. `POST /v1/me/trash/empty` clears the lot
+  and answers with how much was in there.
+* **Flags** are limited to the five IMAP system flags — `\Seen`, `\Answered`, `\Flagged`,
+  `\Draft` and `\Deleted` — spelled with or without the backslash. The answer is the flags the
+  mailbox holds afterwards rather than the ones you asked for, because `\Recent` is Dovecot's
+  to set.
+* A folder that the mailbox does not have is a `404` rather than an empty listing, so a typo
+  cannot quietly look like an empty mail folder.
+
+Server-wide, with an admin mailbox token or a panel API key:
+
+| Method | Path |
+|---|---|
+| `GET`/`POST` | `/v1/domains` |
+| `GET`/`PUT`/`DELETE` | `/v1/domains/{domain}` |
+| `GET`/`POST` | `/v1/domains/{domain}/accounts` |
+| `PUT`/`DELETE` | `/v1/domains/{domain}/accounts/{email}` |
+| `GET`/`POST` | `/v1/domains/{domain}/aliases` |
+| `DELETE` | `/v1/domains/{domain}/aliases/{id}` |
+| `GET` | `/v1/queue` |
+| `POST` | `/v1/queue/flush` |
+| `DELETE` | `/v1/queue?id=<queue_id>` |
+
+A mailbox that is not an admin gets `403` from each of these, naming its own address, rather
+than a bare refusal.
+
+```bash
+# Add a mailbox
+curl -X POST https://mail-api.example.com/v1/domains/example.com/accounts \
+  -H "Authorization: Bearer <TOKEN>" -H "Content-Type: application/json" \
+  -d '{"email":"sales@example.com","password":"…","quota_mb":2048}'
+
+# Point an alias at it
+curl -X POST https://mail-api.example.com/v1/domains/example.com/aliases \
+  -H "Authorization: Bearer <TOKEN>" -H "Content-Type: application/json" \
+  -d '{"source_email":"info@example.com","destination_email":"sales@example.com"}'
+```
+
+### A panel API key instead of a mailbox token
+
+If you would rather not hand out a mailbox token, mint a **panel API key** under
+**Settings → API keys** and use it as the bearer token. It is an ordinary panel credential,
+so the panel's own authorization governs it — and since creating and deleting domains is an
+administrator action, the key must belong to an admin account or those routes answer `403`.
+
+The service needs such a key for its own use as well. It does not write the mail database
+itself; it calls the panel's existing mail API, so that each operation exists in one place and
+one policy governs both the UI and the API. Configure it once in
+`/etc/dockpanel/mailapi.env`:
+
+```
+MAILAPI_BACKEND_API_KEY=dp_…
+```
+
+then restart the service (`rc-service dockpanel-mailapi restart`, or
+`systemctl restart dockpanel-mailapi`). Without it the routes that only ask Dovecot
+(`/v1/me/quota`, `/v1/me/folders`) still work, and the rest answer `503` with that
+instruction.
 
 ## Spam Filter (Rspamd)
 
