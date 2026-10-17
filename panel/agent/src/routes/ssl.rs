@@ -32,6 +32,16 @@ use crate::services::ssl;
 /// would name the wrong party in a message written to be trusted. It gets its
 /// own marker and its own code, and the panel keeps them apart.
 fn ca_or_internal(e: String) -> (StatusCode, Json<serde_json::Value>) {
+    // ⛔ THE ANSWER THE PANEL MUST NOT GET WRONG. A rate limit is not a local
+    // fault and not a validation failure: the CA has said this exact set of names
+    // cannot be issued again until a time it names, and the panel answers by
+    // refusing to try again (#663). A 429, not a 500, says so at the status too.
+    if let Some(reason) = e.strip_prefix(ssl::CA_RATE_LIMITED) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({ "error": reason, "code": "acme_rate_limited" })),
+        );
+    }
     if let Some(reason) = e.strip_prefix(ssl::CA_DECLINED) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,

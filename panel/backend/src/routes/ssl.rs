@@ -7,7 +7,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::auth::{AdminUser, AuthUser, ServerScope};
-use crate::error::{acme_order_failure, dns_provider_failure, internal_error, err, agent_error, ApiError};
+use crate::error::{acme_order_failure, acme_rate_limited, dns_provider_failure, internal_error, err, agent_error, ApiError};
 use crate::models::Site;
 use crate::AppState;
 use crate::services::activity;
@@ -35,6 +35,23 @@ fn acme_failure_or(
     context: &str,
     e: crate::services::agent::AgentError,
 ) -> ApiError {
+    // ⛔ #663's whole point, and it comes FIRST. A rate limit is the one decline
+    // that must not be answered as though it were the operator's to fix: no
+    // attempt before the time the CA names can succeed, so the sentence may not
+    // invite one. It is checked before the generic order reader because that
+    // reader cannot tell the two apart — the label here can.
+    if let Some(reason) = acme_rate_limited(&e) {
+        tracing::warn!(domain = %domain, reason = %reason, "SSL provisioning was rate-limited by the CA");
+        let reason = reason.trim_end_matches(['.', ' ']);
+        return err(
+            StatusCode::TOO_MANY_REQUESTS,
+            &format!(
+                "A certificate for {domain} could not be issued: {reason}. The certificate \
+                 authority is rate-limiting this exact set of names, and no attempt made \
+                 before the time it names can succeed."
+            ),
+        );
+    }
     if let Some(reason) = acme_order_failure(&e) {
         tracing::warn!(domain = %domain, reason = %reason, "{context} was declined");
         // ⚠ Says what happened and nothing about WHY. A newer agent only labels
@@ -92,6 +109,22 @@ fn dns01_failure_or(
     } else {
         ordered.to_string()
     };
+
+    // ⛔ Same reason as the HTTP-01 door beside it (#663): a rate limit is the one
+    // decline that must not be answered with "publish the TXT record and try
+    // again". It comes first so neither of the hints below can be attached to it.
+    if let Some(reason) = acme_rate_limited(&e) {
+        tracing::warn!(domain = %ordered, reason = %reason, "DNS-01 SSL was rate-limited by the CA");
+        let reason = reason.trim_end_matches(['.', ' ']);
+        return err(
+            StatusCode::TOO_MANY_REQUESTS,
+            &format!(
+                "A certificate for {subject} could not be issued: {reason}. The certificate \
+                 authority is rate-limiting this exact set of names, and no attempt made \
+                 before the time it names can succeed."
+            ),
+        );
+    }
 
     if let Some(reason) = dns_provider_failure(&e) {
         tracing::warn!(domain = %ordered, reason = %reason, "DNS-01 SSL was refused by the DNS provider");
@@ -1668,6 +1701,43 @@ mod dns01_message_tests {
         // #663: this branch also fires on a rate limit, where publishing a TXT
         // record fixes nothing — so the advice must stay conditional.
         assert!(m.contains("If that is a validation failure"), "{m}");
+        assert!(!m.contains("port 80"), "{m}");
+        assert!(!m.contains("try again"), "{m}");
+    }
+
+    #[test]
+    fn a_rate_limited_order_names_the_limit_and_never_the_challenge_record() {
+        let e = dns01_failure_or(
+            "blog.example.com",
+            "example.com",
+            false,
+            labelled(
+                "acme_rate_limited",
+                "The CA is rate-limiting this certificate order: too many certificates (5) already issued, retry after 2026-10-17 18:54:12 UTC",
+            ),
+        );
+        assert_eq!(e.0.as_u16(), 429);
+        let m = message(e);
+        assert!(m.contains("rate-limiting"), "{m}");
+        assert!(m.contains("retry after 2026-10-17 18:54:12 UTC"), "{m}");
+        // #663: a rate limit is not fixed by publishing a TXT record, and retrying
+        // before the time the CA names is the one thing that makes it worse.
+        assert!(!m.contains("_acme-challenge"), "{m}");
+        assert!(!m.contains("try again"), "{m}");
+    }
+
+    #[test]
+    fn the_http01_door_answers_a_rate_limit_the_same_way() {
+        let e = acme_failure_or(
+            "example.com",
+            "SSL provisioning",
+            labelled("acme_rate_limited", "The CA is rate-limiting this certificate order: retry after 2026-10-17 18:54:12 UTC"),
+        );
+        assert_eq!(e.0.as_u16(), 429);
+        let m = message(e);
+        assert!(m.contains("rate-limiting"), "{m}");
+        // The port-80 hint belongs to the sibling sentence; a rate limit must not
+        // borrow it, because opening a port fixes nothing here.
         assert!(!m.contains("port 80"), "{m}");
         assert!(!m.contains("try again"), "{m}");
     }

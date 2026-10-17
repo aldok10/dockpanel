@@ -411,6 +411,19 @@ pub async fn load_or_create_account(email: &str) -> Result<Account, String> {
 /// every future error to the operator as though the CA had spoken.
 pub const CA_DECLINED: &str = "[ca] ";
 
+/// The same idea, for the ONE CA answer that must not be retried.
+///
+/// ⛔ A SEPARATE MARKER, not a louder [`CA_DECLINED`], because the two want
+/// OPPOSITE answers from the operator. A validation failure is theirs to fix and
+/// re-trying is how they find out; a rate limit is nobody's fault and every retry
+/// before the time the CA names makes it worse — it is the ONE failure this
+/// product must answer by NOT trying again (#663). Folding it into the CA marker
+/// would hand the panel the same sentence for both and leave it no way to tell
+/// them apart afterwards: the label is the only thing that separates them.
+///
+/// ⚠ Marked POSITIVELY, exactly like [`CA_DECLINED`].
+pub const CA_RATE_LIMITED: &str = "[ca-rate-limit] ";
+
 /// The same idea for the OTHER party the DNS-01 door talks to.
 ///
 /// `provision_cert_dns01` has three ways to fail, not two: the CA can decline,
@@ -436,6 +449,43 @@ pub const DNS_PROVIDER_DECLINED: &str = "[dns] ";
 /// this door produces, and answering it with a reference number is precisely the
 /// outcome this guard exists to improve on.
 pub const FOREIGN_CERT_REFUSED: &str = "[foreign] ";
+
+/// Label a failed `new_order` for the panel.
+///
+/// Pulled out of the two order doors so the rate-limit answer is decided once;
+/// the alternative was the same `rateLimited` test spelled twice and drifting.
+/// Everything that is not a rate limit keeps the CA sentence it has always had,
+/// so an agent that has not learned the new marker is only ever less specific
+/// than this one, never wrong.
+fn new_order_failure(e: &instant_acme::Error) -> String {
+    if is_rate_limited(e) {
+        format!("{CA_RATE_LIMITED}The CA is rate-limiting this certificate order: {e}")
+    } else {
+        format!("{CA_DECLINED}The CA refused the certificate order: {e}")
+    }
+}
+
+/// Whether `e` is the CA's `rateLimited` problem document (RFC 8555 §6.7).
+///
+/// The typed `Problem` is the proof; the string test is the belt to that braces,
+/// for a crate version that stops surfacing it. `rateLimited` is a fixed ACME
+/// spelling and its Let's Encrypt detail ("too many certificates … already
+/// issued") appears on no other problem this door can raise, so the fallback
+/// cannot mislabel a validation failure as a rate limit.
+fn is_rate_limited(e: &instant_acme::Error) -> bool {
+    if let instant_acme::Error::Api(problem) = e {
+        // A typed `Problem` is AUTHORITATIVE: when it names a type, that is the
+        // answer, and its human `detail` is not consulted — a validation failure
+        // whose prose happens to quote a rate limit is still a validation failure.
+        // Only an untyped one falls through to the fixed spelling below.
+        if let Some(t) = problem.r#type.as_deref() {
+            return t.ends_with(":rateLimited") || t == "rateLimited";
+        }
+    }
+    let text = e.to_string();
+    text.contains("urn:ietf:params:acme:error:rateLimited")
+        || text.contains("too many certificates")
+}
 
 pub async fn provision_cert(
     account: &Account,
@@ -472,7 +522,7 @@ pub async fn provision_cert(
     let mut order = account
         .new_order(&new_order)
         .await
-        .map_err(|e| format!("{CA_DECLINED}The CA refused the certificate order: {e}"))?;
+        .map_err(|e| new_order_failure(&e))?;
 
     let state = order.state();
     let needs_challenge = matches!(state.status, OrderStatus::Pending);
@@ -626,7 +676,7 @@ pub async fn provision_cert_dns01(
     let mut order = account
         .new_order(&new_order)
         .await
-        .map_err(|e| format!("{CA_DECLINED}The CA refused the certificate order: {e}"))?;
+        .map_err(|e| new_order_failure(&e))?;
 
     let state = order.state();
     if !matches!(state.status, OrderStatus::Pending | OrderStatus::Ready) {
@@ -1699,5 +1749,55 @@ mod foreign_issuer_tests {
         assert!(msg.starts_with(FOREIGN_CERT_REFUSED), "refusal lost its marker: {msg}");
         assert!(msg.contains("DigiCert Inc"), "refusal does not name the issuer: {msg}");
         assert!(msg.contains("example.com"), "refusal does not name the domain: {msg}");
+    }
+}
+
+/// ⛔ The rate-limit label is the whole safety of #663: without it the panel
+/// cannot tell a rate limit from a validation failure, and the one instruction
+/// that makes a rate limit worse — "try again" — is the one it will give.
+#[cfg(test)]
+mod rate_limit_labelling {
+    use super::*;
+
+    fn api(problem_type: &str) -> instant_acme::Error {
+        instant_acme::Error::Api(instant_acme::Problem {
+            r#type: Some(problem_type.to_string()),
+            detail: Some(
+                "too many certificates (5) already issued for this exact set of identifiers \
+                 in the last 168h0m0s, retry after 2026-10-17 18:54:12 UTC"
+                    .to_string(),
+            ),
+            status: Some(429),
+            subproblems: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn a_rate_limited_order_is_marked_apart_from_the_ca_decline() {
+        let e = api("urn:ietf:params:acme:error:rateLimited");
+        assert!(is_rate_limited(&e), "the typed problem must be recognised");
+        let labelled = new_order_failure(&e);
+        assert!(labelled.starts_with(CA_RATE_LIMITED), "{labelled}");
+        assert!(!labelled.starts_with(CA_DECLINED), "{labelled}");
+    }
+
+    #[test]
+    fn a_validation_failure_keeps_the_ca_label() {
+        let e = api("urn:ietf:params:acme:error:unauthorized");
+        assert!(!is_rate_limited(&e), "only rateLimited is a rate limit");
+        assert!(new_order_failure(&e).starts_with(CA_DECLINED));
+    }
+
+    #[test]
+    fn the_string_fallback_still_recognises_the_problem() {
+        // An error nested too deep to surface the typed `Problem` must still be
+        // caught by the fixed ACME spelling, or the fix silently stops applying.
+        let e = instant_acme::Error::Other(
+            "API error: too many certificates (5) already issued for this exact set of \
+             identifiers (urn:ietf:params:acme:error:rateLimited)"
+                .into(),
+        );
+        assert!(is_rate_limited(&e));
+        assert!(new_order_failure(&e).starts_with(CA_RATE_LIMITED));
     }
 }

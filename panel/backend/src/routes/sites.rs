@@ -937,6 +937,24 @@ pub async fn create(
                             return; // Success, stop retrying
                         }
                         Err(e) => {
+                            // ⛔ A RATE LIMIT IS TERMINAL, NOT TRANSIENT. The CA has
+                            // already said this exact set of names cannot be issued
+                            // again until the time it names, so the three attempts
+                            // left on this ladder can only spend budget the operator
+                            // cannot get back — stop here and say why ONCE (#663).
+                            if let Some(reason) = crate::error::acme_rate_limited(&e) {
+                                tracing::warn!("Auto-SSL for {ssl_domain} was rate-limited by the CA — not retrying: {reason}");
+                                emit_step(&ssl_logs, site_id, "ssl", "SSL certificate", "error",
+                                    Some(format!(
+                                        "The certificate authority is rate-limiting {ssl_domain}: \
+                                         {reason}. The site is served over HTTP; do not retry \
+                                         before the time it names."
+                                    )));
+                                if let Some(tx) = ssl_tx.take() {
+                                    let _ = tx.send(false);
+                                }
+                                return;
+                            }
                             if i == delays.len() - 1 {
                                 // Last attempt failed. Say WHY — this used to read
                                 // "Skipped", which described neither the four

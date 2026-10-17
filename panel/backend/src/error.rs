@@ -78,6 +78,18 @@ const ACME_ORDER_FAILED_CODE: &str = "acme_order_failed";
 /// caveat as its sibling, same cross-tree pin.
 const DNS_PROVIDER_FAILED_CODE: &str = "dns_provider_failed";
 
+/// The label the agent puts on an order the CA refused because this exact set of
+/// identifiers has been issued too often too recently.
+///
+/// ⛔ THE ONE FAILURE THAT MUST NOT BE ANSWERED WITH "TRY AGAIN". Every other
+/// refusable order is the operator's to fix, and the panel deliberately lets a
+/// validation failure send them back to their DNS; a rate limit is the inverse —
+/// each retry before the time the CA names consumes budget that cannot come back.
+/// Its own code is what lets a door recognise it, name the retry, and STOP, so it
+/// may not be folded into [`ACME_ORDER_FAILED_CODE`]'s sentence. Same severed-pair
+/// caveat as its siblings, same cross-tree pin.
+const ACME_RATE_LIMITED_CODE: &str = "acme_rate_limited";
+
 /// The renewal route's wrapper around the same failure, carried by every agent
 /// ever shipped. Recognising it is what lets an install nobody has updated get
 /// the honest answer today. Same severed-pair caveat, same pin.
@@ -160,6 +172,33 @@ pub fn dns_provider_failure(e: &AgentError) -> Option<String> {
         return None;
     }
     if agent_code(body).is_some_and(|c| c == DNS_PROVIDER_FAILED_CODE) {
+        Some(agent_message(body).trim().to_string())
+    } else {
+        None
+    }
+}
+
+/// The sentence a CA rate limit should reach the operator as, or `None` when this
+/// failure is not one.
+///
+/// Split from [`acme_order_failure`] because the two must be answered INVERSELY.
+/// That one is the operator's to fix and its sentence is conditional precisely so
+/// it survives a rate limit arriving through it; this one exists so a door can
+/// RECOGNISE the rate limit before that happens, name the retry the CA gave, and
+/// refuse to try again. The label is the only proof accepted — a bare "too many
+/// certificates" in a message is not, because this module positive-identifies.
+///
+/// ⚠ Not bounded to 5xx like its siblings: the agent answers a rate limit with a
+/// deliberate 429, and that status is the honest one. Anything carrying the label
+/// is a rate limit regardless of which 4xx/5xx framed it.
+pub fn acme_rate_limited(e: &AgentError) -> Option<String> {
+    let AgentError::Status(code, body) = e else {
+        return None;
+    };
+    if !(400..600).contains(code) {
+        return None;
+    }
+    if agent_code(body).is_some_and(|c| c == ACME_RATE_LIMITED_CODE) {
         Some(agent_message(body).trim().to_string())
     } else {
         None
@@ -368,6 +407,31 @@ mod tests {
         );
         let reason = acme_order_failure(&e).expect("a labelled order failure");
         assert_eq!(reason, "The CA did not validate the challenge: no valid A record");
+    }
+
+    #[test]
+    fn a_rate_limited_order_is_recognised_by_its_own_label() {
+        let e = AgentError::Status(
+            429,
+            r#"{"error":"The CA is rate-limiting this certificate order: too many certificates (5) already issued for this exact set of identifiers (urn:ietf:params:acme:error:rateLimited)","code":"acme_rate_limited"}"#.into(),
+        );
+        let reason = acme_rate_limited(&e).expect("a labelled rate limit");
+        assert!(reason.contains("rate-limiting"), "{reason}");
+        // ⭐ It must NOT arrive through the generic order reader. That reader is
+        // what a validation failure uses, and telling the two apart is the whole
+        // reason this label exists.
+        assert!(acme_order_failure(&e).is_none());
+    }
+
+    #[test]
+    fn a_rate_limit_is_never_inferred_from_the_sentence() {
+        // Positive identification only, exactly like its siblings: the CA's own
+        // wording without the label is not proof, so this keeps its incident id.
+        let e = AgentError::Status(
+            500,
+            r#"{"error":"too many certificates (5) already issued for this exact set of identifiers"}"#.into(),
+        );
+        assert!(acme_rate_limited(&e).is_none());
     }
 
     #[test]

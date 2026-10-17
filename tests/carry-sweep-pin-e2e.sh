@@ -114,6 +114,7 @@ hasnt "A5 and status alone is NOT a proof" "$F_ERR" "iftrue{"
 # an incident id with nothing red. Compare the trees rather than trusting either.
 LABEL='"acme_order_failed"'
 eq "A6 the panel declares the label once" "$(occ "$F_ERR" "constACME_ORDER_FAILED_CODE:&str=$LABEL;")" 1
+eq "A6c the panel declares the rate-limit code once" "$(occ "$F_ERR" 'constACME_RATE_LIMITED_CODE:&str="acme_rate_limited";')" 1
 eq "A7 the agent labels in exactly one place" "$(occ "$F_ASSLR" "$LABEL")" 1
 eq "A8 all THREE doors go through that one classifier" "$(occ "$F_ASSLR" "ca_or_internal(e)")" 3
 # ⛔ POSITIVE IDENTIFICATION, and the direction is the whole safety of it. The
@@ -134,6 +135,12 @@ has "A9d the CA marker emits the CA code" "$F_CLASSIFIER" \
     'e.strip_prefix(ssl::CA_DECLINED){return(StatusCode::INTERNAL_SERVER_ERROR,Json(serde_json::json!({"error":reason,"code":"acme_order_failed"}))'
 has "A9e the provider marker emits the provider code" "$F_CLASSIFIER" \
     'e.strip_prefix(ssl::DNS_PROVIDER_DECLINED){return(StatusCode::INTERNAL_SERVER_ERROR,Json(serde_json::json!({"error":reason,"code":"dns_provider_failed"}))'
+# ⛔ The rate-limit pairing, and the STATUS is half of it: a 429 tells the panel this
+# is not the operator's fault and must not be retried, which is the opposite reading
+# the CA-decline branch would give it. Deleting the status alone would silently
+# return every rate limit to "try again" with the metadata still looking right.
+has "A9f the rate-limit marker emits the rate-limit code" "$F_CLASSIFIER" \
+    'e.strip_prefix(ssl::CA_RATE_LIMITED){return(StatusCode::TOO_MANY_REQUESTS,Json(serde_json::json!({"error":reason,"code":"acme_rate_limited"}))'
 # ⛔ THE FALL-THROUGH. Neither marker matched, so no code is attached and the panel
 # keeps its incident id. Inverting this default — labelling by absence — is the one
 # change that would hand every future arm to the operator as though the CA spoke.
@@ -142,7 +149,19 @@ hasnt "A9b2 the fall-through attaches no code of any kind" "$F_CLASSIFIER" 'json
 # The marker is the OTHER severed pair — declared in the service, consumed in the
 # route, and worth counting because the count is what a silent unmarking moves.
 eq "A10 the marker is declared once" "$(occ "$F_ASSL" 'pubconstCA_DECLINED:&str="[ca]";')" 1
-eq "A11 and marks the seventeen arms where the CA actually spoke" "$(occ "$F_ASSL" '{CA_DECLINED}')" 17
+eq "A11 and marks the sixteen arms where the CA actually spoke" "$(occ "$F_ASSL" '{CA_DECLINED}')" 16
+# ⛔ A THIRD MARKER, for the ONE CA answer that must NOT be retried (#663). Answering
+# a rate limit as a validation failure is what exhausted the exact-set budget in the
+# first place: the panel told the operator to try again, and every retry spent budget
+# that does not come back. The two order doors are classified through one helper so
+# that answer is decided once, and everything that is not a rate limit keeps the CA
+# sentence above — an agent that has not learned the marker is only less specific,
+# never wrong.
+eq "A11g the rate-limit marker is declared once" "$(occ "$F_ASSL" 'pubconstCA_RATE_LIMITED:&str="[ca-rate-limit]";')" 1
+eq "A11h and the order doors label it through one helper" "$(occ "$F_ASSL" '{CA_RATE_LIMITED}')" 1
+eq "A11i both order doors use that helper" "$(occ "$F_ASSL" 'map_err(|e|new_order_failure(&e))')" 2
+has "A11j which keeps the CA sentence for everything else" "$F_ASSL" '{CA_DECLINED}TheCArefusedthecertificateorder:'
+hasnt "A11k and never labels a rate limit as a plain CA decline" "$F_ASSL" '{CA_RATE_LIMITED}TheCArefusedthecertificateorder:'
 # ⛔ THE SECOND SEVERED PAIR, added when the DNS-01 door joined. Cloudflare
 # refusing to publish `_acme-challenge` is the operator's to fix and earns a
 # sentence, but it is NOT something the CA said — attributing it to the CA would
@@ -184,6 +203,12 @@ has "B5 it answers 422, not a passthrough" "$F_BSSL" \
 # refuses rather than silently re-ordering over HTTP-01.
 # ⚠ `ssl-controls` F10b pins this SAME literal in this SAME file. Both move together.
 eq "B5b and every refusal that earns a 422 keeps one" "$(occ "$F_BSSL" "StatusCode::UNPROCESSABLE_ENTITY,")" 5
+# ⛔ #663 ON BOTH DOORS. A rate limit is the one decline that must NOT be answered
+# by trying again, so it gets its own status (429) rather than the 422 every other
+# refusal earns — and it is checked BEFORE the hints, so neither door can attach
+# "check port 80" or "publish the TXT record" to an answer no retry can improve.
+has "B5f a rate limit answers with its own status" "$F_BSSL" "StatusCode::TOO_MANY_REQUESTS,"
+eq "B5g and BOTH doors answer it" "$(occ "$F_BSSL" "acme_rate_limited(&e)")" 2
 # ⛔ #662. The compatibility path puts this sentence in front of a local agent
 # fault too, so it must name no cause — and must never say "try again", which on
 # a rate-limited order is the one instruction that makes it worse.
