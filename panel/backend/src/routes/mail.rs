@@ -1756,6 +1756,17 @@ pub async fn webmail_status(
     Ok(Json(result))
 }
 
+/// GET /api/mail/api/status — the Mail REST API daemon's install/run state.
+pub async fn mailapi_status(
+    State(_state): State<AppState>,
+    AdminUser(_claims): AdminUser,
+    ServerScope(_server_id, agent): ServerScope,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let result = agent.get("/mail/api/status").await
+        .map_err(|e| agent_error("Mail API", e))?;
+    Ok(Json(result))
+}
+
 /// POST /api/mail/webmail/remove
 pub async fn webmail_remove(
     State(state): State<AppState>,

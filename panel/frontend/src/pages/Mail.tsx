@@ -201,6 +201,7 @@ export default function Mail() {
   // Mail services
   const [rspamd, setRspamd] = useState<{ installed: boolean; running: boolean } | null>(null);
   const [webmail, setWebmail] = useState<{ installed: boolean; running: boolean; port: number } | null>(null);
+  const [mailApi, setMailApi] = useState<{ installed: boolean; running: boolean; url: string | null } | null>(null);
   const [relay, setRelay] = useState<{ configured: boolean; relayhost: string } | null>(null);
   const [relayHost, setRelayHost] = useState("");
   const [relayPort, setRelayPort] = useState("587");
@@ -325,6 +326,7 @@ export default function Mail() {
     loadStorage();
     api.get<{ installed: boolean; running: boolean }>("/mail/rspamd/status").then(setRspamd).catch(() => {});
     api.get<{ installed: boolean; running: boolean; port: number }>("/mail/webmail/status").then(setWebmail).catch(() => {});
+    api.get<{ installed: boolean; running: boolean; url: string | null }>("/mail/api/status").then(setMailApi).catch(() => {});
     api.get<{ configured: boolean; relayhost: string }>("/mail/relay/status").then(setRelay).catch(() => {});
     api.get<{ configured: boolean; rate: string }>("/mail/rate-limit/status").then(setRateLimit).catch(() => {});
     api.get<TlsStatus>("/mail/tls/status").then(setTls).catch(() => {});
@@ -499,7 +501,7 @@ export default function Mail() {
 
   if (loading) {
     return (
-      <div className="p-6 lg:p-8 animate-fade-up">
+      <div className="p-4 lg:p-6 animate-fade-up">
         <h1 className="text-sm font-medium text-dark-300 uppercase font-mono tracking-widest mb-6">Mail</h1>
         <div className="bg-dark-800 border border-dark-500 p-6 animate-pulse">
           <div className="h-6 bg-dark-700 rounded w-48 mb-4" />
@@ -537,7 +539,7 @@ export default function Mail() {
         </div>
       </div>
 
-      <div className="p-6 lg:p-8">
+      <div className="p-4 lg:p-6">
 
       {message.text && (
         <div className={`mb-4 px-4 py-3 rounded-lg text-sm border ${message.type === "success" ? "bg-rust-500/10 text-rust-400 border-rust-500/20" : "bg-danger-500/10 text-danger-400 border-danger-500/20"}`}>
@@ -630,15 +632,15 @@ export default function Mail() {
           request is never made, and a render gate that depends on a fetch not
           having happened is a gate that a future refactor silently removes. */}
       {isAdmin && mailStatus?.installed && (
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 mb-6">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 mb-5">
           {/* Spam Filter (Rspamd) */}
           {rspamd && (
-            <div className="bg-dark-800 rounded-lg border border-dark-500 p-4 elevation-1">
+            <div className="bg-dark-800 rounded-lg border border-dark-500 p-3 elevation-1">
               <div className="flex items-center justify-between mb-2">
                 <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">Spam Filter</h3>
                 <div className={`w-2.5 h-2.5 rounded-full ${rspamd.running ? "bg-rust-500" : rspamd.installed ? "bg-warn-500" : "bg-dark-500"}`} />
               </div>
-              <p className="text-sm text-dark-100 mb-3">
+              <p className="text-xs text-dark-100 mb-2">
                 {rspamd.running ? "Active" : rspamd.installed ? "Stopped" : "Not installed"}
               </p>
               {!rspamd.installed ? (
@@ -657,41 +659,77 @@ export default function Mail() {
             </div>
           )}
 
-          {/* Webmail (Roundcube) */}
-          {webmail && (
-            <div className="bg-dark-800 rounded-lg border border-dark-500 p-4 elevation-1">
+          {/* Webmail (Roundcube) + Mail API — ONE card, because they are one
+              surface: the API's tokens are per-mailbox and are minted inside
+              Roundcube (Settings → Mail API), so splitting them put a "manage
+              tokens" button on one card that only pointed at the other. */}
+          {(webmail || mailApi) && (
+            <div className="bg-dark-800 rounded-lg border border-dark-500 p-3 elevation-1">
               <div className="flex items-center justify-between mb-2">
-                <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">Webmail</h3>
-                <div className={`w-2.5 h-2.5 rounded-full ${webmail.running ? "bg-rust-500" : webmail.installed ? "bg-warn-500" : "bg-dark-500"}`} />
-              </div>
-              <p className="text-sm text-dark-100 mb-3">
-                {webmail.running ? `Running (:${webmail.port})` : webmail.installed ? "Stopped" : "Not installed"}
-              </p>
-              {!webmail.installed ? (
-                <button onClick={async () => {
-                  const domain = selectedDomain?.domain || "localhost";
-                  try { const r = await api.post<{ port: number }>("/mail/webmail/install", { domain, port: 8888 }); setWebmail({ installed: true, running: true, port: r.port || 8888 }); setMessage({ text: "Roundcube deployed", type: "success" }); }
-                  catch (e) { setMessage({ text: e instanceof Error ? e.message : "Failed", type: "error" }); }
-                }} className="w-full px-3 py-1.5 bg-rust-500 text-white rounded text-xs font-medium hover:bg-rust-600 transition-colors">Install Roundcube</button>
-              ) : (
-                <div className="flex gap-2">
-                  {webmail.running && (
-                    <a href="/webmail/" target="_blank" rel="noopener noreferrer" className="flex-1 px-3 py-1.5 bg-dark-700 text-dark-100 rounded text-xs font-medium hover:bg-dark-600 transition-colors text-center">Open</a>
+                <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">Webmail &amp; Mail API</h3>
+                <div className="flex items-center gap-1.5">
+                  {webmail && (
+                    <div className={`w-2.5 h-2.5 rounded-full ${webmail.running ? "bg-rust-500" : webmail.installed ? "bg-warn-500" : "bg-dark-500"}`} title={`Webmail: ${webmail.running ? "running" : webmail.installed ? "stopped" : "not installed"}`} />
                   )}
-                  <button onClick={() => setPendingConfirm({ type: "remove_webmail", label: "Remove Roundcube webmail?" })}
-                    className="flex-1 px-3 py-1.5 bg-dark-700 text-dark-100 rounded text-xs font-medium hover:bg-dark-600 transition-colors">Remove</button>
+                  {mailApi && (
+                    <div className={`w-2.5 h-2.5 rounded-full ${mailApi.running ? "bg-rust-500" : mailApi.installed ? "bg-warn-500" : "bg-dark-500"}`} title={`Mail API: ${mailApi.running ? "running" : mailApi.installed ? "stopped" : "not installed"}`} />
+                  )}
+                </div>
+              </div>
+
+              {webmail && (
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs text-dark-100 truncate">
+                    Roundcube {webmail.running ? `· port ${webmail.port}` : webmail.installed ? "· stopped" : "· not installed"}
+                  </span>
+                  {!webmail.installed ? (
+                    <button onClick={async () => {
+                      const domain = selectedDomain?.domain || "localhost";
+                      try { const r = await api.post<{ port: number }>("/mail/webmail/install", { domain, port: 8888 }); setWebmail({ installed: true, running: true, port: r.port || 8888 }); setMessage({ text: "Roundcube deployed", type: "success" }); }
+                      catch (e) { setMessage({ text: e instanceof Error ? e.message : "Failed", type: "error" }); }
+                    }} className="shrink-0 px-2 py-1 bg-rust-500 text-white rounded text-xs font-medium hover:bg-rust-600 transition-colors">Install</button>
+                  ) : (
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      {webmail.running && (
+                        <a href="/webmail/" target="_blank" rel="noopener noreferrer" className="px-2 py-1 bg-dark-700 text-dark-100 rounded text-xs font-medium hover:bg-dark-600 transition-colors">Open</a>
+                      )}
+                      <button onClick={() => setPendingConfirm({ type: "remove_webmail", label: "Remove Roundcube webmail?" })}
+                        className="px-2 py-1 bg-dark-700 text-dark-100 rounded text-xs font-medium hover:bg-dark-600 transition-colors">Remove</button>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {mailApi && (
+                <div className="mt-2 pt-2 border-t border-dark-600 space-y-1">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs text-dark-100 shrink-0">
+                      API {mailApi.running ? "running" : mailApi.installed ? "stopped" : "not installed"}
+                    </span>
+                    {mailApi.url && (
+                      <div className="flex items-center gap-1.5 min-w-0">
+                        <span className="text-[11px] text-dark-400 font-mono truncate" title={`${mailApi.url}/v1/send`}>{mailApi.url.replace(/^https?:\/\//, "")}</span>
+                        {/* Swagger UI for the API, served by the daemon itself. */}
+                        <a href={`${mailApi.url}/docs`} target="_blank" rel="noopener noreferrer"
+                          className="shrink-0 px-2 py-1 bg-dark-700 text-dark-100 rounded text-xs font-medium hover:bg-dark-600 transition-colors">Docs</a>
+                      </div>
+                    )}
+                  </div>
+                  {/* Per-mailbox identities are what the API authenticates; the
+                      minting surface lives in Roundcube, not here. */}
+                  <p className="text-[11px] text-dark-400 truncate">Tokens: Webmail → Settings → Mail API.</p>
                 </div>
               )}
             </div>
           )}
 
           {/* SMTP Relay */}
-          <div className="bg-dark-800 rounded-lg border border-dark-500 p-4 elevation-1">
+          <div className="bg-dark-800 rounded-lg border border-dark-500 p-3 elevation-1">
             <div className="flex items-center justify-between mb-2">
               <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">SMTP Relay</h3>
               <div className={`w-2.5 h-2.5 rounded-full ${relay?.configured ? "bg-rust-500" : "bg-dark-500"}`} />
             </div>
-            <p className="text-sm text-dark-100 mb-3 truncate" title={relay?.relayhost || ""}>
+            <p className="text-xs text-dark-100 mb-2 truncate" title={relay?.relayhost || ""}>
               {relay?.configured ? relay.relayhost : "Direct delivery"}
             </p>
             {relay?.configured ? (
@@ -705,13 +743,13 @@ export default function Mail() {
           </div>
 
           {/* Email Reputation */}
-          <div className="bg-dark-800 rounded-lg border border-dark-500 p-4 elevation-1">
+          <div className="bg-dark-800 rounded-lg border border-dark-500 p-3 elevation-1">
             <div className="flex items-center justify-between mb-2">
               <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">Reputation</h3>
               {blacklist && <div className={`w-2.5 h-2.5 rounded-full ${blacklist.status === "clean" ? "bg-rust-500" : blacklist.status === "listed" ? "bg-danger-400" : "bg-dark-400"}`} />}
             </div>
             {blacklist ? (
-              <p className={`text-sm mb-3 ${blacklist.status === "clean" ? "text-dark-100" : blacklist.status === "listed" ? "text-danger-400" : "text-dark-300"}`}>
+              <p className={`text-xs mb-2 ${blacklist.status === "clean" ? "text-dark-100" : blacklist.status === "listed" ? "text-danger-400" : "text-dark-300"}`}>
                 {blacklist.status === "clean"
                   ? "Clean"
                   : blacklist.status === "listed"
@@ -719,7 +757,7 @@ export default function Mail() {
                     : `Could not check ${blacklist.total_count - blacklist.checked_count} of ${blacklist.total_count}`}
               </p>
             ) : (
-              <p className="text-sm text-dark-100 mb-3">Not checked</p>
+              <p className="text-xs text-dark-100 mb-2">Not checked</p>
             )}
             <button disabled={checkingBl} onClick={async () => {
               setCheckingBl(true);
@@ -732,13 +770,13 @@ export default function Mail() {
           </div>
 
           {/* Rate Limiting */}
-          <div className="bg-dark-800 rounded-lg border border-dark-500 p-4 elevation-1">
+          <div className="bg-dark-800 rounded-lg border border-dark-500 p-3 elevation-1">
             <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">Rate Limiting</h3>
-            <div className="flex items-center gap-2 mt-2">
+            <div className="flex items-center gap-2 mt-1.5">
               <div className={`w-2.5 h-2.5 rounded-full ${rateLimit?.configured ? "bg-rust-500" : "bg-dark-500"}`} />
-              <span className="text-sm text-dark-100">{rateLimit?.configured ? rateLimit.rate : "No limit"}</span>
+              <span className="text-xs text-dark-100">{rateLimit?.configured ? rateLimit.rate : "No limit"}</span>
             </div>
-            <div className="flex items-center gap-2 mt-3">
+            <div className="flex items-center gap-2 mt-2">
               <select value={rateLimitValue} onChange={e => setRateLimitValue(e.target.value)} className="px-2 py-1.5 border border-dark-500 rounded text-xs bg-transparent text-dark-100 focus:ring-2 focus:ring-accent-500 outline-none">
                 <option value="50/hour">50/hour</option>
                 <option value="100/hour">100/hour</option>
@@ -760,11 +798,11 @@ export default function Mail() {
           </div>
 
           {/* TLS Encryption */}
-          <div className="bg-dark-800 rounded-lg border border-dark-500 p-4 elevation-1">
+          <div className="bg-dark-800 rounded-lg border border-dark-500 p-3 elevation-1">
             <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">TLS Encryption</h3>
             {tls && (
               <>
-                <div className="mt-2 space-y-1">
+                <div className="mt-1.5 space-y-1">
                   <div className="flex items-center justify-between text-xs">
                     <span className="text-dark-200">Inbound (SMTP)</span>
                     <span className={tls.inbound_enforced ? "text-rust-400 font-medium" : "text-dark-300"}>{tls.inbound_tls || "not set"}</span>
@@ -774,7 +812,7 @@ export default function Mail() {
                     <span className={tls.outbound_enforced ? "text-rust-400 font-medium" : "text-dark-300"}>{tls.outbound_tls || "not set"}</span>
                   </div>
                 </div>
-                <div className="flex gap-2 mt-3">
+                <div className="flex gap-2 mt-2">
                   <button onClick={async () => {
                     try { await api.post("/mail/tls/enforce", { inbound: "encrypt", outbound: "encrypt" }); setTls({ ...tls, inbound_tls: "encrypt", outbound_tls: "encrypt", inbound_enforced: true, outbound_enforced: true }); setMessage({ text: "TLS enforced", type: "success" }); }
                     catch (e) { setMessage({ text: e instanceof Error ? e.message : "Failed", type: "error" }); }
@@ -876,17 +914,17 @@ export default function Mail() {
         </div>
       )}
 
-      <div className="flex flex-col md:flex-row gap-6">
+      <div className="flex flex-col md:flex-row gap-4">
         {/* Domain Sidebar */}
         {domains.length > 0 && (
           <div className="md:w-60 shrink-0">
             <div className="bg-dark-800 border border-dark-500 overflow-hidden">
-              <div className="px-4 py-3 border-b border-dark-600">
+              <div className="px-3 py-2.5 border-b border-dark-600">
                 <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">Domains</h3>
               </div>
               <div className="divide-y divide-dark-600">
                 {domains.map((d) => (
-                  <div key={d.id} className={`px-4 py-3 cursor-pointer hover:bg-dark-800 flex items-center justify-between transition-colors ${selectedDomain?.id === d.id ? "bg-dark-50/5 border-l-2 border-dark-50" : ""}`} onClick={() => selectDomain(d)}>
+                  <div key={d.id} className={`px-3 py-2.5 cursor-pointer hover:bg-dark-800 flex items-center justify-between transition-colors ${selectedDomain?.id === d.id ? "bg-dark-50/5 border-l-2 border-dark-50" : ""}`} onClick={() => selectDomain(d)}>
                     <div className="min-w-0">
                       <span className="text-sm font-medium text-dark-50 truncate font-mono block">{d.domain}</span>
                       <span className="text-[10px] text-dark-300">{d.dkim_public_key ? "DKIM ready" : "No DKIM"}</span>
@@ -939,11 +977,11 @@ export default function Mail() {
           ) : (
             <div className="bg-dark-800 border border-dark-500">
               {/* Domain header + tabs */}
-              <div className="px-5 py-4 border-b border-dark-600">
+              <div className="px-4 py-3 border-b border-dark-600">
                 <h2 className="text-lg font-semibold text-dark-50 font-mono">{selectedDomain.domain}</h2>
                 <p className="text-xs text-dark-200">{accounts.length} mailbox{accounts.length !== 1 ? "es" : ""} · {aliases.length} alias{aliases.length !== 1 ? "es" : ""}</p>
               </div>
-              <div className="flex border-b border-dark-600 px-5">
+              <div className="flex border-b border-dark-600 px-4">
                 {/* Queue and Logs are the machine's mail queue and the whole
                     host's mail log — `get_queue` and `mail_logs`, both
                     AdminUser. They are not a filtered view of this domain, so
@@ -952,13 +990,13 @@ export default function Mail() {
                   ? (["accounts", "aliases", "dns", "queue", "logs"] as const)
                   : (["accounts", "aliases", "dns"] as const)
                 ).map((t) => (
-                  <button key={t} onClick={() => setTab(t)} className={`px-4 py-2.5 text-xs font-medium uppercase tracking-wider transition-colors ${tab === t ? "text-dark-50 border-b-2 border-dark-50" : "text-dark-300 hover:text-dark-100"}`}>
+                  <button key={t} onClick={() => setTab(t)} className={`px-3 py-2 text-xs font-medium uppercase tracking-wider transition-colors ${tab === t ? "text-dark-50 border-b-2 border-dark-50" : "text-dark-300 hover:text-dark-100"}`}>
                     {t === "dns" ? "DNS Records" : t === "queue" ? "Queue" : t === "logs" ? "Logs" : t.charAt(0).toUpperCase() + t.slice(1)}
                   </button>
                 ))}
               </div>
 
-              <div className="p-5">
+              <div className="p-4">
                 {/* Accounts Tab */}
                 {tab === "accounts" && (
                   <div>

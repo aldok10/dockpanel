@@ -134,6 +134,7 @@ pub fn router() -> Router<AppState> {
         .route("/mail/webmail/install", post(webmail_install))
         .route("/mail/webmail/status", get(webmail_status))
         .route("/mail/webmail/remove", post(webmail_remove))
+        .route("/mail/api/status", get(mailapi_status))
         // SMTP Relay
         .route("/mail/relay/configure", post(relay_configure))
         .route("/mail/relay/status", get(relay_status))
@@ -2183,6 +2184,44 @@ async fn webmail_status() -> Json<serde_json::Value> {
     let port = port_output.ok().and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u16>().ok()).unwrap_or(0);
 
     Json(serde_json::json!({ "installed": running || port > 0, "running": running, "port": port }))
+}
+
+/// GET /mail/api/status — the DockPanel Mail REST API (panel/mailapi).
+///
+/// Reporting only: the tokens a user mints live in Roundcube's own Settings, and
+/// the daemon reads them straight out of Roundcube's database, so there is
+/// nothing here for the panel to configure. What it CAN usefully show is whether
+/// the service is up and which URL clients should call — the latter being the
+/// sibling `mail-api.<domain>` of the panel host, which is where the installer
+/// puts it.
+async fn mailapi_status() -> Json<serde_json::Value> {
+    let installed = std::path::Path::new("/usr/local/bin/dockpanel-mailapi").exists();
+    let running = is_service_active("dockpanel-mailapi").await;
+    Json(serde_json::json!({
+        "installed": installed,
+        "running": running,
+        "url": mailapi_public_url(),
+    }))
+}
+
+/// The Mail API's public base URL, read back from the Roundcube drop-in
+/// `webmail_install` writes it into.
+///
+/// Computing it again here would mean a second derivation of the same name —
+/// and `panel_server_name` cannot supply it on a box whose panel vhost is
+/// `server_name _`, which is exactly the common case. Reading the file keeps the
+/// tab a user sees and this status line from ever disagreeing.
+fn mailapi_public_url() -> Option<String> {
+    let path = format!(
+        "{}/roundcube/var/roundcube/config/dockpanel.inc.php",
+        crate::services::docker_apps::APP_DATA_DIR
+    );
+    let content = std::fs::read_to_string(path).ok()?;
+    content
+        .lines()
+        .find(|l| l.contains("mailapi_url"))
+        .and_then(|l| l.split('\'').find(|s| s.starts_with("http")))
+        .map(|s| s.trim_end_matches('/').to_string())
 }
 
 /// POST /mail/webmail/remove — Remove Roundcube container + panel-vhost fragment.

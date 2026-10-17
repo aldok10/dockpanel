@@ -1701,6 +1701,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/mail/webmail/install", post(mail::webmail_install))
         .route("/api/mail/webmail/status", get(mail::webmail_status))
         .route("/api/mail/webmail/remove", post(mail::webmail_remove))
+        .route("/api/mail/api/status", get(mail::mailapi_status))
         // Mail: SMTP Relay
         .route("/api/mail/relay/configure", post(mail::relay_configure))
         .route("/api/mail/relay/status", get(mail::relay_status))
