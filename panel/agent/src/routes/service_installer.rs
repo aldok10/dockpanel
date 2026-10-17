@@ -82,9 +82,15 @@ async fn install_status() -> Result<Json<serde_json::Value>, ApiErr> {
     // Ubuntu 24.04 (Noble) renamed libmodsecurity3 → libmodsecurity3t64 in the
     // time_t-64 ABI transition (virtual-provides, no transitional shim). Check
     // both names so the install-state detect works on Noble and Debian alike.
+    // The config file is written by every path, but the library arrives
+    // differently on each: a package on Debian (`libmodsecurity3`, renamed to
+    // `...t64` by the time_t-64 transition) and RPM, and a from-source build on
+    // Alpine. Checking only the package names reported a working from-source
+    // WAF as absent there, so the Services page offered Install forever.
     let waf_installed = std::path::Path::new("/etc/modsecurity/modsecurity.conf").exists()
         && (is_installed("libmodsecurity3").await
-            || is_installed("libmodsecurity3t64").await);
+            || is_installed("libmodsecurity3t64").await
+            || std::path::Path::new("/usr/local/modsecurity/lib/libmodsecurity.so").exists());
 
     let cloudflared_installed = which("cloudflared").await;
     let cloudflared_running = is_active("cloudflared").await;
@@ -1205,6 +1211,222 @@ async fn detect_php_version() -> Option<String> {
 
 // ── WAF (ModSecurity3 + OWASP CRS) installer ───────────────────────
 
+/// Compile ModSecurity v3 and its nginx connector on a box that packages
+/// neither.
+///
+/// Alpine ships no `libmodsecurity` and no nginx ModSecurity module in `main`,
+/// `community` or `testing` (the `nginx-mod-http-naxsi` it does ship is a
+/// different engine, not a substitute), so the package path in [`install_waf`]
+/// has nothing to install there. This builds the two pieces upstream ships:
+///
+///   * libmodsecurity v3 into `/usr/local/modsecurity` (upstream's default
+///     prefix), and
+///   * `ngx_http_modsecurity_module` as a *dynamic* module, compiled against
+///     the source of the running nginx and installed into the `--modules-path`
+///     that nginx was configured with.
+///
+/// `--with-compat` is what makes the second step safe: Alpine builds its nginx
+/// with it, so a module compiled with the same flag and the same nginx version
+/// loads regardless of the rest of the configure line.
+///
+/// The build toolchain is installed as one `apk` virtual and removed on the way
+/// out. The runtime libraries libmodsecurity links against are installed
+/// *outside* that virtual first — `apk del` would otherwise collect them with
+/// the compiler and leave the library unable to load.
+async fn install_waf_from_source() -> Result<(), ApiErr> {
+    const MODULE_SO: &str = "/usr/lib/nginx/modules/ngx_http_modsecurity_module.so";
+    const MODSEC_LIB: &str = "/usr/local/modsecurity/lib/libmodsecurity.so";
+    const LOAD_CONF: &str = "/etc/nginx/modules/modsecurity.conf";
+
+    // A previous run may already have done the expensive part. Prove it the
+    // only way that matters — nginx loading the module into its real config —
+    // rather than trusting a marker file.
+    if std::path::Path::new(MODULE_SO).exists()
+        && std::path::Path::new(MODSEC_LIB).exists()
+        && std::path::Path::new(LOAD_CONF).exists()
+    {
+        let loads = tokio::time::timeout(
+            Duration::from_secs(10),
+            safe_command("nginx").args(["-t"]).output(),
+        )
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+        if loads {
+            tracing::info!("ModSecurity nginx module already built and loadable");
+            return Ok(());
+        }
+    }
+
+    // Runtime libraries first, explicitly, so the `apk del` in the build script
+    // keeps them: otherwise they are only dependencies of the `-dev` packages
+    // and vanish with the toolchain.
+    let mut add = safe_command_unsandboxed("apk", &[]);
+    add.args(["add", "--no-cache"])
+        .args(["libstdc++", "yajl", "libxml2", "libcurl", "pcre2"]);
+    let out = tokio::time::timeout(Duration::from_secs(300), add.output())
+        .await
+        .map_err(|_| {
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "WAF build: apk timed out installing the runtime libraries",
+            )
+        })?
+        .map_err(|e| {
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("WAF build: could not run apk: {e}"),
+            )
+        })?;
+    if !out.status.success() {
+        return Err(err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!(
+                "WAF build: could not install the runtime libraries: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+        ));
+    }
+
+    // One script, so the toolchain cleanup runs whether the build succeeds or
+    // not. `set -eu` stops at the first failure; the trap removes the virtual.
+    let script = r##"set -eu
+# Serialise concurrent installs. Two clicks at once share this script's build
+# directory and its `.waf-build-deps` virtual, so the first run's `rm -rf` and
+# its EXIT trap delete the second's source and toolchain from under it — seen
+# as a bogus "C++ compiler cannot create executables" (g++: not found) moments
+# after the toolchain was installed. A second run now waits for the first.
+exec 9>/run/lock/dockpanel-waf-build.lock
+flock 9
+
+apk add --no-cache --virtual .waf-build-deps \
+    build-base autoconf automake libtool pkgconf \
+    curl-dev pcre2-dev yajl-dev libxml2-dev zlib-dev openssl-dev linux-headers git
+trap 'apk del .waf-build-deps >/dev/null 2>&1 || true' EXIT
+
+WORK=/tmp/dockpanel-waf-build
+rm -rf "$WORK"
+mkdir -p "$WORK"
+cd "$WORK"
+
+# 1. libmodsecurity v3. The release tarball bundles its third-party sources,
+#    so no submodule fetch (and no git history) is needed.
+curl -fsSL --max-time 300 -o modsecurity.tar.gz \
+    https://github.com/owasp-modsecurity/ModSecurity/releases/download/v3.0.14/modsecurity-v3.0.14.tar.gz
+tar xzf modsecurity.tar.gz
+cd modsecurity-v3.0.14
+
+# GCC 13+ stopped including <cstdint> transitively, which 3.0.14 predates; it
+# fails to compile on a current toolchain without these includes. Upstream
+# carries the same include in later commits.
+for f in $(grep -rlE '\b(u?int(8|16|32|64)_t)\b' headers src); do
+    grep -q 'cstdint\|stdint.h' "$f" || sed -i '1i #include <stdint.h>' "$f"
+done
+
+./configure --with-pcre2 --with-geoip=no --with-maxmind=no --with-lmdb=no \
+    --without-ssdeep --without-lua --disable-examples >/dev/null
+make -j"$(nproc)" >/dev/null
+make install >/dev/null
+cd "$WORK"
+
+# 2. The nginx connector, built against the source of the *running* nginx. The
+#    version is read from the binary rather than pinned, so a distro update is
+#    followed instead of silently producing a module for the wrong ABI.
+NGINX_VER=$(nginx -v 2>&1 | sed -E 's#.*nginx/([0-9]+\.[0-9]+\.[0-9]+).*#\1#')
+test -n "$NGINX_VER"
+curl -fsSL --max-time 300 -o nginx.tar.gz \
+    "https://nginx.org/download/nginx-${NGINX_VER}.tar.gz"
+tar xzf nginx.tar.gz
+git clone --depth 1 https://github.com/owasp-modsecurity/ModSecurity-nginx.git
+cd "nginx-${NGINX_VER}"
+MODSECURITY_INC=/usr/local/modsecurity/include \
+MODSECURITY_LIB=/usr/local/modsecurity/lib \
+YAJL_LIB=/usr/lib \
+./configure --with-compat --with-http_ssl_module \
+    --add-dynamic-module="$WORK/ModSecurity-nginx" \
+    --with-cc-opt="-I/usr/local/modsecurity/include" \
+    --with-ld-opt="-L/usr/local/modsecurity/lib -Wl,-rpath,/usr/local/modsecurity/lib" >/dev/null
+make modules >/dev/null
+install -m 0644 objs/ngx_http_modsecurity_module.so /usr/lib/nginx/modules/
+"##;
+
+    // Compiling two C/C++ trees takes minutes, not seconds; the generous
+    // ceiling exists so a slow box is not mistaken for a broken one.
+    let out = tokio::time::timeout(
+        Duration::from_secs(2400),
+        safe_command_unsandboxed("sh", &[]).args(["-c", script]).output(),
+    )
+    .await
+    .map_err(|_| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "WAF build timed out while compiling ModSecurity (40 minutes)",
+        )
+    })?
+    .map_err(|e| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("WAF build could not start the compiler: {e}"),
+        )
+    })?;
+
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let lines: Vec<&str> = stderr.lines().collect();
+        let tail = lines[lines.len().saturating_sub(12)..].join("\n");
+        return Err(err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("WAF build failed while compiling ModSecurity:\n{tail}"),
+        ));
+    }
+
+    // The module has to be loaded before any `modsecurity` directive is valid.
+    // Alpine's nginx includes `/etc/nginx/modules/*.conf`; a directive there is
+    // how every packaged module on this distro does it, and it keeps the line
+    // out of the user's own site configs.
+    if let Err(e) = std::fs::create_dir_all("/etc/nginx/modules") {
+        return Err(err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Create /etc/nginx/modules: {e}"),
+        ));
+    }
+    std::fs::write(
+        LOAD_CONF,
+        "load_module modules/ngx_http_modsecurity_module.so;\n",
+    )
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Write {LOAD_CONF}: {e}")))?;
+
+    // Assert what the rest of the install assumes — nginx can actually load it
+    // — instead of reporting success on the strength of a copied file.
+    match tokio::time::timeout(Duration::from_secs(15), safe_command("nginx").args(["-t"]).output())
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+    {
+        Some(o) if o.status.success() => {}
+        Some(o) => {
+            return Err(err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!(
+                    "the ModSecurity module was built but nginx -t rejects it: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ),
+            ));
+        }
+        None => {
+            return Err(err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "nginx -t did not complete after installing the ModSecurity module",
+            ));
+        }
+    }
+
+    tracing::info!("libmodsecurity v3.0.14 and ngx_http_modsecurity_module built from source");
+    Ok(())
+}
+
 async fn install_waf() -> Result<Json<serde_json::Value>, ApiErr> {
     use crate::services::pkg;
 
@@ -1218,13 +1440,23 @@ async fn install_waf() -> Result<Json<serde_json::Value>, ApiErr> {
     // pulls the library in, so both Debian spellings collapse onto it — which
     // is why passing both here is correct on either family rather than a
     // duplicate. (Only one of the two was translated before s266.)
-    pkg::refresh_index().await;
-    pkg::install(&["libmodsecurity3", "libnginx-mod-http-modsecurity"])
-        .await
-        .map_err(|e| {
-            err(StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("WAF install failed (libmodsecurity3 or the nginx module is not available): {e}"))
-        })?;
+    //
+    // Alpine is a third case with no package at all: neither the library nor
+    // the connector exists in `main`, `community` or `testing`, so the package
+    // path would fail on its very first argument. There the two pieces are
+    // compiled from upstream source instead; that path also writes the
+    // `load_module` directive the packaged module would have shipped.
+    if pkg::manager().await == pkg::PkgMgr::Apk {
+        install_waf_from_source().await?;
+    } else {
+        pkg::refresh_index().await;
+        pkg::install(&["libmodsecurity3", "libnginx-mod-http-modsecurity"])
+            .await
+            .map_err(|e| {
+                err(StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("WAF install failed (libmodsecurity3 or the nginx module is not available): {e}"))
+            })?;
+    }
 
     // 2. Create directory structure
     let dirs = ["/etc/modsecurity", "/etc/modsecurity/sites", "/var/log/modsecurity"];
@@ -1385,23 +1617,36 @@ async fn uninstall_waf() -> Result<Json<serde_json::Value>, ApiErr> {
         }
     }
 
+    // Take the module out before the reload below, so nginx comes back up
+    // without it. On Alpine there is no package to remove — the install
+    // compiled the pieces itself — so the from-source artifacts are deleted
+    // directly; the other families still go through the package manager.
+    if pkg::manager().await == pkg::PkgMgr::Apk {
+        // The `load_module` directive goes first: reloading nginx with a
+        // directive pointing at a file that is already gone would fail. The
+        // running master keeps the old image mapped until it is reloaded.
+        let _ = std::fs::remove_file("/etc/nginx/modules/modsecurity.conf");
+        let _ = std::fs::remove_file("/usr/lib/nginx/modules/ngx_http_modsecurity_module.so");
+        let _ = std::fs::remove_dir_all("/usr/local/modsecurity");
+    } else {
+        // Purge packages. All three Debian spellings collapse onto the single
+        // RHEL package, so `remove` is handed the same list `install` was given.
+        pkg::remove(&[
+            "libnginx-mod-http-modsecurity",
+            "libmodsecurity3",
+            "libmodsecurity3t64",
+        ])
+        .await
+        .map_err(|e| {
+            err(StatusCode::INTERNAL_SERVER_ERROR, &format!("WAF uninstall failed: {e}"))
+        })?;
+    }
+
     // Reload nginx to remove WAF from active configs
     let _ = tokio::time::timeout(
         Duration::from_secs(10),
         safe_command("nginx").args(["-s", "reload"]).output()
     ).await;
-
-    // Purge packages. All three Debian spellings collapse onto the single RHEL
-    // package, so `remove` is handed the same list `install` was given.
-    pkg::remove(&[
-        "libnginx-mod-http-modsecurity",
-        "libmodsecurity3",
-        "libmodsecurity3t64",
-    ])
-    .await
-    .map_err(|e| {
-        err(StatusCode::INTERNAL_SERVER_ERROR, &format!("WAF uninstall failed: {e}"))
-    })?;
 
     // Clean up config files (preserve logs)
     let _ = std::fs::remove_dir_all("/etc/modsecurity");
