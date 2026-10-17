@@ -85,7 +85,16 @@ RestrictNamespaces=~user
 # to a directory nothing in the agent ever writes — it is here so the invariant
 # "the agent only writes where the unit says it may" stays literally true, and
 # `-`-prefixed because a RHEL minimal image has no /etc/init.d at all.
-ReadWritePaths=/etc/nginx /etc/dockpanel /var/run/dockpanel /var/backups/dockpanel /var/lib/dockpanel /var/www /var/log /etc/systemd/system -/etc/init.d /opt -/etc/letsencrypt -/etc/apt -/etc/fail2ban -/etc/powerdns -/etc/modsecurity -/etc/cloudflared -/etc/postfix -/etc/dovecot -/var/spool/postfix -/var/spool/cron -/var/vmail -/var/cache/nginx -/etc/ufw -/var/lib/ufw -/etc/php -/etc/ssh -/var/dockpanel-sftp
+# /etc/conf.d and /etc/ssl/dovecot are the two writes the mail install makes on
+# an OpenRC box. OpenRC has no drop-in machinery, so Alpine's `opendkim` runscript
+# reads its extra arguments from /etc/conf.d/opendkim — a file the RUNSCRIPT
+# names, so it cannot be relocated into a directory the agent already owns the
+# way the systemd half's drop-in can. /etc/ssl/dovecot is where Alpine's own
+# Dovecot package keeps its snakeoil pair, and where `ensure_selfsigned_mail_cert`
+# puts the one it generates when the box has no real certificate to hand either
+# daemon. Both are `-`-prefixed: /etc/conf.d exists only on Alpine, and neither is
+# present before the mail install runs.
+ReadWritePaths=/etc/nginx /etc/dockpanel /var/run/dockpanel /var/backups/dockpanel /var/lib/dockpanel /var/www /var/log /etc/systemd/system -/etc/init.d /opt -/etc/letsencrypt -/etc/apt -/etc/fail2ban -/etc/powerdns -/etc/modsecurity -/etc/cloudflared -/etc/postfix -/etc/dovecot -/etc/conf.d -/etc/ssl/dovecot -/var/spool/postfix -/var/spool/cron -/var/vmail -/var/cache/nginx -/etc/ufw -/var/lib/ufw -/etc/php -/etc/ssh -/var/dockpanel-sftp
 
 MemoryMax=512M
 LimitNOFILE=65535

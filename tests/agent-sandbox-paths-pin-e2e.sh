@@ -102,14 +102,15 @@ echo "§2 optional paths carry systemd's '-' prefix (an absent one must not bric
 # the prefix, or a box without it fails namespace setup and the agent never starts.
 MISSING_DASH=0
 for p in /etc/letsencrypt /etc/apt /etc/fail2ban /etc/powerdns /etc/modsecurity \
-         /etc/cloudflared /etc/postfix /etc/dovecot /var/spool/postfix /var/spool/cron \
+         /etc/cloudflared /etc/postfix /etc/dovecot /etc/conf.d /etc/ssl/dovecot \
+         /var/spool/postfix /var/spool/cron \
          /var/vmail /var/cache/nginx /etc/ufw /var/lib/ufw /etc/php /etc/ssh; do
   if grep -q -- "-$p" "$UNIT"; then :; else
     bad "$p is listed without the '-' prefix — one absent directory stops the agent starting"
     MISSING_DASH=1
   fi
 done
-[ "$MISSING_DASH" -eq 0 ] && ok "all 16 conditional paths carry '-'"
+[ "$MISSING_DASH" -eq 0 ] && ok "all 18 conditional paths carry '-'"
 
 echo
 echo "§3 the three that already shipped broken stay listed"
