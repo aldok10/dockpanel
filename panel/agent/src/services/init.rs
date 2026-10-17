@@ -706,8 +706,18 @@ fn disable(units: &[String], now: bool) -> i32 {
 }
 
 fn rc_service(service: &str, verb: &str) -> i32 {
+    // Never hand the caller's stdout/stderr down to the daemon. `rc-service`
+    // starts the service, and a daemon that keeps its inherited descriptors —
+    // Dovecot among them (its master leaves stderr pointing at whatever it
+    // inherited) — holds open the capture pipe a caller like
+    // `Command::output()` reads until EOF, so a perfectly successful start
+    // blocks the caller forever. The exit code is the contract; the
+    // runscript's chatter is not, and daemon logs go to the system log anyway.
     status_of(
-        crate::safe_cmd::safe_command_sync("rc-service").args([service, verb]),
+        crate::safe_cmd::safe_command_sync("rc-service")
+            .args([service, verb])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
     )
 }
 
