@@ -1,0 +1,1469 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "DockPanel Mail API",
+    "version": "1.0.0",
+    "description": "Send and manage mail on a DockPanel host over REST.\n\nMessages are injected through Postfix's local `sendmail` wrapper, so they are DKIM-signed and delivered on exactly the same path as mail sent from the webmail, and a copy is filed into the sender's **Sent** folder.\n\n## Authentication\n\nEvery route except `GET /health` requires `Authorization: Bearer <token>`. Two kinds of token are accepted, and only one of them is a *mailbox*:\n\n* **A mailbox token** — minted per-mailbox in Roundcube under **Settings → Mail API**. It may send as its own address and manage only its own mailbox (the `/v1/me/*` routes). This is the token an application should hold.\n* **A panel API key** — one beginning with `dp_`, created in the panel under **Settings → API keys**. It is not bound to a mailbox; it authenticates as the panel does, which is what the server-wide `/v1/domains/*` and `/v1/queue/*` routes require.\n\nThe two are not interchangeable: a mailbox token gets `403` on a management route, a `dp_` key is refused by nothing but the panel's own authorization — and `GET /v1/me` reports which level the presented token is at, as `admin`."
+  },
+  "servers": [
+    {
+      "url": "/",
+      "description": "This host (same origin the API is served from)"
+    }
+  ],
+  "tags": [
+    {
+      "name": "Health",
+      "description": "Liveness. The only unauthenticated route."
+    },
+    {
+      "name": "Send",
+      "description": "Inject an outbound message as the authenticated mailbox."
+    },
+    {
+      "name": "Self-service",
+      "description": "The caller's own mailbox. Any mailbox token may use these, and only for its own address."
+    },
+    {
+      "name": "Management",
+      "description": "Server-wide mail administration. Requires a panel `dp_` API key, or a mailbox listed in the service's `MAILAPI_ADMIN_EMAILS`."
+    }
+  ],
+  "security": [
+    {
+      "bearerAuth": []
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": ["Health"],
+        "summary": "Liveness probe",
+        "operationId": "health",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "The service is up.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": { "type": "string", "example": "ok" },
+                    "service": { "type": "string", "example": "dockpanel-mailapi" }
+                  },
+                  "required": ["status", "service"]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/send": {
+      "post": {
+        "tags": ["Send"],
+        "summary": "Send a message",
+        "description": "Sends as the mailbox the token belongs to. `from` defaults to that mailbox and is refused if it names any other address (a display name is fine). At least one `to` recipient is required; provide `text` and/or `html`.",
+        "operationId": "send",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/SendRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Accepted for delivery. `accepted` lists every envelope recipient, including BCC.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/SendResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": {
+            "description": "The token may not send as the requested `from` address.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          },
+          "500": { "$ref": "#/components/responses/Internal" }
+        }
+      }
+    },
+    "/emails": {
+      "post": {
+        "tags": ["Send"],
+        "summary": "Send a message (alias of /v1/send)",
+        "description": "Kept for callers written against the original route. Identical to `POST /v1/send`.",
+        "operationId": "sendAlias",
+        "deprecated": true,
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/SendRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Accepted for delivery.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/SendResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": {
+            "description": "The token may not send as the requested `from` address.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          },
+          "500": { "$ref": "#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/me": {
+      "get": {
+        "tags": ["Self-service"],
+        "summary": "Who the token is",
+        "operationId": "me",
+        "responses": {
+          "200": {
+            "description": "The authenticated mailbox and its level.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Me" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      },
+      "put": {
+        "tags": ["Self-service"],
+        "summary": "Set the mailbox display name",
+        "description": "`null` leaves the display name unchanged; an empty string clears it.",
+        "operationId": "meUpdate",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/DisplayNamePatch" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The updated mailbox.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MailAccount" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/v1/me/password": {
+      "post": {
+        "tags": ["Self-service"],
+        "summary": "Change the mailbox password",
+        "operationId": "mePassword",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/PasswordChange" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The updated mailbox.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MailAccount" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/v1/me/forward": {
+      "get": {
+        "tags": ["Self-service"],
+        "summary": "Read the forwarding address",
+        "operationId": "meForwardGet",
+        "responses": {
+          "200": {
+            "description": "The current forwarding setting.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ForwardResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      },
+      "put": {
+        "tags": ["Self-service"],
+        "summary": "Set or clear the forwarding address",
+        "description": "A `PUT` replaces the setting, so an omitted `forward_to` means \"no forwarding\". An empty string clears it.",
+        "operationId": "meForwardPut",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ForwardSetting" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The updated mailbox.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MailAccount" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/v1/me/autoresponder": {
+      "get": {
+        "tags": ["Self-service"],
+        "summary": "Read the out-of-office reply",
+        "operationId": "meAutoresponderGet",
+        "responses": {
+          "200": {
+            "description": "The current vacation/out-of-office setting.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AutoresponderResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      },
+      "put": {
+        "tags": ["Self-service"],
+        "summary": "Set the out-of-office reply",
+        "description": "Any field left out is left unchanged.",
+        "operationId": "meAutoresponderPut",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/AutoresponderSetting" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The updated mailbox.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MailAccount" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/v1/me/quota": {
+      "get": {
+        "tags": ["Self-service"],
+        "summary": "Mailbox usage against its quota",
+        "description": "Usage is read live from Dovecot, so it reflects what has actually been delivered; the limit comes from the panel, where it is configured.",
+        "operationId": "meQuota",
+        "responses": {
+          "200": {
+            "description": "Usage and limit.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/QuotaResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "500": { "$ref": "#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/me/folders": {
+      "get": {
+        "tags": ["Self-service"],
+        "summary": "List IMAP folders",
+        "operationId": "meFolders",
+        "responses": {
+          "200": {
+            "description": "Every folder in the mailbox.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/FoldersResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "500": { "$ref": "#/components/responses/Internal" }
+        }
+      },
+      "post": {
+        "tags": ["Self-service"],
+        "summary": "Create a folder",
+        "description": "Use `INBOX/Sub` to nest.",
+        "operationId": "meFolderCreate",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/FolderCreate" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The folder was created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": { "created": { "type": "string", "example": "Archive" } },
+                  "required": ["created"]
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      },
+      "delete": {
+        "tags": ["Self-service"],
+        "summary": "Delete a folder",
+        "description": "The folder is named by a query parameter rather than a path segment because folder names legitimately contain `/`. `INBOX`, `Sent` and `Trash` are structurally protected and are refused.",
+        "operationId": "meFolderDelete",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "query",
+            "required": true,
+            "description": "Folder to delete, e.g. `Archive`.",
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The folder was deleted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": { "deleted": { "type": "string", "example": "Archive" } },
+                  "required": ["deleted"]
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" }
+        }
+      }
+    },
+    "/v1/me/messages": {
+      "get": {
+        "tags": ["Self-service"],
+        "summary": "List the messages in a folder",
+        "description": "`Drafts`, `Sent` and `Trash` are folders rather than routes: name one with `folder` and this is how it is read. Newest first.",
+        "operationId": "meMessages",
+        "parameters": [
+          {
+            "name": "folder",
+            "in": "query",
+            "required": false,
+            "description": "Folder to read. Defaults to `INBOX`. A query parameter rather than a path segment because folder names legitimately contain `/`.",
+            "schema": { "type": "string", "default": "INBOX", "example": "Sent" }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "description": "Most messages to return. Defaults to 50 and is capped at 500.",
+            "schema": { "type": "integer", "minimum": 1, "maximum": 500, "default": 50 }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "description": "Messages to skip, newest first.",
+            "schema": { "type": "integer", "minimum": 0, "default": 0 }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The messages in the folder.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MessagesResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      },
+      "post": {
+        "tags": ["Self-service"],
+        "summary": "Append a message to a folder",
+        "description": "Writes a message into a folder without sending it — how a draft is saved. It is built by the same code that `/v1/send` sends with, so it takes the same fields, except that no recipient is required. When the mailbox does not hand the message back, `uid` is `null` and any `flags` were not applied.",
+        "operationId": "meMessageAppend",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/MessageAppend" },
+              "example": {
+                "folder": "Drafts",
+                "to": "someone@example.com",
+                "subject": "Draft",
+                "text": "Written later",
+                "flags": ["\\Draft"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The message was written.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MessageAppendResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/v1/me/messages/{uid}": {
+      "get": {
+        "tags": ["Self-service"],
+        "summary": "Read one message",
+        "operationId": "meMessage",
+        "parameters": [
+          {
+            "name": "uid",
+            "in": "path",
+            "required": true,
+            "description": "Message ordinal, as `GET /v1/me/messages` reports it.",
+            "schema": { "type": "integer" }
+          },
+          {
+            "name": "folder",
+            "in": "query",
+            "required": true,
+            "description": "Folder the message is in.",
+            "schema": { "type": "string", "example": "Drafts" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The message, headers and all.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MessageResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      },
+      "delete": {
+        "tags": ["Self-service"],
+        "summary": "Delete a message",
+        "description": "A delete in mail is a move to `Trash`. `permanent=true` expunges instead, and a message already in `Trash` is expunged either way.",
+        "operationId": "meMessageDelete",
+        "parameters": [
+          {
+            "name": "uid",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "integer" }
+          },
+          {
+            "name": "folder",
+            "in": "query",
+            "required": true,
+            "schema": { "type": "string", "example": "INBOX" }
+          },
+          {
+            "name": "permanent",
+            "in": "query",
+            "required": false,
+            "description": "Expunge instead of moving to `Trash`.",
+            "schema": { "type": "boolean", "default": false }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The message was deleted — moved or expunged, as `moved_to` and `permanent` report.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "deleted": { "type": "integer" },
+                    "folder": { "type": "string" },
+                    "moved_to": { "type": "string", "nullable": true, "description": "Set when the message was moved rather than expunged." },
+                    "permanent": { "type": "boolean" }
+                  },
+                  "required": ["deleted", "folder", "permanent"]
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/v1/me/messages/{uid}/move": {
+      "post": {
+        "tags": ["Self-service"],
+        "summary": "Move a message to another folder",
+        "description": "How a message is restored out of `Trash`, or filed into `Sent`.",
+        "operationId": "meMessageMove",
+        "parameters": [
+          {
+            "name": "uid",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "integer" }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/MessageMove" },
+              "example": { "folder": "Trash", "to": "INBOX" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The message was moved.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "moved": { "type": "integer" },
+                    "from": { "type": "string" },
+                    "to": { "type": "string" }
+                  },
+                  "required": ["moved", "from", "to"]
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/v1/me/messages/{uid}/flags": {
+      "post": {
+        "tags": ["Self-service"],
+        "summary": "Set the flags on a message",
+        "description": "The flags the mailbox holds afterwards are read back, not predicted: `\\Recent` is Dovecot's to set. Only `\\Seen`, `\\Answered`, `\\Flagged`, `\\Draft` and `\\Deleted` may be set, with or without the leading backslash.",
+        "operationId": "meMessageFlags",
+        "parameters": [
+          {
+            "name": "uid",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "integer" }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/FlagsChange" },
+              "example": { "folder": "INBOX", "add": ["Seen"], "remove": ["Flagged"] }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The message's flags after the change.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/FlagsResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/v1/me/trash/empty": {
+      "post": {
+        "tags": ["Self-service"],
+        "summary": "Empty Trash",
+        "operationId": "meTrashEmpty",
+        "responses": {
+          "200": {
+            "description": "How much was in `Trash` when it was emptied.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "emptied": { "type": "string", "example": "Trash" },
+                    "messages": { "type": "integer", "description": "Messages that were removed." }
+                  },
+                  "required": ["emptied", "messages"]
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "500": { "$ref": "#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/domains": {
+      "get": {
+        "tags": ["Management"],
+        "summary": "List mail domains",
+        "operationId": "domainsList",
+        "responses": {
+          "200": {
+            "description": "Every mail domain on the host.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": { "$ref": "#/components/schemas/MailDomain" }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      },
+      "post": {
+        "tags": ["Management"],
+        "summary": "Create a mail domain",
+        "description": "Creates the domain, its DKIM key, and — when the panel manages the zone — its DNS records.",
+        "operationId": "domainsCreate",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CreateDomainRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The new domain.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MailDomain" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    },
+    "/v1/domains/{domain}": {
+      "get": {
+        "tags": ["Management"],
+        "summary": "Get one mail domain",
+        "operationId": "domainGet",
+        "parameters": [{ "$ref": "#/components/parameters/Domain" }],
+        "responses": {
+          "200": {
+            "description": "The domain.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MailDomain" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      },
+      "put": {
+        "tags": ["Management"],
+        "summary": "Update a mail domain",
+        "operationId": "domainUpdate",
+        "parameters": [{ "$ref": "#/components/parameters/Domain" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/UpdateDomainRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The updated domain.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MailDomain" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      },
+      "delete": {
+        "tags": ["Management"],
+        "summary": "Delete a mail domain",
+        "description": "Removes the domain and its mailboxes, and — when the panel manages the zone — the DNS records it created.",
+        "operationId": "domainDelete",
+        "parameters": [{ "$ref": "#/components/parameters/Domain" }],
+        "responses": {
+          "200": {
+            "description": "The domain was deleted.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Ok" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/v1/domains/{domain}/accounts": {
+      "get": {
+        "tags": ["Management"],
+        "summary": "List mailboxes in a domain",
+        "operationId": "accountsList",
+        "parameters": [{ "$ref": "#/components/parameters/Domain" }],
+        "responses": {
+          "200": {
+            "description": "Every mailbox in the domain.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": { "$ref": "#/components/schemas/MailAccount" }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      },
+      "post": {
+        "tags": ["Management"],
+        "summary": "Create a mailbox",
+        "operationId": "accountsCreate",
+        "parameters": [{ "$ref": "#/components/parameters/Domain" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CreateAccountRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The new mailbox.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MailAccount" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/v1/domains/{domain}/accounts/{email}": {
+      "put": {
+        "tags": ["Management"],
+        "summary": "Update a mailbox",
+        "description": "Any of `password`, `display_name`, `quota_mb`, `enabled`, `forward_to`, `autoresponder_enabled`, `autoresponder_subject`, `autoresponder_body`. Fields left out are left unchanged.",
+        "operationId": "accountUpdate",
+        "parameters": [
+          { "$ref": "#/components/parameters/Domain" },
+          { "$ref": "#/components/parameters/Email" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/UpdateAccountRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The updated mailbox.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MailAccount" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      },
+      "delete": {
+        "tags": ["Management"],
+        "summary": "Delete a mailbox",
+        "operationId": "accountDelete",
+        "parameters": [
+          { "$ref": "#/components/parameters/Domain" },
+          { "$ref": "#/components/parameters/Email" }
+        ],
+        "responses": {
+          "200": {
+            "description": "The mailbox was deleted.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Ok" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/v1/domains/{domain}/aliases": {
+      "get": {
+        "tags": ["Management"],
+        "summary": "List aliases in a domain",
+        "operationId": "aliasesList",
+        "parameters": [{ "$ref": "#/components/parameters/Domain" }],
+        "responses": {
+          "200": {
+            "description": "Every alias and forward in the domain.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": { "$ref": "#/components/schemas/MailAlias" }
+                }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      },
+      "post": {
+        "tags": ["Management"],
+        "summary": "Create an alias or forward",
+        "operationId": "aliasesCreate",
+        "parameters": [{ "$ref": "#/components/parameters/Domain" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CreateAliasRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The new alias.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MailAlias" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/v1/domains/{domain}/aliases/{id}": {
+      "delete": {
+        "tags": ["Management"],
+        "summary": "Delete an alias",
+        "operationId": "aliasDelete",
+        "parameters": [
+          { "$ref": "#/components/parameters/Domain" },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "Alias id, as returned by the alias list.",
+            "schema": { "type": "string", "format": "uuid" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The alias was deleted.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Ok" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/v1/queue": {
+      "get": {
+        "tags": ["Management"],
+        "summary": "Inspect the Postfix queue",
+        "description": "What the MTA is holding, and why.",
+        "operationId": "queueList",
+        "responses": {
+          "200": {
+            "description": "The queued messages.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/QueueResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      },
+      "delete": {
+        "tags": ["Management"],
+        "summary": "Drop a queued message",
+        "operationId": "queueDelete",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "query",
+            "required": true,
+            "description": "Queue id, as returned by `GET /v1/queue`.",
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The message was removed from the queue.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Ok" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    },
+    "/v1/queue/flush": {
+      "post": {
+        "tags": ["Management"],
+        "summary": "Retry everything queued",
+        "operationId": "queueFlush",
+        "responses": {
+          "200": {
+            "description": "The queue was flushed.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Ok" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "A per-mailbox token minted in Roundcube (Settings → Mail API), or a panel API key beginning with `dp_`. Both travel in the same `Authorization` header."
+      }
+    },
+    "parameters": {
+      "Domain": {
+        "name": "domain",
+        "in": "path",
+        "required": true,
+        "description": "A mail domain name, e.g. `example.com`.",
+        "schema": { "type": "string", "example": "example.com" }
+      },
+      "Email": {
+        "name": "email",
+        "in": "path",
+        "required": true,
+        "description": "A full mailbox address inside that domain.",
+        "schema": { "type": "string", "format": "email", "example": "sales@example.com" }
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "The request was rejected.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Error" }
+          }
+        }
+      },
+      "Unauthorized": {
+        "description": "Missing, unknown, or revoked token.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Error" }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "The token is valid but is not allowed to perform a server-wide operation.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Error" }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "No such domain, mailbox, or alias.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Error" }
+          }
+        }
+      },
+      "Internal": {
+        "description": "The operation failed on the server.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Error" }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "properties": {
+          "error": { "type": "string", "description": "A human-readable reason." }
+        },
+        "required": ["error"]
+      },
+      "Ok": {
+        "type": "object",
+        "description": "A management call proxied to the panel. The panel's own body is returned; its shape is not restated here.",
+        "additionalProperties": true
+      },
+      "MessageRequest": {
+        "type": "object",
+        "description": "The parts of a message a caller sets. One schema for both doors, because a message written into a folder is built by the same code that sends one — only the sending differs.",
+        "properties": {
+          "from": {
+            "type": "string",
+            "description": "Sender. Defaults to the token's mailbox, and is refused if it names any other address. A display name (`Name <a@b.c>`) is allowed."
+          },
+          "to": {
+            "description": "Primary recipients. Required when sending; a draft may have none.",
+            "oneOf": [
+              { "type": "string", "format": "email" },
+              { "type": "array", "items": { "type": "string", "format": "email" } }
+            ]
+          },
+          "cc": {
+            "description": "Carbon-copy recipients.",
+            "oneOf": [
+              { "type": "string", "format": "email" },
+              { "type": "array", "items": { "type": "string", "format": "email" } }
+            ]
+          },
+          "bcc": {
+            "description": "Blind recipients. They receive the message but never appear in its headers.",
+            "oneOf": [
+              { "type": "string", "format": "email" },
+              { "type": "array", "items": { "type": "string", "format": "email" } }
+            ]
+          },
+          "reply_to": { "type": "string", "format": "email" },
+          "subject": { "type": "string" },
+          "text": { "type": "string", "description": "Plain-text body." },
+          "html": { "type": "string", "description": "HTML body. With `text` too, the message is sent as multipart/alternative." }
+        }
+      },
+      "SendRequest": {
+        "description": "A message to send. The one difference from `MessageRequest` is `to`: a message may be stored in a folder with no recipient, but it cannot be sent to nobody.",
+        "allOf": [{ "$ref": "#/components/schemas/MessageRequest" }],
+        "required": ["to"],
+        "example": {
+          "to": "someone@example.com",
+          "subject": "Hello",
+          "text": "Hi there"
+        }
+      },
+      "SendResponse": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "nullable": true, "description": "The message's `Message-ID`, useful as a handle to key on." },
+          "accepted": {
+            "type": "array",
+            "items": { "type": "string", "format": "email" },
+            "description": "Every envelope recipient, including BCC."
+          }
+        },
+        "required": ["accepted"]
+      },
+      "Me": {
+        "type": "object",
+        "properties": {
+          "email": { "type": "string", "format": "email" },
+          "domain": { "type": "string", "description": "The mailbox's domain." },
+          "admin": {
+            "type": "boolean",
+            "description": "Whether this token may use the server-wide `/v1/domains/*` and `/v1/queue/*` routes."
+          }
+        },
+        "required": ["email", "admin"]
+      },
+      "DisplayNamePatch": {
+        "type": "object",
+        "properties": {
+          "display_name": { "type": "string", "nullable": true, "description": "`null` leaves it unchanged; `\"\"` clears it." }
+        }
+      },
+      "PasswordChange": {
+        "type": "object",
+        "properties": { "new_password": { "type": "string", "minLength": 1 } },
+        "required": ["new_password"]
+      },
+      "ForwardSetting": {
+        "type": "object",
+        "properties": {
+          "forward_to": { "type": "string", "nullable": true, "description": "An address to forward to. Omitted or `\"\"` clears forwarding." }
+        }
+      },
+      "ForwardResponse": {
+        "type": "object",
+        "properties": { "forward_to": { "type": "string", "nullable": true } },
+        "required": ["forward_to"]
+      },
+      "AutoresponderSetting": {
+        "type": "object",
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "subject": { "type": "string", "nullable": true },
+          "body": { "type": "string", "nullable": true }
+        }
+      },
+      "AutoresponderResponse": {
+        "type": "object",
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "subject": { "type": "string", "nullable": true },
+          "body": { "type": "string", "nullable": true }
+        },
+        "required": ["enabled"]
+      },
+      "QuotaResponse": {
+        "type": "object",
+        "properties": {
+          "email": { "type": "string", "format": "email" },
+          "used_kb": { "type": "integer", "format": "int64", "description": "Bytes in use, in KiB, summed over every folder." },
+          "messages": { "type": "integer", "format": "int64", "description": "Total messages across every folder." },
+          "quota_mb": { "type": "integer", "nullable": true, "description": "The limit, from the panel. `null` when no limit is set." },
+          "limit_kb": { "type": "integer", "format": "int64", "nullable": true }
+        },
+        "required": ["email", "used_kb", "messages"]
+      },
+      "FoldersResponse": {
+        "type": "object",
+        "properties": {
+          "email": { "type": "string", "format": "email" },
+          "folders": { "type": "array", "items": { "type": "string" } }
+        },
+        "required": ["email", "folders"]
+      },
+      "FolderCreate": {
+        "type": "object",
+        "properties": { "name": { "type": "string", "example": "Archive" } },
+        "required": ["name"]
+      },
+      "MessageSummary": {
+        "type": "object",
+        "description": "One message, as a listing shows it.",
+        "properties": {
+          "uid": { "type": "integer", "description": "Mailbox ordinal. Stable within a folder until the message is expunged." },
+          "flags": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Dovecot's flags for the message, split into a list.",
+            "example": ["\\Seen", "\\Recent"]
+          },
+          "size": { "type": "integer", "nullable": true, "description": "Size in bytes." },
+          "subject": { "type": "string", "nullable": true },
+          "from": { "type": "string", "nullable": true },
+          "to": { "type": "string", "nullable": true },
+          "cc": { "type": "string", "nullable": true },
+          "date": { "type": "string", "nullable": true, "description": "The `Date` header, as the message wrote it." }
+        },
+        "required": ["uid", "flags"]
+      },
+      "MessagesResponse": {
+        "type": "object",
+        "properties": {
+          "email": { "type": "string", "format": "email" },
+          "folder": { "type": "string", "example": "Sent" },
+          "total": { "type": "integer", "description": "Messages in the folder, before `limit` and `offset`." },
+          "offset": { "type": "integer" },
+          "messages": { "type": "array", "items": { "$ref": "#/components/schemas/MessageSummary" } }
+        },
+        "required": ["email", "folder", "total", "offset", "messages"]
+      },
+      "MessageResponse": {
+        "type": "object",
+        "properties": {
+          "email": { "type": "string", "format": "email" },
+          "folder": { "type": "string" },
+          "uid": { "type": "integer" },
+          "message": { "$ref": "#/components/schemas/MessageSummary" },
+          "text": { "type": "string", "description": "The stored message as it is on disk, headers included." }
+        },
+        "required": ["email", "folder", "uid", "message", "text"]
+      },
+      "MessageMove": {
+        "type": "object",
+        "properties": {
+          "folder": { "type": "string", "description": "Folder the message is in now." },
+          "to": { "type": "string", "description": "Folder to move it to. Both must already exist." }
+        },
+        "required": ["folder", "to"],
+        "example": { "folder": "Trash", "to": "INBOX" }
+      },
+      "MessageAppend": {
+        "description": "A message written into a folder instead of being sent — how a draft is saved.",
+        "allOf": [
+          { "$ref": "#/components/schemas/MessageRequest" },
+          {
+            "type": "object",
+            "required": ["folder"],
+            "properties": {
+              "folder": { "type": "string", "description": "Folder to write into. The mailbox must already have it, so a typo cannot create one.", "example": "Drafts" },
+              "flags": {
+                "type": "array",
+                "items": { "type": "string", "enum": ["\\Seen", "\\Answered", "\\Flagged", "\\Draft", "\\Deleted"] },
+                "description": "Flags to set on the stored message. `\\Draft` is what makes a saved message a draft.",
+                "example": ["\\Draft"]
+              }
+            }
+          }
+        ]
+      },
+      "MessageAppendResponse": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "description": "The `Message-ID` this server generated for the message." },
+          "folder": { "type": "string" },
+          "uid": { "type": "integer", "nullable": true, "description": "The uid the message was stored as, or `null` when the mailbox did not hand it back — in which case the flags could not be applied either." }
+        },
+        "required": ["id", "folder", "uid"]
+      },
+      "FlagsChange": {
+        "type": "object",
+        "properties": {
+          "folder": { "type": "string", "description": "Folder the message is in." },
+          "add": {
+            "type": "array",
+            "items": { "type": "string", "enum": ["\\Seen", "\\Answered", "\\Flagged", "\\Draft", "\\Deleted"] },
+            "description": "Flags to set. The leading backslash is optional."
+          },
+          "remove": {
+            "type": "array",
+            "items": { "type": "string", "enum": ["\\Seen", "\\Answered", "\\Flagged", "\\Draft", "\\Deleted"] },
+            "description": "Flags to clear."
+          }
+        },
+        "required": ["folder"],
+        "example": { "folder": "INBOX", "add": ["Seen"], "remove": ["Flagged"] }
+      },
+      "FlagsResponse": {
+        "type": "object",
+        "properties": {
+          "uid": { "type": "integer" },
+          "folder": { "type": "string" },
+          "flags": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "The flags the mailbox holds after the change, read back rather than predicted.",
+            "example": ["\\Seen", "\\Recent"]
+          }
+        },
+        "required": ["uid", "folder", "flags"]
+      },
+      "MailDomain": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "domain": { "type": "string" },
+          "dkim_selector": { "type": "string" },
+          "dkim_public_key": { "type": "string", "nullable": true },
+          "catch_all": { "type": "string", "nullable": true },
+          "enabled": { "type": "boolean" },
+          "created_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "MailAccount": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "domain_id": { "type": "string", "format": "uuid" },
+          "email": { "type": "string", "format": "email" },
+          "display_name": { "type": "string", "nullable": true },
+          "quota_mb": { "type": "integer" },
+          "enabled": { "type": "boolean" },
+          "forward_to": { "type": "string", "nullable": true },
+          "autoresponder_enabled": { "type": "boolean" },
+          "autoresponder_subject": { "type": "string", "nullable": true },
+          "autoresponder_body": { "type": "string", "nullable": true },
+          "created_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "MailAlias": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "domain_id": { "type": "string", "format": "uuid" },
+          "source_email": { "type": "string", "format": "email" },
+          "destination_email": { "type": "string", "format": "email" },
+          "created_at": { "type": "string", "format": "date-time" }
+        }
+      },
+      "CreateDomainRequest": {
+        "type": "object",
+        "properties": { "domain": { "type": "string", "example": "example.com" } },
+        "required": ["domain"]
+      },
+      "UpdateDomainRequest": {
+        "type": "object",
+        "properties": {
+          "catch_all": { "type": "string", "nullable": true, "description": "Address that receives mail for unknown mailboxes. `\"\"` or null disables it." },
+          "enabled": { "type": "boolean" }
+        }
+      },
+      "CreateAccountRequest": {
+        "type": "object",
+        "properties": {
+          "email": { "type": "string", "description": "Either the local part (`sales`) or a full address inside the domain." },
+          "password": { "type": "string", "minLength": 1 },
+          "display_name": { "type": "string", "nullable": true },
+          "quota_mb": { "type": "integer" }
+        },
+        "required": ["email", "password"]
+      },
+      "UpdateAccountRequest": {
+        "type": "object",
+        "properties": {
+          "password": { "type": "string" },
+          "display_name": { "type": "string", "nullable": true },
+          "quota_mb": { "type": "integer" },
+          "enabled": { "type": "boolean" },
+          "forward_to": { "type": "string", "nullable": true },
+          "autoresponder_enabled": { "type": "boolean" },
+          "autoresponder_subject": { "type": "string", "nullable": true },
+          "autoresponder_body": { "type": "string", "nullable": true }
+        }
+      },
+      "CreateAliasRequest": {
+        "type": "object",
+        "properties": {
+          "source_email": { "type": "string", "format": "email", "example": "sales@example.com" },
+          "destination_email": { "type": "string", "format": "email", "example": "someone@example.com" }
+        },
+        "required": ["source_email", "destination_email"]
+      },
+      "QueueResponse": {
+        "type": "object",
+        "properties": {
+          "queue": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/QueueItem" }
+          }
+        }
+      },
+      "QueueItem": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "sender": { "type": "string" },
+          "recipients": { "type": "string" },
+          "size": { "type": "string" },
+          "arrival_time": { "type": "string" },
+          "status": { "type": "string" }
+        }
+      }
+    }
+  }
+}

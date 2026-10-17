@@ -54,6 +54,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
+use utoipa_swagger_ui::SwaggerUi;
 
 /// A recipient list that may arrive either as a bare string or an array.
 #[derive(Debug, Deserialize)]
@@ -1737,6 +1738,18 @@ async fn doveadm(args: &[&str]) -> Result<String, String> {
 
 // ---------------------------------------------------------------------------
 
+/// The OpenAPI document, embedded at build time. Serving the spec out of the
+/// binary rather than off disk keeps it in step with the routes compiled into
+/// that binary — a deployment cannot ship one without the other. `SwaggerUi`
+/// below serves it at `/openapi.json` and renders it at `/docs`.
+const OPENAPI_JSON: &str = include_str!("../openapi.json");
+
+/// Parse the embedded spec once, so a malformed document fails loudly at startup
+/// instead of quietly serving a broken `/docs` page.
+fn openapi_spec() -> Value {
+    serde_json::from_str(OPENAPI_JSON).expect("embedded openapi.json must be valid JSON")
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -1803,6 +1816,13 @@ async fn main() {
         .route("/v1/domains/{domain}/aliases/{id}", delete(alias_delete))
         .route("/v1/queue", get(queue_list).delete(queue_delete))
         .route("/v1/queue/flush", post(queue_flush))
+        // API documentation. Unauthenticated, unlike everything else: the spec
+        // describes the API, it does not grant access to it, and every route it
+        // documents still demands a bearer token of its own.
+        .merge(
+            SwaggerUi::new("/docs")
+                .external_url_unchecked("/openapi.json", openapi_spec()),
+        )
         .with_state(state);
 
     let listener = match tokio::net::TcpListener::bind(&listen).await {
@@ -1815,5 +1835,21 @@ async fn main() {
     tracing::info!("dockpanel-mailapi listening on {listen}");
     if let Err(e) = axum::serve(listener, app).await {
         tracing::error!("server error: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The spec is embedded, so a typo in it would otherwise only surface as a
+    /// broken `/docs` page in production. Parsing it here keeps that honest.
+    #[test]
+    fn embedded_openapi_spec_is_valid() {
+        let spec = openapi_spec();
+        assert!(
+            spec.get("paths").is_some_and(|p| p.as_object().is_some_and(|o| !o.is_empty())),
+            "the embedded spec must describe at least one path"
+        );
     }
 }
