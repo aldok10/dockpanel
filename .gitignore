@@ -2,6 +2,7 @@
 panel/agent/target/
 panel/backend/target/
 panel/cli/target/
+panel/mailapi/target/
 panel/mcp/target/
 
 # Node.js
