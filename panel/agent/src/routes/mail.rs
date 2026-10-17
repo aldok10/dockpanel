@@ -157,6 +157,29 @@ pub fn router() -> Router<AppState> {
         .route("/mail/uninstall", post(mail_uninstall))
 }
 
+/// The on-disk map backend this Postfix was built to use: `hash` on Debian and
+/// the RHEL family, `lmdb` on Alpine.
+///
+/// Read from Postfix itself rather than inferred from the distro, so the
+/// declaration in `main.cf` and the `postmap` that builds the table can never
+/// disagree — `postmap <file>` with no explicit type uses exactly this value.
+///
+/// Alpine's Postfix carries no Berkeley DB at all: `postconf -m` still lists
+/// `hash`, but every lookup at run time aborts with "Berkeley DB support ... is
+/// not available for this OS distribution", which the cleanup daemon turns into
+/// a "virtual_alias_maps map lookup problem" and then refuses the message. Mail
+/// to a real mailbox bounced while `postfix status` stayed green, so the value
+/// Postfix reports here is the only reliable signal.
+async fn postfix_map_type() -> String {
+    match safe_command("postconf").args(["-h", "default_database_type"]).output().await {
+        Ok(out) if out.status.success() => {
+            let t = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if t.is_empty() { "hash".to_string() } else { t }
+        }
+        _ => "hash".to_string(),
+    }
+}
+
 // ── Mail server status + installation ────────────────────────────────────
 
 async fn mail_status() -> Result<Json<serde_json::Value>, ApiErr> {
@@ -259,8 +282,17 @@ async fn mail_install() -> Result<Json<serde_json::Value>, ApiErr> {
     // groupadd/useradd write /etc/passwd, /etc/shadow, /etc/group — all too
     // sensitive to put in the agent's ReadWritePaths. Run unsandboxed via
     // systemd-run, the same escape used for apt/dpkg (#54-A pattern, v2.8.14).
+    // Alpine's postfix package creates its own `vmail` account in its
+    // pre-install (`-h /var/mail/domains`, primary group postdrop) for the
+    // optional maildrop delivery agent — Debian and the RHEL family create no
+    // such account. Its uid is not the 5000 every map below is pinned to, so
+    // leaving it in place makes our `useradd` fail silently and leaves
+    // /var/vmail owned by the wrong uid: Dovecot then delivers as 5000 and
+    // cannot write a single message. Replace the package's placeholder first.
+    replace_placeholder_vmail().await;
+    let nologin = if Path::new("/usr/sbin/nologin").exists() { "/usr/sbin/nologin" } else { "/sbin/nologin" };
     let _ = safe_command_unsandboxed("groupadd", &[]).args(["-g", "5000", "vmail"]).output().await;
-    let _ = safe_command_unsandboxed("useradd", &[]).args(["-g", "5000", "-u", "5000", "-d", VMAIL_DIR, "-s", "/usr/sbin/nologin", "-m", "vmail"]).output().await;
+    let _ = safe_command_unsandboxed("useradd", &[]).args(["-g", "5000", "-u", "5000", "-d", VMAIL_DIR, "-s", nologin, "-m", "vmail"]).output().await;
     // Created via the unsandboxed escape, not tokio::fs.
     //
     // The agent unit lists `-/var/vmail`, and systemd's `-` prefix means "bind
@@ -288,17 +320,18 @@ async fn mail_install() -> Result<Json<serde_json::Value>, ApiErr> {
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to create mail config dir: {e}")))?;
 
     // 4. Write Postfix main.cf additions for virtual mailbox hosting
+    let map_type = postfix_map_type().await;
     let postfix_config = format!(r#"
 # DockPanel mail configuration
 virtual_mailbox_domains = /etc/postfix/virtual_domains
-virtual_mailbox_maps = hash:/etc/postfix/virtual_mailbox_maps
+virtual_mailbox_maps = {map_type}:/etc/postfix/virtual_mailbox_maps
 # Nothing is delivered by the local transport. mydestination defaults to
 # include $myhostname, and when the panel host is also a hosted mail domain
 # that default silently outranks virtual_mailbox_domains: mail for a real
 # mailbox is handed to `local`, which has no such Unix user, and bounces
 # "unknown user". A virtual-mailbox host must claim nothing but localhost.
 mydestination = localhost
-virtual_alias_maps = hash:/etc/postfix/virtual_alias_maps
+virtual_alias_maps = {map_type}:/etc/postfix/virtual_alias_maps
 virtual_mailbox_base = /var/vmail
 virtual_uid_maps = static:5000
 virtual_gid_maps = static:5000
@@ -335,6 +368,25 @@ non_smtpd_milters = {OPENDKIM_MILTER}
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to write main.cf: {e}")))?;
     }
 
+    // Re-apply the virtual-map declarations even when the block above already
+    // exists — it is written once and skipped for ever after, so a box installed
+    // before the map type was read from Postfix keeps whatever it was first
+    // given. On Alpine that was `hash:`, which Postfix cannot open at all: every
+    // delivery died with "virtual_alias_maps map lookup problem" and a real
+    // mailbox bounced, while `postfix status` and the installer both said mail
+    // was fine. `postconf` rewrites the key in place (as `inet_interfaces` and
+    // `myhostname` below rely on), so this repairs an existing install and is a
+    // no-op on a fresh one.
+    for (key, path) in [
+        ("virtual_mailbox_maps", POSTFIX_VIRTUAL_MAILBOX),
+        ("virtual_alias_maps", POSTFIX_VIRTUAL_ALIAS),
+    ] {
+        let _ = safe_command("postconf")
+            .arg(format!("{key}={map_type}:{path}"))
+            .output()
+            .await;
+    }
+
     // 4a. Listen on every interface.
     //
     // Debian's postfix debconf writes `inet_interfaces = all` during its
@@ -352,8 +404,11 @@ non_smtpd_milters = {OPENDKIM_MILTER}
     // 4b. HELO name. Left unset, Postfix uses the short OS hostname, which
     // receivers score heavily against: on a stock cloud image the delivered
     // mail earned HFILTER_HELO_5 + HFILTER_HOSTNAME_UNKNOWN + MID_RHS_NOT_FQDN
-    // — six spam points before any content was examined.
-    if let Some(host) = panel_server_name() {
+    // — six spam points before any content was examined. `mail_helo_name`
+    // falls back to the box's own FQDN, so an IP-based install (panel
+    // `server_name _`) gets its provider-published, PTR-confirmed name rather
+    // than `srvNNNN.localdomain`.
+    if let Some(host) = mail_helo_name().await {
         let _ = safe_command("postconf").arg(format!("myhostname={host}")).output().await;
         // Applied here too, not only in the block above: that block is appended
         // once and skipped forever after, so an install that already has it
@@ -364,8 +419,20 @@ non_smtpd_milters = {OPENDKIM_MILTER}
     }
 
     // 4c. Serve the box's real certificate where it has one, so that clients
-    // which verify their peer can connect at all.
-    if let Some((cert, key)) = panel_tls_paths() {
+    // which verify their peer can connect at all — and, where it has none,
+    // generate the same self-signed fallback Dovecot is given below. Alpine's
+    // packages ship no snakeoil and no `/etc/ssl/certs` default, so without
+    // this Postfix advertises STARTTLS (the submission service on 587 sets
+    // `smtpd_tls_security_level = encrypt`) with no certificate at all and
+    // every submission fails — which is exactly what the Roundcube this product
+    // installs would hit the moment a user tried to send.
+    let openrc = crate::services::init::has_openrc();
+    let mail_tls = match panel_tls_paths() {
+        Some(pair) => Some(pair),
+        None if openrc => ensure_selfsigned_mail_cert().await,
+        None => None,
+    };
+    if let Some((cert, key)) = &mail_tls {
         let _ = safe_command("postconf").arg(format!("smtpd_tls_cert_file={cert}")).output().await;
         let _ = safe_command("postconf").arg(format!("smtpd_tls_key_file={key}")).output().await;
     }
@@ -406,9 +473,14 @@ non_smtpd_milters = {OPENDKIM_MILTER}
     // mail-storage path, the auth database blocks and the ssl_cert/ssl_key
     // names branch on version.
     let v24 = dovecot_needs_v24_syntax().await;
-    let dovecot_tls = match panel_tls_paths() {
+    // [`mail_tls`] already holds the box's real certificate or, on Alpine, the
+    // self-signed fallback generated for Postfix a moment ago — one pair serves
+    // both daemons. `None` means the platform supplies its own default (the
+    // snakeoil the Debian/RHEL `conf.d` names), which is why `ssl = required`
+    // on its own is correct there.
+    let dovecot_tls = match &mail_tls {
         Some((cert, key)) => {
-            tracing::info!("Dovecot will serve the panel's Let's Encrypt certificate");
+            tracing::info!("Dovecot will serve the panel's mail certificate");
             if v24 {
                 format!("ssl = required\nssl_server_cert_file = {cert}\nssl_server_key_file = {key}\n")
             } else {
@@ -481,8 +553,21 @@ userdb {
 }
 "#
     };
+    // Dovecot 2.4 wants the MAIN config to open by declaring the config and
+    // storage format versions. Debian ships those in its own
+    // `/etc/dovecot/dovecot.conf`, so a `conf.d` drop-in never needs them — but
+    // Alpine ships no main config at all, so the panel writes one and must
+    // state the versions itself, from the running binary rather than a guess.
+    let dovecot_version_header = if openrc {
+        match dovecot_version_string().await {
+            Some(v) => format!("dovecot_config_version = {v}\ndovecot_storage_version = {v}\n"),
+            None => String::new(),
+        }
+    } else {
+        String::new()
+    };
     let dovecot_base = format!(
-        r#"# DockPanel Dovecot configuration
+        r#"{dovecot_version_header}# DockPanel Dovecot configuration
 protocols = imap pop3 lmtp
 
 {dovecot_mail_and_auth}
@@ -509,7 +594,18 @@ service auth {{
     );
     let dovecot_config = format!("{dovecot_base}{dovecot_tls}");
 
-    write_file_atomic("/etc/dovecot/conf.d/99-dockpanel.conf", &dovecot_config).await
+    // Alpine's `dovecot` package ships NO `/etc/dovecot/dovecot.conf` and no
+    // `conf.d` directory at all, and the OpenRC runscript declares the former a
+    // `required_files` — so a drop-in that nothing includes is invisible and the
+    // service refuses to start. On OpenRC the panel owns the main config file;
+    // on systemd families it stays a drop-in beside the distro's own config,
+    // which `!include conf.d/*.conf` picks up.
+    let dovecot_conf_path = if openrc {
+        "/etc/dovecot/dovecot.conf"
+    } else {
+        "/etc/dovecot/conf.d/99-dockpanel.conf"
+    };
+    write_file_atomic(dovecot_conf_path, &dovecot_config).await
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to write dovecot config: {e}")))?;
 
     // 7. Create the map files if they do not exist yet.
@@ -699,6 +795,60 @@ async fn dovecot_password_schemes() -> Vec<String> {
         .collect()
 }
 
+/// The installed Dovecot's version, e.g. `"2.4.5"`.
+///
+/// Dovecot 2.4 requires the **main** config file to open with
+/// `dovecot_config_version` and `dovecot_storage_version`. Debian supplies both
+/// in its own `/etc/dovecot/dovecot.conf`, which is why a `conf.d` drop-in
+/// never needs them; Alpine supplies no main config at all, so this installer
+/// writes one and has to state the versions. The value is the running binary's,
+/// asked for the same reason [`dovecot_needs_v24_syntax`] asks rather than
+/// assuming a version from the distro.
+async fn dovecot_version_string() -> Option<String> {
+    let out = safe_command("dovecot").arg("--version").output().await.ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()
+        .map(str::to_string)
+}
+
+/// Remove a `vmail` account that a package created before this installer ran,
+/// when its ids are not the 5000 the Postfix/Dovecot maps are pinned to.
+///
+/// Only Alpine's `postfix` package does this (its pre-install adds
+/// `vmail:vmail` with home `/var/mail/domains` and primary group `postdrop`);
+/// the account is a placeholder for an optional maildrop agent this panel never
+/// uses. Replacing it is what lets the identical 5000-based configuration run
+/// on all three families. A `vmail` already at 5000 is left untouched, so a
+/// re-run is a no-op.
+async fn replace_placeholder_vmail() {
+    if !crate::services::init::has_openrc() {
+        return;
+    }
+    let uid = id_field("vmail", "-u").await;
+    let gid = id_field("vmail", "-g").await;
+    if uid.as_deref() == Some("5000") && gid.as_deref() == Some("5000") {
+        return;
+    }
+    if uid.is_some() {
+        let _ = safe_command_unsandboxed("userdel", &[]).args(["vmail"]).output().await;
+    }
+    // `groupdel` is best-effort: the user's *primary* group is `postdrop`, not
+    // `vmail`, so this removes only a stray `vmail` group if one exists.
+    let _ = safe_command_unsandboxed("groupdel", &[]).args(["vmail"]).output().await;
+}
+
+/// One numeric field of a user via `id`, or `None` when the user does not exist.
+async fn id_field(user: &str, flag: &str) -> Option<String> {
+    let out = safe_command("id").args([flag, user]).output().await.ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 /// Give `/var/vmail` the SELinux type Dovecot is allowed to write.
 ///
 /// **This is the one that silently ate every message.** `/var/vmail` is created
@@ -825,12 +975,32 @@ async fn write_opendkim_config() -> Result<(), String> {
         "Syslog yes\nUserID opendkim\nUMask 007\n\
          Socket {OPENDKIM_SOCKET}\n\
          PidFile /run/opendkim/opendkim.pid\nOversignHeaders From\n\
+         SignatureAlgorithm rsa-sha256\n\
          {trust_anchor}\
          KeyTable {KEY_TABLE}\nSigningTable refile:{SIGNING_TABLE}\n\
          ExternalIgnoreList {DKIM_KEYS_DIR}/trusted.hosts\n\
          InternalHosts {DKIM_KEYS_DIR}/trusted.hosts\n"
     );
     write_file_atomic(OPENDKIM_CONF, &conf).await?;
+
+    // OpenRC has no drop-in machinery: Alpine's `opendkim` runscript reads its
+    // extra arguments from `/etc/conf.d/opendkim`, and its own `command_args`
+    // already appends `-u opendkim -f`, so only the `-x` naming the panel's
+    // config file is needed. Without it the daemon reads the distro default,
+    // the panel's keys and signing tables are never loaded, and every message
+    // leaves unsigned while `opendkim` reports active — the same "healthy while
+    // signing nothing" shape this drop-in exists to prevent on systemd.
+    if crate::services::init::has_openrc() {
+        tokio::fs::create_dir_all("/etc/conf.d").await
+            .map_err(|e| format!("Failed to create /etc/conf.d: {e}"))?;
+        let conf_d = format!(
+            "# DockPanel — point OpenDKIM at the panel-owned configuration.\n\
+             # Rewritten by the agent; the runscript appends `-u opendkim -f`.\n\
+             command_args=\"-x {OPENDKIM_CONF}\"\n"
+        );
+        write_file_atomic("/etc/conf.d/opendkim", &conf_d).await?;
+        return Ok(());
+    }
 
     tokio::fs::create_dir_all(OPENDKIM_DROPIN_DIR).await
         .map_err(|e| format!("Failed to create {OPENDKIM_DROPIN_DIR}: {e}"))?;
@@ -956,6 +1126,59 @@ fn panel_tls_paths() -> Option<(String, String)> {
     let cert = format!("{dir}/fullchain.pem");
     let key = format!("{dir}/privkey.pem");
     (Path::new(&cert).exists() && Path::new(&key).exists()).then_some((cert, key))
+}
+
+/// Ensure the mail daemons have a certificate on a box that ships none of its
+/// own.
+///
+/// Alpine provides neither a default certificate nor a `conf.d` that could name
+/// one, and its Dovecot OpenRC runscript requires the main config file to
+/// exist. With `ssl = required` and nothing to present Dovecot is a config
+/// error and never starts; Postfix, advertising STARTTLS on 587 with no
+/// certificate, fails every submission. The pair is generated at the path
+/// Alpine's own package would have used, and is the same snakeoil the Debian
+/// and RHEL packages hand out: enough for both daemons to run and for
+/// opportunistic clients, and rejected by any client that verifies its peer —
+/// which is exactly why [`panel_tls_paths`] is preferred whenever it resolves.
+///
+/// The key is left group-readable by `postfix` (0640 root:postfix): Postfix
+/// reads `smtpd_tls_key_file` from the unprivileged `smtpd` process, so a
+/// root-only 0600 key would have Postfix unable to serve STARTTLS even though
+/// the file exists. Dovecot reads it as root and is unaffected.
+async fn ensure_selfsigned_mail_cert() -> Option<(String, String)> {
+    let dir = "/etc/ssl/dovecot";
+    let cert = format!("{dir}/server.pem");
+    let key = format!("{dir}/server.key");
+    if !(Path::new(&cert).exists() && Path::new(&key).exists()) {
+        if tokio::fs::create_dir_all(dir).await.is_err() {
+            return None;
+        }
+        let host = panel_server_name().unwrap_or_else(|| "localhost".to_string());
+        let out = safe_command("openssl")
+            .args([
+                "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                "-keyout", &key, "-out", &cert, "-days", "3650",
+                "-subj", &format!("/CN={host}"),
+            ])
+            .output()
+            .await
+            .ok()?;
+        if !out.status.success() {
+            tracing::warn!(
+                "could not generate a self-signed mail certificate: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return None;
+        }
+    }
+    // Normalised on every call, not only when the pair is generated: a box that
+    // installed mail before Postfix was taught to read this key still carries a
+    // root-only 0600 file, and `postconf` would point Postfix at a key its
+    // unprivileged `smtpd` cannot open.
+    let _ = safe_command("chmod").args(["0644", &cert]).output().await;
+    let _ = safe_command("chmod").args(["0640", &key]).output().await;
+    let _ = safe_command("chgrp").args(["postfix", &key]).output().await;
+    Some((cert, key))
 }
 
 // ── DKIM key generation ─────────────────────────────────────────────────
@@ -1568,6 +1791,39 @@ async fn rspamd_toggle(Json(body): Json<serde_json::Value>) -> Result<Json<serde
 const WEBMAIL_NGINX_CONF: &str = "/etc/nginx/conf.d/dockpanel-panel.locations/webmail.conf";
 const WEBMAIL_NGINX_DIR: &str = "/etc/nginx/conf.d/dockpanel-panel.locations";
 
+/// The name Postfix should present in `HELO`/`EHLO` and carry as `myhostname`.
+///
+/// [`panel_server_name`] first — it is the domain the operator actually serves —
+/// then the machine's own FQDN.
+///
+/// The fallback is the whole point on an IP-based install (`server_name _`):
+/// there [`panel_server_name`] answers `None`, so `mail_install` left Postfix on
+/// its compiled-in default and the box announced itself as
+/// `srvNNNN.localdomain` — a name that resolves to nothing and matches no PTR,
+/// so every outbound message earned HFILTER_HOSTNAME_UNKNOWN and
+/// MID_RHS_NOT_FQDN before a single header of content was read. On a normal
+/// cloud image `hostname -f` is the very name the provider published the PTR
+/// for, which is exactly the value a receiver's forward-confirmed check wants.
+async fn mail_helo_name() -> Option<String> {
+    if let Some(host) = panel_server_name() {
+        return Some(host);
+    }
+    let out = safe_command("hostname").arg("-f").output().await.ok()?;
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    usable_mail_hostname(&name).then_some(name)
+}
+
+/// Whether a candidate is a real, routable mail hostname rather than a
+/// placeholder: `hostname -f` returns the bare short name (or
+/// `localhost.localdomain`) when nothing has told the box its FQDN, and both
+/// are worse than leaving Postfix alone.
+fn usable_mail_hostname(name: &str) -> bool {
+    name.contains('.')
+        && !name.starts_with("localhost")
+        && !name.ends_with(".localdomain")
+        && !name.ends_with(".local")
+}
+
 /// Read the panel vhost's `server_name` directive. Returns `None` for
 /// `_` (IP-based installs) or if no panel vhost exists yet.
 fn panel_server_name() -> Option<String> {
@@ -1974,8 +2230,8 @@ async fn relay_configure(Json(body): Json<RelayConfig>) -> Result<Json<serde_jso
         .collect::<Vec<_>>().join("\n");
 
     let relay_config = format!(
-        "\n# DockPanel relay configuration\nrelayhost = [{}]:{}\nsmtp_sasl_auth_enable = yes\nsmtp_sasl_password_maps = hash:/etc/postfix/sasl_passwd\nsmtp_sasl_security_options = noanonymous\nsmtp_tls_security_level = encrypt\nsmtp_tls_CAfile = /etc/ssl/certs/ca-certificates.crt\n",
-        body.host, body.port
+        "\n# DockPanel relay configuration\nrelayhost = [{}]:{}\nsmtp_sasl_auth_enable = yes\nsmtp_sasl_password_maps = {}:/etc/postfix/sasl_passwd\nsmtp_sasl_security_options = noanonymous\nsmtp_tls_security_level = encrypt\nsmtp_tls_CAfile = /etc/ssl/certs/ca-certificates.crt\n",
+        body.host, body.port, postfix_map_type().await
     );
 
     write_file_atomic("/etc/postfix/main.cf", &format!("{cleaned}{relay_config}")).await
@@ -2527,7 +2783,7 @@ async fn ensure_sender_login_enforcement(map_content: &str) {
     // No `-e`: Postfix assumes it whenever a value is given (2.8 and later), as
     // the `inet_interfaces` / `myhostname` / TLS calls in `mail_install` do.
     let _ = safe_command("postconf")
-        .arg(format!("smtpd_sender_login_maps=hash:{POSTFIX_SENDER_LOGIN}"))
+        .arg(format!("smtpd_sender_login_maps={}:{POSTFIX_SENDER_LOGIN}", postfix_map_type().await))
         .output()
         .await;
     // NO `permit_mynetworks` in front of this, and that is the whole difference
@@ -2615,7 +2871,28 @@ async fn write_file_atomic(path: &str, content: &str) -> Result<(), String> {
 /// A box that has no `dovecot` group has no Dovecot either, so a failing
 /// `chown` is not worth losing the write over — the mode already keeps the
 /// hashes private.
+/// Ensure a passwd-file image ends in exactly one newline; an empty file stays
+/// empty.
+///
+/// Dovecot reads newline-terminated rows. A final row with no newline is still
+/// read, but the next writer that appends without re-checking joins the two —
+/// and this is not hypothetical: an added test account merged into
+/// `m.s.n.thread`'s row and silently took that mailbox's password hash, because
+/// `sync_config` writes `lines.join("\n")` with no terminator. Normalised in the
+/// one function every writer goes through rather than at each call site.
+fn normalize_dovecot_users(content: &str) -> String {
+    if content.is_empty() {
+        return String::new();
+    }
+    if content.ends_with('\n') {
+        content.to_string()
+    } else {
+        format!("{content}\n")
+    }
+}
+
 async fn write_dovecot_users(content: &str) -> Result<(), String> {
+    let content = normalize_dovecot_users(content);
     let tmp_path = format!("{DOVECOT_USERS}.tmp");
     tokio::fs::write(&tmp_path, content).await.map_err(|e| e.to_string())?;
     #[cfg(unix)]
@@ -2679,6 +2956,44 @@ mod tests {
         let out = add_milter("smtpd_milters =\n", RSPAMD_MILTER).unwrap();
         assert!(out.contains(&format!("smtpd_milters = {RSPAMD_MILTER}")), "got: {out}");
         assert!(!out.contains(", "), "got: {out}");
+    }
+
+    // ── HELO identity ──────────────────────────────────────────────────
+    //
+    // `mail_helo_name` prefers the panel's server_name and otherwise asks the
+    // box, but the box answers with placeholders that are worse than leaving
+    // Postfix alone; these pin the ones that must be rejected.
+
+    #[test]
+    fn accepts_only_real_fqdns_as_a_helo_fallback() {
+        for good in ["srv2067331.hstgr.cloud", "mail.example.com", "host.eu-west-1.example"] {
+            assert!(usable_mail_hostname(good), "should accept {good}");
+        }
+        for bad in [
+            "srv2067331",            // bare short name: `hostname -f` with no FQDN
+            "localhost",
+            "localhost.localdomain",
+            "gateway.localdomain",
+            "printer.local",
+            "",                      // empty output from a failed `hostname -f`
+        ] {
+            assert!(!usable_mail_hostname(bad), "should reject {bad:?}");
+        }
+    }
+
+    /// A passwd file whose last row has no newline is still read, but the next
+    /// writer that appends joins the two rows — which is how a test account
+    /// merged into a real mailbox's row and took its password hash.
+    #[test]
+    fn dovecot_passwd_rows_are_always_terminated() {
+        assert_eq!(normalize_dovecot_users("a:x\nb:y"), "a:x\nb:y\n");
+        assert_eq!(normalize_dovecot_users("a:x\n"), "a:x\n");
+        assert_eq!(normalize_dovecot_users(""), "");
+        // The shape `sync_config` builds: `rows.join("\n")` with no terminator.
+        let rows = ["a:x", "b:y"];
+        let out = normalize_dovecot_users(&rows.join("\n"));
+        assert!(out.ends_with('\n'), "got {out:?}");
+        assert_eq!(out.matches('\n').count(), 2, "got {out:?}");
     }
 
     // ── Sender identity ────────────────────────────────────────────────
