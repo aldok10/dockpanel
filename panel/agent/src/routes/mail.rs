@@ -1730,6 +1730,15 @@ async fn remove_webmail_nginx() {
     }
 }
 
+/// Roundcube plugin backing the Mail API tab: per-mailbox tokens that the
+/// `dockpanel-mailapi` daemon (panel/mailapi) authenticates against. Shipped as
+/// agent assets so a webmail reinstall always rewrites the current version,
+/// the same discipline the nginx templates follow.
+const ROUNDCUBE_MAILAPI_PLUGIN: &str =
+    include_str!("../templates/roundcube/dockpanel_mailapi/dockpanel_mailapi.php");
+const ROUNDCUBE_MAILAPI_LOCALE: &str =
+    include_str!("../templates/roundcube/dockpanel_mailapi/localization/en_US.inc");
+
 /// POST /mail/webmail/install — Deploy Roundcube webmail via Docker.
 ///
 /// Idempotent: tears down any prior `dockpanel-roundcube` container before
@@ -1761,23 +1770,109 @@ async fn webmail_install(Json(body): Json<serde_json::Value>) -> Result<Json<ser
         tracing::warn!("Could not create {webmail_db} for webmail: {e}");
     }
 
+    // Where Roundcube reaches the panel's mail services FROM INSIDE the
+    // container. It used to be handed the panel's public hostname and dialled
+    // `ssl://<hostname>`; from inside Docker that name resolves to the host's
+    // *public* address, which NAT-hairpins — or answers on an IPv6 Dovecot is
+    // not bound to — and when the panel serves its self-signed fallback the
+    // verification fails before the greeting is even read. The user is left
+    // with "Connection to storage server failed." for every account.
+    // `host.docker.internal` is the host as seen from the container's own
+    // bridge; `--add-host` maps it to that bridge's gateway, so it holds even
+    // when the gateway is not the usual 172.17.0.1.
+    let mail_host = "host.docker.internal";
+
+    // Roundcube verifies the IMAP/SMTP peer by default (`verify_peer` true). On
+    // a same-host bridge the daemon presents either the box's Let's Encrypt
+    // certificate — issued for a public name, not the bridge address being
+    // dialled — or the panel's self-signed fallback; neither validates against
+    // the address in use, so the login is refused. Keep TLS, so credentials
+    // still cross the bridge encrypted, and relax *peer authentication*, which
+    // authenticates nothing meaningful on a link that never leaves the host.
+    // The image's entrypoint includes every `/var/roundcube/config/*.php` after
+    // its own generated config, so a drop-in there is the supported override
+    // point and survives a container recreate.
+    let webmail_conf_dir = format!(
+        "{}/roundcube/var/roundcube/config",
+        crate::services::docker_apps::APP_DATA_DIR
+    );
+    if let Err(e) = std::fs::create_dir_all(&webmail_conf_dir) {
+        tracing::warn!("Could not create {webmail_conf_dir} for webmail: {e}");
+    }
+
+    // The Mail API tab is a Roundcube plugin, and Roundcube's own plugin
+    // directory lives inside the image — anything written there dies with the
+    // container. Bind a directory in from the app data dir and write the plugin
+    // into that, mirroring how a template deploy keeps an app's own files.
+    let webmail_plugin_dir = format!(
+        "{}/roundcube/var/roundcube/plugins/dockpanel_mailapi",
+        crate::services::docker_apps::APP_DATA_DIR
+    );
+    if let Err(e) = std::fs::create_dir_all(format!("{webmail_plugin_dir}/localization")) {
+        tracing::warn!("Could not create {webmail_plugin_dir} for webmail plugin: {e}");
+    }
+    for (rel, body) in [
+        ("dockpanel_mailapi.php", ROUNDCUBE_MAILAPI_PLUGIN),
+        ("localization/en_US.inc", ROUNDCUBE_MAILAPI_LOCALE),
+    ] {
+        if let Err(e) = std::fs::write(format!("{webmail_plugin_dir}/{rel}"), body) {
+            tracing::warn!("Could not write webmail plugin file {rel}: {e}");
+        }
+    }
+
     let panel_host = panel_server_name();
+
+    // Everything the panel manages about Roundcube's config goes in one drop-in
+    // the image includes after its own generated config. Besides relaxing peer
+    // verification, switch the Mail API plugin on and point it at the public API
+    // host so the tab shows the real endpoint rather than the webmail host it is
+    // served from. `panel_server_name` is the panel's own host, so strip its
+    // leftmost label to rebuild the sibling `mail-api.<domain>` name.
+    let mailapi_host = panel_host
+        .clone()
+        .map(|h| h.splitn(2, '.').nth(1).unwrap_or(&h).to_string())
+        .unwrap_or_else(|| domain.to_string());
+    let conn_options = format!(
+        "<?php\n\
+        // DockPanel-managed (see webmail_install in the agent's mail.rs).\n\
+        $config['imap_conn_options'] = ['ssl' => ['verify_peer' => false, 'verify_peer_name' => false, 'allow_self_signed' => true]];\n\
+        $config['smtp_conn_options'] = ['ssl' => ['verify_peer' => false, 'verify_peer_name' => false, 'allow_self_signed' => true]];\n\
+        \n\
+        // Mail API tab (panel/mailapi). Plugin files are bind-mounted at\n\
+        // /var/www/html/plugins/dockpanel_mailapi; the token table is created by\n\
+        // the plugin and read by the dockpanel-mailapi daemon.\n\
+        $config['plugins'][] = 'dockpanel_mailapi';\n\
+        $config['mailapi_url'] = 'https://mail-api.{mailapi_host}';\n"
+    );
+    if let Err(e) = std::fs::write(format!("{webmail_conf_dir}/dockpanel.inc.php"), conn_options) {
+        tracing::warn!("Could not write webmail connection options: {e}");
+    }
+
     let mut args: Vec<String> = vec![
         "run".into(), "-d".into(),
         "--name".into(), "dockpanel-roundcube".into(),
         "--restart".into(), "unless-stopped".into(),
+        "--add-host".into(), format!("{mail_host}:host-gateway"),
         "-p".into(), format!("127.0.0.1:{port}:80"),
         "-v".into(), format!("{webmail_db}:/var/roundcube/db"),
-        "-e".into(), format!("ROUNDCUBEMAIL_DEFAULT_HOST=ssl://{domain}"),
+        "-v".into(), format!("{webmail_conf_dir}:/var/roundcube/config"),
+        "-v".into(), format!("{webmail_plugin_dir}:/var/www/html/plugins/dockpanel_mailapi"),
+        "-e".into(), format!("ROUNDCUBEMAIL_DEFAULT_HOST=ssl://{mail_host}"),
         "-e".into(), "ROUNDCUBEMAIL_DEFAULT_PORT=993".into(),
-        "-e".into(), format!("ROUNDCUBEMAIL_SMTP_SERVER=tls://{domain}"),
+        "-e".into(), format!("ROUNDCUBEMAIL_SMTP_SERVER=tls://{mail_host}"),
         "-e".into(), "ROUNDCUBEMAIL_SMTP_PORT=587".into(),
         "-e".into(), "ROUNDCUBEMAIL_UPLOAD_MAX_FILESIZE=25M".into(),
         "-e".into(), "ROUNDCUBEMAIL_PROXY_WHITELIST=127.0.0.1".into(),
     ];
-    if let Some(host) = panel_host.as_deref() {
-        args.push("-e".into());
-        args.push(format!("ROUNDCUBEMAIL_TRUSTED_HOSTS={host}"));
+    // Roundcube only accepts requests whose Host header it recognises. The
+    // panel vhost's `server_name` is preferred; the domain the UI passed is the
+    // fallback for an IP-only panel, where the nginx config names none and
+    // Roundcube would otherwise reject every request. `FORWARDED_PROTO` is only
+    // set with a real domain, because that is the case the panel serves HTTPS.
+    let trusted_host = panel_host.clone().unwrap_or_else(|| domain.to_string());
+    args.push("-e".into());
+    args.push(format!("ROUNDCUBEMAIL_TRUSTED_HOSTS={trusted_host}"));
+    if panel_host.is_some() {
         args.push("-e".into());
         args.push("ROUNDCUBEMAIL_FORWARDED_PROTO=https".into());
     }
