@@ -12,7 +12,9 @@ use super::AppState;
 /// Allowed PHP versions (distro repos, deb.sury.org, or ondrej/php PPA).
 /// The versions the PHP screens offer. `pub(crate)` because `nginx.rs::put_site`
 /// walks it to find a default for a PHP site that names no version.
-pub(crate) const ALLOWED_VERSIONS: &[&str] = &["8.1", "8.2", "8.3", "8.4", "8.5"];
+pub(crate) const ALLOWED_VERSIONS: &[&str] = &[
+    "7.1", "7.2", "7.3", "7.4", "8.0", "8.1", "8.2", "8.3", "8.4", "8.5",
+];
 
 /// PHP extensions to install with each version — each is installed only if
 /// this apt source actually has a candidate for it. Newer PHP releases build
@@ -62,7 +64,15 @@ async fn is_installed(version: &str) -> bool {
     if let Some(actual) = crate::services::pkg::installed_php_version().await {
         return actual == version;
     }
-    crate::services::pkg::is_installed(&format!("php{version}-fpm")).await
+    if crate::services::pkg::is_installed(&format!("php{version}-fpm")).await {
+        return true;
+    }
+    // Versions whose FPM runs outside the package manager (the Docker-backed
+    // matrix on a box whose repositories do not carry them) are invisible to
+    // `apk`, yet they open the very socket `resolve_php_fpm_socket` hands a
+    // site. Treat a present socket as installed so the PHP screen lists them
+    // and the site form can select them.
+    crate::services::pkg::resolve_php_fpm_socket(version).await.is_some()
 }
 
 /// Check if a PHP-FPM socket file exists for THIS version.

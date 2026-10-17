@@ -1491,7 +1491,9 @@ pub async fn get_one(
 /// frontend no longer carries a third and fourth copy: both pickers read the
 /// live list from `GET /api/php/versions`, which is the agent's answer for the
 /// server the site actually runs on.
-const PHP_VERSIONS: &[&str] = &["8.1", "8.2", "8.3", "8.4", "8.5"];
+const PHP_VERSIONS: &[&str] = &[
+    "7.1", "7.2", "7.3", "7.4", "8.0", "8.1", "8.2", "8.3", "8.4", "8.5",
+];
 
 /// PUT /api/sites/{id}/php — Switch PHP version for a site.
 #[derive(serde::Deserialize)]
