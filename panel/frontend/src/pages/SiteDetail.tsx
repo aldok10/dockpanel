@@ -434,9 +434,9 @@ export default function SiteDetail() {
     loadSslProvenance();
   }, [site?.ssl_enabled, site?.domain, loadSslProvenance]);
 
-  // The account's installed public keys. Fetched only for a shell-enabled site:
-  // the keys belong to the same Linux account either way, but they only open a
-  // login once the shell is on, so there is nothing to show before that.
+  // The account's installed public keys. Fetched for any site with the account
+  // on: there is one Linux account behind both SFTP and SSH, so a key is worth
+  // showing — and adding — for an SFTP-only site too.
   const loadSshKeys = useCallback(() => {
     api
       .get<{ keys: SshKey[] }>(`/sites/${id}/ssh/keys`)
@@ -445,9 +445,17 @@ export default function SiteDetail() {
   }, [id]);
 
   useEffect(() => {
-    if (site?.ssh_shell_enabled) loadSshKeys();
+    if (site?.sftp_enabled) loadSshKeys();
     else setSshKeys([]);
-  }, [site?.ssh_shell_enabled, loadSshKeys]);
+  }, [site?.sftp_enabled, loadSshKeys]);
+
+  // The Sites list links here (#access), so a row's FTP / SSH chip opens this
+  // card rather than the top of a long page. The card only renders once the
+  // site is active, hence waiting on site.status too.
+  useEffect(() => {
+    if (!site || window.location.hash !== "#access") return;
+    document.getElementById("access")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, [site?.status, id]);
 
   // Composite score augmenting the plain up/down Health Check button above —
   // computed server-side from SSL expiry + backup freshness + monitor uptime,
@@ -1745,36 +1753,52 @@ export default function SiteDetail() {
         </div>
       )}
 
-      {/* SFTP Access */}
+      {/* SFTP & SSH Access — one Linux account, chrooted to the site's files */}
       {site.status === "active" && (
-        <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden mt-6">
+        <div id="access" className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden mt-6 scroll-mt-20">
           <div className="px-5 py-4 border-b border-dark-600 flex items-center justify-between">
-            <h2 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">SFTP Access</h2>
-            <span className={`inline-flex px-2.5 py-0.5 rounded-full text-xs font-medium ${
-              site.sftp_enabled ? "bg-rust-500/10 text-rust-400" : "bg-dark-700 text-dark-300"
-            }`}>
-              {site.sftp_enabled ? "Enabled" : "Disabled"}
-            </span>
+            <h2 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">SFTP &amp; SSH Access</h2>
+            <div className="flex items-center gap-2">
+              <span className={`inline-flex px-2.5 py-0.5 rounded-full text-xs font-medium ${
+                site.sftp_enabled ? "bg-rust-500/10 text-rust-400" : "bg-dark-700 text-dark-300"
+              }`}>
+                {site.sftp_enabled ? "SFTP on" : "SFTP off"}
+              </span>
+              <span className={`inline-flex px-2.5 py-0.5 rounded-full text-xs font-medium ${
+                site.ssh_shell_enabled ? "bg-rust-500/10 text-rust-400" : "bg-dark-700 text-dark-300"
+              }`}>
+                {site.ssh_shell_enabled ? "Shell on" : "Shell off"}
+              </span>
+            </div>
           </div>
           <div className="p-5 space-y-4">
             <p className="text-sm text-dark-200">
-              Gives this site its own Linux account, chrooted to its own files — nothing outside this
-              site is ever reachable over the connection. Enabling it re-owns the site's existing
-              content directory; this only happens once, when you click Enable.
+              Both use <strong className="text-dark-100">one Linux account</strong>, chrooted to this
+              site's own files — one password, one set of keys, and nothing outside the site is ever
+              reachable. <span className="text-dark-100">SFTP</span> is file transfer;{" "}
+              <span className="text-dark-100">SSH</span> adds a jailed login shell that drops you into{" "}
+              <code className="font-mono text-dark-100">/content</code>. Enabling either creates the
+              account if the site does not have one yet.
             </p>
             {site.sftp_enabled && site.sftp_uid != null && (
-              <div className="grid grid-cols-2 gap-3 text-xs font-mono">
+              <div className="grid grid-cols-1 gap-3 text-xs font-mono sm:grid-cols-3">
                 <div>
                   <div className="text-dark-400 uppercase tracking-wide mb-1">Username</div>
                   <div className="text-dark-100">sftp{site.sftp_uid}</div>
                 </div>
                 <div>
-                  <div className="text-dark-400 uppercase tracking-wide mb-1">Host / Port</div>
-                  <div className="text-dark-100">{site.domain} / 22</div>
+                  <div className="text-dark-400 uppercase tracking-wide mb-1">SFTP</div>
+                  <div className="text-dark-100 truncate">sftp sftp{site.sftp_uid}@{site.domain}</div>
+                </div>
+                <div>
+                  <div className="text-dark-400 uppercase tracking-wide mb-1">SSH</div>
+                  <div className="text-dark-100 truncate">
+                    {site.ssh_shell_enabled ? `ssh sftp${site.sftp_uid}@${site.domain}` : "off"}
+                  </div>
                 </div>
               </div>
             )}
-            <div className="flex items-center gap-3">
+            <div className="flex items-center gap-3 flex-wrap">
               <button
                 disabled={sftpToggling}
                 onClick={async () => {
@@ -1786,8 +1810,14 @@ export default function SiteDetail() {
                     const result = await api.post<{ sftp_enabled: boolean }>(`/sites/${id}/sftp/${path}`);
                     // sftp_uid isn't in this response — the toggle endpoints only
                     // confirm the new state; re-fetching the site is what picks up
-                    // the allocated uid after an enable.
-                    setSite(s => s ? { ...s, sftp_enabled: result.sftp_enabled } : s);
+                    // the allocated uid after an enable. Disabling also drops the
+                    // shell, which lives on the account being removed, so mirror
+                    // that locally instead of leaving a stale "Shell on" badge.
+                    setSite(s => s ? {
+                      ...s,
+                      sftp_enabled: result.sftp_enabled,
+                      ssh_shell_enabled: result.sftp_enabled ? s.ssh_shell_enabled : false,
+                    } : s);
                     if (result.sftp_enabled) {
                       const fresh = await api.get<Site>(`/sites/${id}`);
                       setSite(fresh);
@@ -1806,6 +1836,36 @@ export default function SiteDetail() {
                 }`}
               >
                 {sftpToggling ? "..." : site.sftp_enabled ? "Disable SFTP" : "Enable SFTP"}
+              </button>
+              <button
+                disabled={sshToggling}
+                onClick={async () => {
+                  setSshToggling(true);
+                  setSshMsg("");
+                  try {
+                    const path = site.ssh_shell_enabled ? "disable" : "enable";
+                    const result = await api.post<{ ssh_shell_enabled: boolean }>(`/sites/${id}/ssh/${path}`);
+                    // The enable response carries no uid — re-fetching the site is
+                    // what surfaces the account created on the way (same as SFTP).
+                    setSite(s => s ? { ...s, ssh_shell_enabled: result.ssh_shell_enabled } : s);
+                    if (result.ssh_shell_enabled) {
+                      const fresh = await api.get<Site>(`/sites/${id}`);
+                      setSite(fresh);
+                    }
+                    setSshMsg(site.ssh_shell_enabled ? "SSH disabled" : "SSH enabled");
+                  } catch (e) {
+                    setSshMsg(e instanceof Error ? e.message : "Toggle failed");
+                  } finally {
+                    setSshToggling(false);
+                  }
+                }}
+                className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 ${
+                  site.ssh_shell_enabled
+                    ? "bg-warn-500/10 text-warn-400 hover:bg-warn-500/20"
+                    : "bg-rust-500 text-white hover:bg-rust-600"
+                }`}
+              >
+                {sshToggling ? "..." : site.ssh_shell_enabled ? "Disable SSH Shell" : "Enable SSH Shell"}
               </button>
               {site.sftp_enabled && (
                 <button
@@ -1830,6 +1890,11 @@ export default function SiteDetail() {
               {sftpMsg && (
                 <span className={`text-xs ${sftpMsg.includes("failed") || sftpMsg.includes("Failed") ? "text-danger-400" : "text-rust-400"}`}>
                   {sftpMsg}
+                </span>
+              )}
+              {sshMsg && (
+                <span className={`text-xs ${sshMsg.includes("failed") || sshMsg.includes("Failed") ? "text-danger-400" : "text-rust-400"}`}>
+                  {sshMsg}
                 </span>
               )}
             </div>
@@ -1861,85 +1926,17 @@ export default function SiteDetail() {
                 </div>
               </div>
             )}
-          </div>
-        </div>
-      )}
 
-      {/* SSH Access — a jailed interactive shell on the site's own account */}
-      {site.status === "active" && (
-        <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden mt-6">
-          <div className="px-5 py-4 border-b border-dark-600 flex items-center justify-between">
-            <h2 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">SSH Access</h2>
-            <span className={`inline-flex px-2.5 py-0.5 rounded-full text-xs font-medium ${
-              site.ssh_shell_enabled ? "bg-rust-500/10 text-rust-400" : "bg-dark-700 text-dark-300"
-            }`}>
-              {site.ssh_shell_enabled ? "Enabled" : "Disabled"}
-            </span>
-          </div>
-          <div className="p-5 space-y-4">
-            <p className="text-sm text-dark-200">
-              A jailed login over SSH on this site's own Linux account — the same one SFTP
-              uses, so there is one password and one set of keys for both. You land in your
-              site's files at <code className="font-mono text-dark-100">/content</code> and nothing
-              outside them is reachable. Enabling it creates the account if the site does not
-              have one yet.
-            </p>
-            {site.ssh_shell_enabled && site.sftp_uid != null && (
-              <div className="grid grid-cols-2 gap-3 text-xs font-mono">
-                <div>
-                  <div className="text-dark-400 uppercase tracking-wide mb-1">Username</div>
-                  <div className="text-dark-100">sftp{site.sftp_uid}</div>
-                </div>
-                <div>
-                  <div className="text-dark-400 uppercase tracking-wide mb-1">Connect</div>
-                  <div className="text-dark-100">ssh sftp{site.sftp_uid}@{site.domain}</div>
-                </div>
-              </div>
-            )}
-            <div className="flex items-center gap-3">
-              <button
-                disabled={sshToggling}
-                onClick={async () => {
-                  setSshToggling(true);
-                  setSshMsg("");
-                  try {
-                    const path = site.ssh_shell_enabled ? "disable" : "enable";
-                    const result = await api.post<{ ssh_shell_enabled: boolean }>(`/sites/${id}/ssh/${path}`);
-                    // The enable response carries no uid — re-fetching the site is
-                    // what surfaces the account created on the way (same as SFTP).
-                    setSite(s => s ? { ...s, ssh_shell_enabled: result.ssh_shell_enabled } : s);
-                    if (result.ssh_shell_enabled) {
-                      const fresh = await api.get<Site>(`/sites/${id}`);
-                      setSite(fresh);
-                    }
-                    setSshMsg(site.ssh_shell_enabled ? "SSH disabled" : "SSH enabled");
-                  } catch (e) {
-                    setSshMsg(e instanceof Error ? e.message : "Toggle failed");
-                  } finally {
-                    setSshToggling(false);
-                  }
-                }}
-                className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 ${
-                  site.ssh_shell_enabled
-                    ? "bg-warn-500/10 text-warn-400 hover:bg-warn-500/20"
-                    : "bg-rust-500 text-white hover:bg-rust-600"
-                }`}
-              >
-                {sshToggling ? "..." : site.ssh_shell_enabled ? "Disable SSH" : "Enable SSH"}
-              </button>
-              {sshMsg && (
-                <span className={`text-xs ${sshMsg.includes("failed") || sshMsg.includes("Failed") ? "text-danger-400" : "text-rust-400"}`}>
-                  {sshMsg}
-                </span>
-              )}
-            </div>
-
-            {site.ssh_shell_enabled && (
+            {/* Public keys — one set, for SFTP and SSH alike, because it is one
+                account. Installing a key unlocks the account, so key sign-in
+                works even before a password has been set. */}
+            {site.sftp_enabled && (
               <div className="border-t border-dark-600 pt-4 space-y-3">
                 <div className="flex items-center justify-between gap-3">
-                  <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">SSH Keys</h3>
+                  <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">Public Keys</h3>
                   <span className="text-xs text-dark-400 text-right">
-                    Password sign-in uses the same account password — reset it in the SFTP card above.
+                    Keys sign in over SFTP and SSH alike. Password sign-in uses the account
+                    password — use Reset Password.
                   </span>
                 </div>
                 {sshKeys.length === 0 ? (

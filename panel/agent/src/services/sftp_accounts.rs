@@ -374,6 +374,19 @@ pub async fn set_password(uid: i32, plaintext: &str) -> Result<(), String> {
     apply_password(&sftp_username(uid), plaintext).await
 }
 
+/// Make sure `uid`'s login is not locked, so public-key auth can succeed.
+///
+/// `provision` leaves the account locked (`useradd` without `-p`), which is
+/// correct for a password-less account — but sshd refuses a LOCKED account for
+/// every auth method, publickey included, so a site that has been given a key
+/// but no password could not use that key at all until this ran. Installing a
+/// key therefore unlocks first. Idempotent: [`ensure_unlocked`] only sets a
+/// password when the shadow field is actually locked, so an existing password
+/// (a reset the owner already did by hand) is never overwritten by this path.
+pub async fn unlock(uid: i32) -> Result<(), String> {
+    ensure_unlocked(&sftp_username(uid)).await
+}
+
 /// Hash `plaintext` and store it on `username`.
 ///
 /// Shared by the SFTP password route and the jailed-shell unlock below, which

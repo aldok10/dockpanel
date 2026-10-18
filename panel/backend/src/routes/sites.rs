@@ -3902,11 +3902,17 @@ pub async fn disable_sftp(
         Some(serde_json::json!({ "uid": uid, "gid": gid, "last_sftp_site": last_sftp_site.0 == 0 })),
     ).await.map_err(|e| agent_error("SFTP disable", e))?;
 
-    sqlx::query("UPDATE sites SET sftp_enabled = false, updated_at = NOW() WHERE id = $1")
-        .bind(id)
-        .execute(&state.db)
-        .await
-        .map_err(|e| internal_error("disable sftp", e))?;
+    // The shell lives on the account this call is deleting, so it goes with it.
+    // Leaving `ssh_shell_enabled` true would tell the site page a shell is on
+    // over an account that no longer exists — and the next `enable` would have
+    // to allocate a fresh uid anyway.
+    sqlx::query(
+        "UPDATE sites SET sftp_enabled = false, ssh_shell_enabled = false, updated_at = NOW() WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&state.db)
+    .await
+    .map_err(|e| internal_error("disable sftp", e))?;
 
     let ip = crate::routes::client_ip(&headers);
     tracing::info!("SFTP disabled for {}", site.domain);
@@ -4234,7 +4240,24 @@ pub async fn add_site_ssh_key(
         .map_err(|e| internal_error("add site ssh key", e))?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "Site not found"))?;
     let username = site_linux_username(&site)?;
+    let uid = site
+        .sftp_uid
+        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "This site has no Linux account yet"))?;
     let agent = crate::helpers::agent_for_site_server(&state, site.server_id, &site.domain).await?;
+    // Unlock BEFORE installing the key. `ssh_shell_enabled` and the key are
+    // independent — an SFTP-only site has a locked account (provision never set
+    // a password), and sshd refuses a locked account for publickey exactly as it
+    // does for a password, so the key the caller just pasted would be installed
+    // and yet unusable. Done first so a failure here changes nothing, rather
+    // than leaving an unusable key behind. Idempotent: an account that already
+    // has a password keeps it.
+    agent
+        .post(
+            &format!("/sftp/sites/{}/unlock", site.domain),
+            Some(serde_json::json!({ "uid": uid })),
+        )
+        .await
+        .map_err(|e| agent_error("Unlock site SSH account", e))?;
     agent
         .post(
             &format!("/os-users/{username}/keys"),

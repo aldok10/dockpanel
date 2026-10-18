@@ -97,6 +97,28 @@ struct ShellDisableRequest {
     uid: i32,
 }
 
+#[derive(Deserialize)]
+struct UnlockRequest {
+    uid: i32,
+}
+
+/// POST /sftp/sites/{domain}/unlock — ensure the account is not locked, so a
+/// public key authenticates even for an account that has never had a password.
+/// sshd refuses a locked account for publickey just as it does for password, so
+/// a key alone would otherwise be unusable on an SFTP-only site.
+async fn unlock(
+    Path(domain): Path<String>,
+    Json(body): Json<UnlockRequest>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    if !is_valid_domain(&domain) {
+        return Err(err(StatusCode::BAD_REQUEST, "Invalid domain"));
+    }
+    sftp_accounts::unlock(body.uid)
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &e))?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
 /// POST /sftp/sites/{domain}/shell/enable — a jailed interactive shell for the
 /// site's existing SFTP account.
 async fn shell_enable(
@@ -133,4 +155,5 @@ pub fn router() -> Router<AppState> {
         .route("/sftp/sites/{domain}/password", post(set_password))
         .route("/sftp/sites/{domain}/shell/enable", post(shell_enable))
         .route("/sftp/sites/{domain}/shell/disable", post(shell_disable))
+        .route("/sftp/sites/{domain}/unlock", post(unlock))
 }

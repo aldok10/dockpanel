@@ -18,6 +18,11 @@ interface Site {
   enabled: boolean;
   parent_site_id: string | null;
   created_at: string;
+  // The site's own Linux account (chrooted to its files). Shown on the list so a
+  // row can tell you whether FTP / SSH is already on before you open the site.
+  sftp_enabled: boolean;
+  ssh_shell_enabled: boolean;
+  sftp_uid: number | null;
   // Present only on the admin all-sites view (GET /api/admin/sites). The
   // owner-scoped list cannot carry them, and would not need to: every row it
   // returns belongs to the person reading it.
@@ -469,6 +474,7 @@ export default function Sites() {
                 <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-5 py-3 hidden sm:table-cell">Runtime</th>
                 <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-5 py-3">Status</th>
                 <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-5 py-3 hidden md:table-cell">SSL</th>
+                <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-5 py-3 hidden md:table-cell">Access</th>
                 <th scope="col" className="text-left text-xs font-medium text-dark-200 uppercase tracking-widest font-mono px-5 py-3 hidden lg:table-cell">Created</th>
                 {allSites && (
                   <>
@@ -523,6 +529,29 @@ export default function Sites() {
                     ) : (
                       <span className="text-xs text-dark-300">None</span>
                     )}
+                  </td>
+                  <td className="px-5 py-4 hidden md:table-cell">
+                    <div className="flex items-center gap-1.5">
+                      {(
+                        [
+                          { label: "FTP", on: site.sftp_enabled, hint: site.sftp_enabled && site.sftp_uid != null ? `sftp sftp${site.sftp_uid}@${site.domain}` : "Turn SFTP on for this site" },
+                          { label: "SSH", on: site.ssh_shell_enabled, hint: site.ssh_shell_enabled && site.sftp_uid != null ? `ssh sftp${site.sftp_uid}@${site.domain}` : "Turn the SSH shell on for this site" },
+                        ]
+                      ).map((a) => (
+                        <Link
+                          key={a.label}
+                          to={`/sites/${site.id}#access`}
+                          title={a.hint}
+                          className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-mono transition-colors ${
+                            a.on
+                              ? "bg-rust-500/10 text-rust-400 hover:text-rust-300"
+                              : "bg-dark-700 text-dark-400 hover:text-dark-200"
+                          }`}
+                        >
+                          {a.label}
+                        </Link>
+                      ))}
+                    </div>
                   </td>
                   <td className="px-5 py-4 text-sm text-dark-200 hidden lg:table-cell">
                     {formatDate(site.created_at)}

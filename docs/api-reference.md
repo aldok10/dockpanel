@@ -1,6 +1,6 @@
 # API Reference
 
-DockPanel exposes 868 REST endpoints (564 backend + 304 agent) across 50+ categories — the figure derived from the two routers in `FEATURES.md` §Verified Metrics, which owns it. The tables below document the commonly used subset, not every route. All endpoints except `/api/health`, `/api/branding`, `/api/auth/setup-status`, and `/api/auth/login` require authentication.
+DockPanel exposes 869 REST endpoints (564 backend + 305 agent) across 50+ categories — the figure derived from the two routers in `FEATURES.md` §Verified Metrics, which owns it. The tables below document the commonly used subset, not every route. All endpoints except `/api/health`, `/api/branding`, `/api/auth/setup-status`, and `/api/auth/login` require authentication.
 
 ## Authentication
 

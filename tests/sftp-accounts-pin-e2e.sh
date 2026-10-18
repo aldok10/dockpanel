@@ -305,16 +305,16 @@ echo "── J: the frontend never lets an operator type their own SFTP password
 # accounts), so a whole-file substring check would either miss a real bug or
 # false-positive on one of those. A fixed line window would silently stop
 # covering the card if a future edit made it longer or shorter.
-SFTP_CARD=$(awk '/\{\/\* SFTP Access \*\/\}/{f=1} f{print} f&&/\{\/\* WAF \(ModSecurity\) \*\/\}/{exit}' "$FRONTEND")
+SFTP_CARD=$(awk '/\{\/\* SFTP & SSH Access/{f=1} f{print} f&&/\{\/\* WAF \(ModSecurity\) \*\/\}/{exit}' "$FRONTEND")
 if [ -z "$SFTP_CARD" ]; then
-  bad "could not extract the SFTP Access card from SiteDetail.tsx — markers moved or were renamed"
+  bad "could not extract the merged SFTP & SSH access card from SiteDetail.tsx — markers moved or were renamed"
 else
-  ok "SFTP Access card block extracted (bounded on its own comment markers)"
+  ok "merged SFTP & SSH access card extracted (bounded on its own comment markers)"
 fi
 CARD_FLAT=$(printf '%s' "$SFTP_CARD" | tr -d ' \t\n')
 case "$CARD_FLAT" in
-  *'type="password"'*) bad "the SFTP Access card has a free-text password input — passwords should only ever be server-generated" ;;
-  *) ok "no free-text password input inside the SFTP Access card" ;;
+  *'type="password"'*) bad "the SFTP & SSH access card has a free-text password input — passwords should only ever be server-generated" ;;
+  *) ok "no free-text password input inside the SFTP & SSH access card" ;;
 esac
 must_contain "$CARD_FLAT" 'sftp/reset-password' \
   "the card calls the reset-password endpoint (server-generated, never operator-typed)"
