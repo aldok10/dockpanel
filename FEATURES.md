@@ -244,10 +244,10 @@ honest:
 | Panel services RAM (agent + API) | ~49 MB | measured | 2026-07-27 |
 | Full-stack RAM (with bundled PostgreSQL) | ~109 MB | measured | 2026-07-27 |
 | App templates | 147 | derived | every commit |
-| HTTP routes | 859 (555 backend + 304 agent) | derived | every commit |
+| HTTP routes | 868 (564 backend + 304 agent) | derived | every commit |
 | Regression-pin assertions | 4770 (144 suites) | derived | every commit |
 | Frontend pages | 53 | derived | every commit |
-| DB migrations | 141 | derived | every commit |
+| DB migrations | 142 | derived | every commit |
 | Supervised background services | 17 | derived | every commit |
 
 Five of these were wrong when the register was built (s272), some by a factor of

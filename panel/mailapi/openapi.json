@@ -3,7 +3,7 @@
   "info": {
     "title": "DockPanel Mail API",
     "version": "1.0.0",
-    "description": "Send and manage mail on a DockPanel host over REST.\n\nMessages are injected through Postfix's local `sendmail` wrapper, so they are DKIM-signed and delivered on exactly the same path as mail sent from the webmail, and a copy is filed into the sender's **Sent** folder.\n\n## Authentication\n\nEvery route except `GET /health` requires `Authorization: Bearer <token>`. Two kinds of token are accepted, and only one of them is a *mailbox*:\n\n* **A mailbox token** — minted per-mailbox in Roundcube under **Settings → Mail API**. It may send as its own address and manage only its own mailbox (the `/v1/me/*` routes). This is the token an application should hold.\n* **A panel API key** — one beginning with `dp_`, created in the panel under **Settings → API keys**. It is not bound to a mailbox; it authenticates as the panel does, which is what the server-wide `/v1/domains/*` and `/v1/queue/*` routes require.\n\nThe two are not interchangeable: a mailbox token gets `403` on a management route, a `dp_` key is refused by nothing but the panel's own authorization — and `GET /v1/me` reports which level the presented token is at, as `admin`."
+    "description": "Send and manage mail on a DockPanel host over REST.\n\nMessages are injected through Postfix's local `sendmail` wrapper, so they are DKIM-signed and delivered on exactly the same path as mail sent from the webmail, and a copy is filed into the sender's **Sent** folder.\n\n## Authentication\n\nEvery route except `GET /health` requires `Authorization: Bearer <token>`. Three kinds of token are accepted, and only one of them is a *mailbox*:\n\n* **A mailbox token** — minted per-mailbox in the panel under **Mail → Mail API**. It carries its own subset of the permission catalog (`me`, `domain`), so a token intended for one application can be narrower than the mailbox it belongs to. This is the token an application should hold.\n* **A panel API key** — one beginning with `dp_`, created in the panel under **Settings → API keys**. It is not bound to a mailbox; it authenticates as the panel does.\n* **A legacy Roundcube token** — minted by the bundled webmail's *Mail API* tab before the panel took over. It is granted `me` and nothing more.\n\n## Permissions\n\nA token's permissions are drawn from a two-entry catalog and are an upper bound, not a floor: they are intersected on every request with what the mailbox is **currently** allowed, which the panel records as a *role* per mailbox.\n\n* `me` — `/v1/me/*` and `/v1/send`: send as the mailbox's own address and manage only that mailbox.\n* `domain` — `/v1/domains/*` and `/v1/queue`: the whole server's mail domains, mailboxes, aliases and queue.\n\nSo a `/me`-only token is refused (`403`) on a management route even when its mailbox is an administrator's, and removing `domain` from a mailbox in the panel downgrades the tokens already handed out. `GET /v1/me` reports the permissions the presented token currently holds."
   },
   "servers": [
     {
@@ -26,7 +26,7 @@
     },
     {
       "name": "Management",
-      "description": "Server-wide mail administration. Requires a panel `dp_` API key, or a mailbox listed in the service's `MAILAPI_ADMIN_EMAILS`."
+      "description": "Server-wide mail administration. Requires a token carrying the `domain` permission (`/v1/me` reports the permissions a token holds)."
     }
   ],
   "security": [
@@ -1929,12 +1929,13 @@
         "properties": {
           "email": { "type": "string", "format": "email" },
           "domain": { "type": "string", "description": "The mailbox's domain." },
-          "admin": {
-            "type": "boolean",
-            "description": "Whether this token may use the server-wide `/v1/domains/*` and `/v1/queue/*` routes."
+          "permissions": {
+            "type": "array",
+            "items": { "type": "string", "enum": ["me", "domain"] },
+            "description": "What this particular token may do right now. `domain` implies `me`. A token never holds more than the mailbox it belongs to is currently allowed."
           }
         },
-        "required": ["email", "admin"]
+        "required": ["email", "permissions"]
       },
       "DisplayNamePatch": {
         "type": "object",

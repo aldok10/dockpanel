@@ -245,12 +245,43 @@ into the sender's **Sent** folder, so it shows up in Roundcube like any other me
 
 ### Getting a token
 
-1. Log into **Webmail** (Roundcube)
-2. Open **Settings → Mail API**
-3. Click **Generate new token** and copy it — it is shown only once
+1. Open the panel and go to **Mail**
+2. Under **Mail API — Tokens & Permissions**, type the mailbox's address under *Mint a token for
+   a mailbox*
+3. Tick the permissions the token should have, give it a label if you like, and click
+   **Create token** — it is shown only once
 
-A token belongs to the mailbox you are signed in as and can only send as that address. Revoke
-it from the same screen when it is no longer needed.
+A token belongs to the mailbox you name and can only send as that address. Rotate or revoke it
+from the same card when it is no longer needed.
+
+### Permissions
+
+A token carries its own permissions, from a catalog of two:
+
+| Permission | Grants |
+|---|---|
+| `me` | `/v1/me/*` and `/v1/send` — manage and send as the token's own mailbox |
+| `domain` | `/v1/domains/*` and `/v1/queue` — administer the whole server's mail |
+
+`domain` implies `me`. A token's permissions are an **upper bound**: on every request the
+service intersects them with what the mailbox is currently allowed, which is recorded per
+mailbox as a *role* in the panel. Two things follow, and they are the point of the design:
+
+* **A `/me`-only token stays `/me`-only**, even if its mailbox is an administrator's. An
+  application gets exactly what it needs and no path to the rest of the server.
+* **Revoking is immediate.** Move a mailbox off `mail-admin`, or drop an extra permission, and
+  tokens already handed out lose `domain` on their next request — no need to hunt them down.
+
+**Roles** are named permission bundles, managed on the same card. Two are built in and cannot be
+edited or deleted:
+
+| Role | Permissions |
+|---|---|
+| `mail-user` | `me` — the default for every mailbox |
+| `mail-admin` | `me`, `domain` |
+
+Add a custom role when a mailbox needs something between the two, then assign it (with any
+extra permissions) under *Mailbox permissions*. A mailbox with no assignment gets `mail-user`.
 
 ### Sending
 
@@ -274,7 +305,9 @@ that already hold one.
 The API is published at `mail-api.<domain>` as an ordinary DockPanel **site** — runtime *proxy*,
 forwarding to `127.0.0.1:8081` — so it appears under **Sites** and its certificate is issued and
 renewed like any other site's. The service itself listens on loopback only. Tokens are stored
-(hashed) in Roundcube's own database, which is all the service reads to authenticate a request.
+(hashed, never in the clear) in the panel's own database, which the service reads directly to
+authenticate a request. Roundcube's own `dockpanel_mailapi_tokens` table is still honoured for
+tokens minted before the panel took over, but only at `me` — see **Permissions** above.
 
 ### API reference
 
@@ -292,17 +325,19 @@ route they document still demands a bearer token.
 
 ### Managing mail
 
-The same token manages as well as sends. What it may do follows from the mailbox it belongs
-to, and there are two levels:
+The same token manages as well as sends. What it may do follows from the **permissions it carries**,
+bounded by what its mailbox is currently allowed, and there are two levels:
 
-* **Its own mailbox** — every token. Read and change the display name, password, forwarding
-  and the out-of-office reply; list, create and delete folders and read, save, move and delete
-  the mail in them; read quota usage.
-* **The whole server** — only for mailboxes listed in `MAILAPI_ADMIN_EMAILS` in the service's
-  environment (`/etc/dockpanel/mailapi.env`). This is opt-in on purpose: a token is handed to
-  an application, and an address is not a role.
+* **Its own mailbox** — the `me` permission, which every token has. Read and change the display
+  name, password, forwarding and the out-of-office reply; list, create and delete folders and
+  read, save, move and delete the mail in them; read quota usage.
+* **The whole server** — the `domain` permission, granted per token in the panel. This is opt-in
+  on purpose: a token is handed to an application, and a permission is not an address.
 
-`GET /v1/me` reports which level your token is at, as `admin`.
+`GET /v1/me` reports the permissions your token currently holds.
+
+Webmail's **Settings → Mail API** tab lists a mailbox's tokens, read-only, so you can see what
+exists and when each was last used; creating and revoking happens in the panel.
 
 Self-service, with any token:
 
@@ -389,10 +424,12 @@ API; the sort and the page are applied to what comes back.
 
 The address book and the settings are **Roundcube's own**. Contacts, their groups, sender
 identities, canned responses, the preference blob and the addresses the Webmail collected all
-live in the SQLite database the webmail already keeps for the mailbox — the same one the
-service reads to authenticate a token. There is no second store: a contact added through the
-API is in the webmail's address book on the next page load, a signature changed here is the one
-the compose window uses, and a contact added in the webmail comes back from the API.
+live in the SQLite database the webmail already keeps for the mailbox — the same one the service
+reads to authenticate a token minted before the panel took that over. There is no second store:
+a contact added through the API is in the webmail's address book on the next page load, a
+signature changed here is the one the compose window uses, and a contact added in the webmail
+comes back from the API. (Tokens minted *now* live in the panel's database instead; see
+**Getting a token** above.)
 
 These routes need the mailbox to have signed in to the Webmail at least once, because that is
 what creates its Roundcube account; before that they answer `404` and say so.
@@ -444,7 +481,7 @@ curl -X PUT https://mail-api.example.com/v1/me/settings \
   -d '{"language":"id"}'
 ```
 
-Server-wide, with an admin mailbox token or a panel API key:
+Server-wide, with a token carrying the `domain` permission, or a panel API key:
 
 | Method | Path |
 |---|---|
@@ -493,6 +530,11 @@ then restart the service (`rc-service dockpanel-mailapi restart`, or
 `systemctl restart dockpanel-mailapi`). Without it the routes that only ask Dovecot
 (`/v1/me/quota`, `/v1/me/folders`) still work, and the rest answer `503` with that
 instruction.
+
+The service reads the panel's own `DATABASE_URL` (from `/etc/dockpanel/api.env`) to look up
+mail-API tokens and their permissions, so there is nothing else to configure for that. If the
+database is unreachable it answers `503` on an authenticated request rather than falling back to
+the webmail's token table — a broken connection must not look like a token that was narrowed.
 
 ## Spam Filter (Rspamd)
 

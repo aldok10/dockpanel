@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::auth::{AdminUser, AuthUser, Claims, ServerScope};
 use crate::error::{internal_error, err, agent_error, ApiError};
+use crate::routes::mail_api;
 use crate::routes::sites::ProvisionStep;
 use crate::services::activity;
 use crate::services::agent::AgentHandle;
@@ -1737,8 +1738,29 @@ pub async fn webmail_install(
     State(state): State<AppState>,
     AdminUser(claims): AdminUser,
     ServerScope(_server_id, agent): ServerScope,
-    Json(body): Json<serde_json::Value>,
+    Json(mut body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // The webmail tab lists a mailbox's mail-API tokens through the panel, with a
+    // key scoped to that one read. Mint it here — the backend owns the database
+    // and the agent does not — and hand it to the agent in the same request so it
+    // can be written into the container's config. A reinstall therefore rotates
+    // the key, and the container is the only holder of the current one.
+    let webmail_key = mail_api::rotate_webmail_client(&state.db).await?;
+
+    if !body.is_object() {
+        body = serde_json::json!({});
+    }
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert(
+            "mailapi_webmail_key".to_string(),
+            serde_json::Value::String(webmail_key),
+        );
+        obj.insert(
+            "panel_base_url".to_string(),
+            serde_json::Value::String(state.config.base_url.clone()),
+        );
+    }
+
     let result = agent.post_long("/mail/webmail/install", Some(body), 900).await
         .map_err(|e| agent_error("Webmail", e))?;
     activity::log_activity(&state.db, claims.sub, &claims.email, "mail.webmail_install", None, None, None, None, claims.key_id).await;

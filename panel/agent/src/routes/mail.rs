@@ -1996,6 +1996,16 @@ const ROUNDCUBE_MAILAPI_PLUGIN: &str =
 const ROUNDCUBE_MAILAPI_LOCALE: &str =
     include_str!("../templates/roundcube/dockpanel_mailapi/localization/en_US.inc");
 
+/// Escape a value for a single-quoted PHP string in the drop-in we generate.
+///
+/// The two values that reach it (the panel URL and a hex key) are ours, but the
+/// URL comes from the panel's own configuration, and an unescaped quote there
+/// would end the PHP string early and put the rest of the file outside it —
+/// where Roundcube's config parser would either fail or, worse, execute it.
+fn php_single_quote(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
 /// POST /mail/webmail/install — Deploy Roundcube webmail via Docker.
 ///
 /// Idempotent: tears down any prior `dockpanel-roundcube` container before
@@ -2089,6 +2099,23 @@ async fn webmail_install(Json(body): Json<serde_json::Value>) -> Result<Json<ser
         .clone()
         .map(|h| h.splitn(2, '.').nth(1).unwrap_or(&h).to_string())
         .unwrap_or_else(|| domain.to_string());
+
+    // The Mail API tab no longer mints or reads tokens itself — the panel does
+    // that now, and `panel/mailapi` authenticates against the panel's database.
+    // What the tab needs is the panel's own URL and a key scoped to one read:
+    // listing the tokens of the address the signed-in user holds. The backend
+    // mints that key (routes/mail_api.rs) and passes it in this same request, so
+    // a reinstall rotates it and the container's config is its only holder.
+    let panel_base_url = body
+        .get("panel_base_url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim_end_matches('/');
+    let mailapi_client_key = body
+        .get("mailapi_webmail_key")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
     let conn_options = format!(
         "<?php\n\
         // DockPanel-managed (see webmail_install in the agent's mail.rs).\n\
@@ -2096,10 +2123,15 @@ async fn webmail_install(Json(body): Json<serde_json::Value>) -> Result<Json<ser
         $config['smtp_conn_options'] = ['ssl' => ['verify_peer' => false, 'verify_peer_name' => false, 'allow_self_signed' => true]];\n\
         \n\
         // Mail API tab (panel/mailapi). Plugin files are bind-mounted at\n\
-        // /var/www/html/plugins/dockpanel_mailapi; the token table is created by\n\
-        // the plugin and read by the dockpanel-mailapi daemon.\n\
+        // /var/www/html/plugins/dockpanel_mailapi. The tab lists the mailbox's\n\
+        // tokens through the panel with a read-only scoped key; minting and\n\
+        // revoking happen in the panel (Mail -> Mail API).\n\
         $config['plugins'][] = 'dockpanel_mailapi';\n\
-        $config['mailapi_url'] = 'https://mail-api.{mailapi_host}';\n"
+        $config['mailapi_url'] = 'https://mail-api.{mailapi_host}';\n\
+        $config['mailapi_panel_url'] = '{panel_url}';\n\
+        $config['mailapi_client_key'] = '{client_key}';\n",
+        panel_url = php_single_quote(panel_base_url),
+        client_key = php_single_quote(mailapi_client_key),
     );
     if let Err(e) = std::fs::write(format!("{webmail_conf_dir}/dockpanel.inc.php"), conn_options) {
         tracing::warn!("Could not write webmail connection options: {e}");

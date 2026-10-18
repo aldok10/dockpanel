@@ -23,6 +23,7 @@ pub mod incidents;
 pub mod git_deploys;
 pub mod logs;
 pub mod mail;
+pub mod mail_api;
 pub mod metrics;
 pub mod monitors;
 pub mod notifications;
@@ -1716,6 +1717,24 @@ pub fn router() -> Router<AppState> {
         .route("/api/mail/webmail/status", get(mail::webmail_status))
         .route("/api/mail/webmail/remove", post(mail::webmail_remove))
         .route("/api/mail/api/status", get(mail::mailapi_status))
+        // Mail: REST API roles, permissions and tokens
+        //
+        // Roles and grants are the panel's authority over what a mail-API token
+        // may do; the tokens themselves are minted here now, not in Roundcube.
+        // The `webmail/tokens` route is the one exception: it is what the
+        // webmail container's own tab calls, with a key scoped to read-only.
+        .route("/api/mail/api/permissions", get(mail_api::list_permissions))
+        .route("/api/mail/api/roles", get(mail_api::list_roles).post(mail_api::create_role))
+        .route("/api/mail/api/roles/{id}", put(mail_api::update_role).delete(mail_api::delete_role))
+        .route("/api/mail/api/grants", get(mail_api::list_grants))
+        .route(
+            "/api/mail/api/grants/{email}",
+            get(mail_api::get_grant).put(mail_api::put_grant).delete(mail_api::delete_grant),
+        )
+        .route("/api/mail/api/tokens", get(mail_api::list_tokens).post(mail_api::create_token))
+        .route("/api/mail/api/tokens/{id}", delete(mail_api::revoke_token))
+        .route("/api/mail/api/tokens/{id}/rotate", post(mail_api::rotate_token))
+        .route("/api/mail/webmail/tokens", get(mail_api::webmail_tokens))
         // Mail: SMTP Relay
         .route("/api/mail/relay/configure", post(mail::relay_configure))
         .route("/api/mail/relay/status", get(mail::relay_status))

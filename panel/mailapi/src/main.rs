@@ -12,21 +12,31 @@
 //! if the user had sent it there.
 //!
 //! Auth accepts either:
-//!   * an opaque API token created in Roundcube (sha256 looked up in its SQLite
-//!     `dockpanel_mailapi_tokens` table), or
+//!   * a mail-API token minted in the panel (its sha256 looked up in the panel's
+//!     `mail_api_tokens` table, over the same Postgres the panel uses), or
+//!   * a token minted by the bundled Roundcube plugin before the panel took
+//!     over — its sha256 is looked up in Roundcube's SQLite
+//!     `dockpanel_mailapi_tokens` table and it is granted `me` and nothing more, or
 //!   * a JWT signed with the panel's `JWT_SECRET` (HS256) that carries an
 //!     `email` claim — the "internal" path used by the panel itself, or
 //!   * a panel API key (`dp_…`), which is forwarded to the backend untouched so
 //!     the panel's own authorization decides what it may do.
 //!
-//! A token identifies a MAILBOX, so what it may manage follows from that:
-//! every mailbox may manage itself (`/v1/me/*`, and `/v1/send`), and a mailbox
-//! listed in `MAILAPI_ADMIN_EMAILS` may manage the whole server
-//! (`/v1/domains/*`, `/v1/queue`). Management is not reimplemented here: the
-//! daemon calls the panel backend's existing `/api/mail/*` routes over loopback,
-//! so there is one implementation of each operation and one place where its
-//! authorization rule lives. The `dp_` key it presents for that leg is
-//! `MAILAPI_BACKEND_API_KEY` — a service credential, not the caller's.
+//! A token identifies a MAILBOX and carries its own set of PERMISSIONS, drawn
+//! from a two-entry catalog:
+//!   * `me`     — `/v1/me/*` and `/v1/send`; manage only the token's own mailbox
+//!   * `domain` — `/v1/domains/*` and `/v1/queue`; manage the whole server
+//!
+//! The token's permissions are an upper bound, not a floor: they are intersected
+//! on every request with what the mailbox is *currently* allowed (its role in the
+//! panel, `panel/backend/src/routes/mail_api.rs`). That is what makes a `/me`-only
+//! token stay `/me`-only even for an administrator mailbox, and what makes
+//! removing `domain` from a mailbox take effect on tokens already handed out.
+//! Management is not reimplemented here: the daemon calls the panel backend's
+//! existing `/api/mail/*` routes over loopback, so there is one implementation of
+//! each operation and one place where its authorization rule lives. The `dp_` key
+//! it presents for that leg is `MAILAPI_BACKEND_API_KEY` — a service credential,
+//! not the caller's.
 //!
 //! ⚠ `MAILAPI_BACKEND_API_KEY` must belong to an ADMIN user: the backend gates
 //! domain creation, updates, deletion and the mail queue on `AdminUser`, so a
@@ -114,9 +124,12 @@ struct Config {
     /// The panel API key (`dp_…`) this daemon presents to the backend. Must
     /// belong to an ADMIN user — see the module comment.
     backend_api_key: Option<String>,
-    /// Mailboxes allowed the full management surface. Everyone else gets
-    /// self-service; see `Principal`.
-    admin_emails: Vec<String>,
+    /// The panel's Postgres. Mail-API tokens and their permissions live there now
+    /// (`mail_api_tokens`, `mail_api_grants`, `mail_api_roles`), and this daemon
+    /// reads them directly rather than calling back into the panel for every
+    /// request. `None` disables the panel-token path in favour of the legacy
+    /// Roundcube table only.
+    database_url: Option<String>,
 }
 
 #[derive(Clone)]
@@ -124,6 +137,9 @@ struct AppState {
     cfg: Arc<Config>,
     /// One pooled client for the loopback calls into the panel backend.
     http: reqwest::Client,
+    /// The panel's Postgres, when `DATABASE_URL` is set. `None` means only the
+    /// legacy Roundcube token table can authenticate a mailbox token.
+    pg: Option<sqlx::PgPool>,
 }
 
 #[derive(Debug)]
@@ -198,15 +214,6 @@ impl Config {
             })
             .unwrap_or_default();
 
-        let admin_emails = get("MAILAPI_ADMIN_EMAILS")
-            .map(|s| {
-                s.split(',')
-                    .map(|e| e.trim().to_lowercase())
-                    .filter(|e| !e.is_empty())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-
         Config {
             listen: get("MAILAPI_LISTEN").unwrap_or_else(|| "127.0.0.1:8081".into()),
             sendmail: get("MAILAPI_SENDMAIL").unwrap_or_else(|| "/usr/sbin/sendmail".into()),
@@ -219,7 +226,7 @@ impl Config {
             backend_url: get("MAILAPI_BACKEND_URL")
                 .unwrap_or_else(|| "http://127.0.0.1:3080".into()),
             backend_api_key: get("MAILAPI_BACKEND_API_KEY"),
-            admin_emails,
+            database_url: get("DATABASE_URL"),
         }
     }
 }
@@ -260,9 +267,55 @@ fn generate_message_id(identity: &str) -> String {
     format!("<{nanos}.{}@{domain}>", &hash[..16])
 }
 
-/// The sender a token (or JWT) is allowed to send as.
-fn resolve_identity(cfg: &Config, token: &str) -> Option<String> {
-    // 1. JWT signed with the panel secret, carrying an email claim.
+/// The permissions a mail-API token can hold.
+///
+/// Deliberately two booleans rather than a `Vec<String>`: there are exactly two
+/// entries, and a typo in a lookup is then a compile error instead of a
+/// permission that silently never matches.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Permissions {
+    /// `/v1/me/*` and `/v1/send` — manage the token's own mailbox.
+    me: bool,
+    /// `/v1/domains/*` and `/v1/queue` — manage the whole server.
+    domain: bool,
+}
+
+impl Permissions {
+    /// What a credential the panel itself vouches for may do: a panel JWT, a
+    /// `dp_` key the backend has already authorised, or a host-local static
+    /// token. None of these is a mailbox token — they belong to the panel and to
+    /// root on the box, so they keep the whole surface.
+    const ALL: Permissions = Permissions { me: true, domain: true };
+
+    /// A token minted by the old Roundcube plugin: `me`, and nothing wider.
+    const ME: Permissions = Permissions { me: true, domain: false };
+
+    fn has(self, key: &str) -> bool {
+        match key {
+            "me" => self.me,
+            "domain" => self.domain,
+            _ => false,
+        }
+    }
+
+    fn names(self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.me {
+            out.push("me");
+        }
+        if self.domain {
+            out.push("domain");
+        }
+        out
+    }
+}
+
+/// Credentials the daemon can resolve without the panel: the panel's JWT and the
+/// host-local static tokens, each returning the mailbox and the full permission
+/// set. The panel-minted token path is separate because it is async.
+fn resolve_local_identity(cfg: &Config, token: &str) -> Option<(String, Permissions)> {
+    // 1. JWT signed with the panel secret, carrying an email claim. This is the
+    //    panel's own internal path — it vouches for the address.
     if let Some(secret) = &cfg.jwt_secret {
         if token.matches('.').count() == 2 {
             let mut val = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
@@ -275,7 +328,7 @@ fn resolve_identity(cfg: &Config, token: &str) -> Option<String> {
                 for key in ["email", "mail", "sub"] {
                     if let Some(email) = data.claims.get(key).and_then(|v| v.as_str()) {
                         if email.contains('@') {
-                            return Some(email.to_lowercase());
+                            return Some((email.to_lowercase(), Permissions::ALL));
                         }
                     }
                 }
@@ -283,20 +336,23 @@ fn resolve_identity(cfg: &Config, token: &str) -> Option<String> {
         }
     }
 
-    // 2. Opaque API token created in Roundcube.
-    let hash = sha256_hex(token);
-    if let Some(email) = lookup_roundcube_token(cfg, &hash) {
-        return Some(email);
+    // 2. Static host-local token, listed in the daemon's own environment. Root on
+    //    the box already has everything the daemon can reach.
+    if let Some((_, email)) = cfg.static_tokens.iter().find(|(t, _)| t.as_str() == token) {
+        return Some((email.to_lowercase(), Permissions::ALL));
     }
 
-    // 3. Static host-local token.
-    cfg.static_tokens
-        .iter()
-        .find(|(t, _)| t.as_str() == token)
-        .map(|(_, e)| e.to_lowercase())
+    None
 }
 
-/// Look up `token_hash` in Roundcube's token table. Returns the mailbox email.
+/// Look up `token_hash` in Roundcube's **legacy** token table.
+///
+/// Tokens minted by the old plugin (before the panel took over) still
+/// authenticate here, and they are granted `me` and nothing more — deliberately.
+/// The old model decided a token's power from the mailbox's *address*, so a row
+/// in this table was potentially a server-wide one; refusing to read anything
+/// wider than `me` out of it is what stops the old behaviour surviving the
+/// change. A mailbox that wants `domain` mints a panel token.
 fn lookup_roundcube_token(cfg: &Config, token_hash: &str) -> Option<String> {
     let db = cfg.roundcube_db.as_ref()?;
     if !db.exists() {
@@ -321,12 +377,81 @@ fn lookup_roundcube_token(cfg: &Config, token_hash: &str) -> Option<String> {
     email
 }
 
+/// Intersect what a token was granted with what its mailbox is allowed now.
+///
+/// Split out from `lookup_panel_token` so the rule can be pinned without a
+/// database: this is the function that makes a revocation immediate, and it is
+/// the only place the two lists meet.
+fn intersect_token_permissions(token_perms: &[String], allowance: &[String]) -> Permissions {
+    let mut effective = Permissions::default();
+    for key in token_perms {
+        if !allowance.iter().any(|a| a == key) {
+            continue;
+        }
+        match key.as_str() {
+            "me" => effective.me = true,
+            "domain" => effective.domain = true,
+            _ => {}
+        }
+    }
+    effective
+}
+
+/// Look up a panel-minted token by its hash, returning the mailbox and the
+/// token's **effective** permissions.
+///
+/// Effective = the token's own set ∩ the mailbox's current allowance. The
+/// intersection is the point of the whole design: a token that was granted
+/// `domain` stops having it the moment the mailbox's role stops granting it, so
+/// revoking does not require finding every token that was handed out.
+async fn lookup_panel_token(
+    pg: &sqlx::PgPool,
+    token_hash: &str,
+) -> Result<Option<(String, Permissions)>, sqlx::Error> {
+    let row: Option<(String, Vec<String>, Option<Vec<String>>, Option<Vec<String>>)> = sqlx::query_as(
+        "SELECT t.email, t.permissions, r.permissions, g.extra_permissions \
+           FROM mail_api_tokens t \
+           LEFT JOIN mail_api_grants g ON g.email = t.email \
+           LEFT JOIN mail_api_roles r ON r.id = g.role_id \
+          WHERE t.token_hash = $1 AND t.revoked = FALSE",
+    )
+    .bind(token_hash)
+    .fetch_optional(pg)
+    .await?;
+
+    let Some((email, token_perms, role_perms, extra)) = row else {
+        return Ok(None);
+    };
+
+    // No grant row at all is the default allowance — `me` alone, the same rule
+    // the panel applies. A grant whose role was deleted falls back the same way.
+    let allowance: Vec<String> = match (role_perms, extra) {
+        (None, None) => vec!["me".to_string()],
+        (role, extra) => role
+            .unwrap_or_default()
+            .into_iter()
+            .chain(extra.unwrap_or_default())
+            .collect(),
+    };
+
+    let effective = intersect_token_permissions(&token_perms, &allowance);
+
+    // Best-effort usage stamp; a lock or a blip must never fail the request.
+    let _ = sqlx::query("UPDATE mail_api_tokens SET last_used_at = NOW() WHERE token_hash = $1")
+        .bind(token_hash)
+        .execute(pg)
+        .await;
+
+    Ok(Some((email, effective)))
+}
+
 /// What a request's credential resolves to.
 struct Principal {
     /// The mailbox the credential speaks for.
     email: String,
-    /// May manage domains, other mailboxes and the mail queue.
-    is_admin: bool,
+    /// What this particular credential may do. Always the *intersection* of what
+    /// the token asked for and what the mailbox is currently allowed.
+    permissions: Permissions,
     /// A panel `dp_` key the caller supplied. When set, backend calls carry this
     /// key instead of the service one, so the panel authorises the caller as
     /// whoever minted it — which is strictly narrower than the service key.
@@ -343,15 +468,17 @@ async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<String, A
     Ok(principal(state, headers).await?.email)
 }
 
-/// Resolve a bearer credential into the mailbox it speaks for.
+/// Resolve a bearer credential into the mailbox it speaks for and the
+/// permissions it holds.
 ///
-/// Three credential classes, and the difference between them is the whole
+/// Four credential classes, and the difference between them is the whole
 /// authorization story:
 ///   * a panel `dp_` key — the panel already knows what its user may do, so it
 ///     is forwarded untouched and the backend decides;
-///   * a mailbox token (or the panel's JWT) — identifies a MAILBOX, and a
-///     mailbox may always act on itself. Server-wide access is granted only by
-///     `MAILAPI_ADMIN_EMAILS`, never inferred from the address.
+///   * a panel JWT or a host-local static token — trusted, full surface;
+///   * a panel-minted mail-API token — a mailbox plus its own permissions,
+///     intersected with what the mailbox is allowed right now;
+///   * a legacy Roundcube token — a mailbox, `me` only.
 async fn principal(state: &AppState, headers: &HeaderMap) -> Result<Principal, ApiErr> {
     let token = bearer_token(headers)
         .ok_or_else(|| ApiErr::unauthorized("Missing API token (Authorization: Bearer <token>)"))?;
@@ -360,35 +487,81 @@ async fn principal(state: &AppState, headers: &HeaderMap) -> Result<Principal, A
         let email = backend_me(state, &token).await?;
         return Ok(Principal {
             email,
-            is_admin: true,
+            permissions: Permissions::ALL,
             passthrough_key: Some(token),
         });
     }
 
-    let email = resolve_identity(&state.cfg, &token)
-        .ok_or_else(|| ApiErr::unauthorized("Invalid or revoked API token"))?
-        // The Roundcube path returns whatever case the plugin stored; the JWT and
-        // static paths already lowercase. Normalising here means a mixed-case row
-        // does not silently fall outside MAILAPI_ADMIN_EMAILS, nor fail the
-        // sender check in `send`, which compares lowercased addresses.
-        .to_lowercase();
-    let is_admin = state.cfg.admin_emails.iter().any(|e| e == &email);
-    Ok(Principal {
-        email,
-        is_admin,
-        passthrough_key: None,
-    })
+    // The panel's own internal credentials, resolved offline.
+    if let Some((email, permissions)) = resolve_local_identity(&state.cfg, &token) {
+        return Ok(Principal {
+            email,
+            permissions,
+            passthrough_key: None,
+        });
+    }
+
+    let hash = sha256_hex(&token);
+
+    // The supported path: a token minted in the panel.
+    if let Some(pg) = &state.pg {
+        match lookup_panel_token(pg, &hash).await {
+            Ok(Some((email, permissions))) => {
+                return Ok(Principal {
+                    // The panel stores addresses lowercased; the daemon lowercases
+                    // anyway so a mixed-case row cannot fail `send`'s sender check.
+                    email: email.to_lowercase(),
+                    permissions,
+                    passthrough_key: None,
+                });
+            }
+            Ok(None) => {}
+            Err(e) => {
+                // Fail closed. Falling through to the legacy table on a database
+                // error would still authenticate the token — as `me` — and a
+                // broken connection would then look like a token that had been
+                // narrowed, which is exactly the outcome to refuse.
+                tracing::error!("panel mail-API token lookup failed: {e}");
+                return Err(ApiErr::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "The panel's mail token store is unavailable",
+                ));
+            }
+        }
+    }
+
+    // The old Roundcube table: `me` only, never wider.
+    if let Some(email) = lookup_roundcube_token(&state.cfg, &hash) {
+        return Ok(Principal {
+            email: email.to_lowercase(),
+            permissions: Permissions::ME,
+            passthrough_key: None,
+        });
+    }
+
+    Err(ApiErr::unauthorized("Invalid or revoked API token"))
 }
 
-/// Refuse a server-wide operation for a mailbox that may only manage itself.
-fn require_admin(p: &Principal) -> Result<(), ApiErr> {
-    if p.is_admin {
+/// Refuse a route the caller's token was not granted.
+///
+/// The refusal names the permission and where to grant it, because the common
+/// case is an operator who minted a `/me`-only token and then pointed it at a
+/// management route — the fix is a grant in the panel, not a different token.
+fn require_permission(p: &Principal, permission: &str) -> Result<(), ApiErr> {
+    if p.permissions.has(permission) {
         return Ok(());
     }
-    Err(ApiErr::forbidden(format!(
-        "{} may only manage its own mailbox. Add it to MAILAPI_ADMIN_EMAILS for server-wide access.",
-        p.email
-    )))
+    let msg = match permission {
+        "domain" => format!(
+            "{} may not administer the whole server: its token was not granted the `domain` permission. Grant it in the panel under Mail -> Mail API, then mint a token with it.",
+            p.email
+        ),
+        other => format!(
+            "{} may not use this route: its token was not granted the `{other}` permission.",
+            p.email
+        ),
+    };
+    Err(ApiErr::forbidden(msg))
 }
 
 // ---------------------------------------------------------------------------
@@ -404,7 +577,7 @@ async fn me(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<Va
     Ok(Json(json!({
         "email": p.email,
         "domain": p.domain(),
-        "admin": p.is_admin,
+        "permissions": p.permissions.names(),
     })))
 }
 
@@ -2353,7 +2526,7 @@ async fn me_trash_empty(
 }
 
 // ---------------------------------------------------------------------------
-// Management handlers — server-wide, so `require_admin` gates each one.
+// Management handlers — server-wide, so `require_permission(.., "domain")` gates each one.
 // ---------------------------------------------------------------------------
 
 /// `GET /v1/domains`
@@ -2362,7 +2535,7 @@ async fn domains_list(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
-    require_admin(&p)?;
+    require_permission(&p, "domain")?;
     Ok(Json(backend_call(&state, &p, Method::GET, "/api/mail/domains", None).await?))
 }
 
@@ -2374,7 +2547,7 @@ async fn domains_create(
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
-    require_admin(&p)?;
+    require_permission(&p, "domain")?;
     Ok(Json(backend_call(&state, &p, Method::POST, "/api/mail/domains", Some(body)).await?))
 }
 
@@ -2385,7 +2558,7 @@ async fn domain_get(
     Path(domain): Path<String>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
-    require_admin(&p)?;
+    require_permission(&p, "domain")?;
     let domains = backend_call(&state, &p, Method::GET, "/api/mail/domains", None).await?;
     let row = find_by(as_array(&domains, "domains"), "domain", &domain)
         .cloned()
@@ -2401,7 +2574,7 @@ async fn domain_update(
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
-    require_admin(&p)?;
+    require_permission(&p, "domain")?;
     let id = locate_domain(&state, &p, &domain).await?;
     let path = format!("/api/mail/domains/{id}");
     Ok(Json(backend_call(&state, &p, Method::PUT, &path, Some(body)).await?))
@@ -2415,7 +2588,7 @@ async fn domain_delete(
     Path(domain): Path<String>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
-    require_admin(&p)?;
+    require_permission(&p, "domain")?;
     let id = locate_domain(&state, &p, &domain).await?;
     let path = format!("/api/mail/domains/{id}");
     Ok(Json(backend_call(&state, &p, Method::DELETE, &path, None).await?))
@@ -2428,7 +2601,7 @@ async fn accounts_list(
     Path(domain): Path<String>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
-    require_admin(&p)?;
+    require_permission(&p, "domain")?;
     let id = locate_domain(&state, &p, &domain).await?;
     let path = format!("/api/mail/domains/{id}/accounts");
     Ok(Json(backend_call(&state, &p, Method::GET, &path, None).await?))
@@ -2443,7 +2616,7 @@ async fn accounts_create(
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
-    require_admin(&p)?;
+    require_permission(&p, "domain")?;
     let id = locate_domain(&state, &p, &domain).await?;
     let path = format!("/api/mail/domains/{id}/accounts");
     Ok(Json(backend_call(&state, &p, Method::POST, &path, Some(body)).await?))
@@ -2458,7 +2631,7 @@ async fn account_update(
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
-    require_admin(&p)?;
+    require_permission(&p, "domain")?;
     let domain_id = locate_domain(&state, &p, &domain).await?;
     let account_id = account_id_in(&state, &p, &domain_id, &email).await?;
     let path = format!("/api/mail/domains/{domain_id}/accounts/{account_id}");
@@ -2472,7 +2645,7 @@ async fn account_delete(
     Path((domain, email)): Path<(String, String)>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
-    require_admin(&p)?;
+    require_permission(&p, "domain")?;
     let domain_id = locate_domain(&state, &p, &domain).await?;
     let account_id = account_id_in(&state, &p, &domain_id, &email).await?;
     let path = format!("/api/mail/domains/{domain_id}/accounts/{account_id}");
@@ -2486,7 +2659,7 @@ async fn aliases_list(
     Path(domain): Path<String>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
-    require_admin(&p)?;
+    require_permission(&p, "domain")?;
     let id = locate_domain(&state, &p, &domain).await?;
     let path = format!("/api/mail/domains/{id}/aliases");
     Ok(Json(backend_call(&state, &p, Method::GET, &path, None).await?))
@@ -2501,7 +2674,7 @@ async fn aliases_create(
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
-    require_admin(&p)?;
+    require_permission(&p, "domain")?;
     let id = locate_domain(&state, &p, &domain).await?;
     let path = format!("/api/mail/domains/{id}/aliases");
     Ok(Json(backend_call(&state, &p, Method::POST, &path, Some(body)).await?))
@@ -2514,7 +2687,7 @@ async fn alias_delete(
     Path((domain, alias_id)): Path<(String, String)>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
-    require_admin(&p)?;
+    require_permission(&p, "domain")?;
     let domain_id = locate_domain(&state, &p, &domain).await?;
     let path = format!("/api/mail/domains/{domain_id}/aliases/{alias_id}");
     Ok(Json(backend_call(&state, &p, Method::DELETE, &path, None).await?))
@@ -2526,7 +2699,7 @@ async fn queue_list(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
-    require_admin(&p)?;
+    require_permission(&p, "domain")?;
     Ok(Json(backend_call(&state, &p, Method::GET, "/api/mail/queue", None).await?))
 }
 
@@ -2536,7 +2709,7 @@ async fn queue_flush(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
-    require_admin(&p)?;
+    require_permission(&p, "domain")?;
     Ok(Json(backend_call(&state, &p, Method::POST, "/api/mail/queue/flush", None).await?))
 }
 
@@ -2552,7 +2725,7 @@ async fn queue_delete(
     Query(q): Query<QueueIdQuery>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
-    require_admin(&p)?;
+    require_permission(&p, "domain")?;
     let path = format!("/api/mail/queue/{}", q.id);
     Ok(Json(backend_call(&state, &p, Method::DELETE, &path, None).await?))
 }
@@ -2961,7 +3134,31 @@ async fn main() {
         .timeout(Duration::from_secs(30))
         .build()
         .unwrap_or_default();
-    let state = AppState { cfg, http };
+
+    // The panel's database, where mail-API tokens and their permissions live.
+    // A pool that cannot be built is not fatal: the daemon still starts and the
+    // legacy Roundcube-token path still works, so a mail host whose Postgres is
+    // down can still send. A *failed lookup* at request time is fatal (see
+    // `principal`), so a reachable pool that goes away refuses requests rather
+    // than silently narrowing them.
+    let pg = match &cfg.database_url {
+        Some(url) if !url.trim().is_empty() => {
+            match sqlx::postgres::PgPoolOptions::new()
+                .max_connections(5)
+                .acquire_timeout(Duration::from_secs(5))
+                .connect_lazy(url)
+            {
+                Ok(pool) => Some(pool),
+                Err(e) => {
+                    tracing::error!("could not configure the panel database pool: {e}");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+
+    let state = AppState { cfg, http, pg };
 
     let app = Router::new()
         .route("/health", get(health))
@@ -3388,5 +3585,30 @@ mod tests {
         assert_eq!(row.message.get("folder").and_then(|v| v.as_str()), Some("Sent"));
         assert_eq!(row.uid, 7);
         assert_eq!(row.size, 42);
+    }
+
+    /// A token only ever holds the intersection of what it was granted and what
+    /// its mailbox is allowed now — this is the rule that makes a role change
+    /// take effect on tokens already handed out, so it is pinned directly.
+    #[test]
+    fn a_token_is_capped_by_its_mailbox() {
+        let keys = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // Granted `domain` and `me`, mailbox still allowed both.
+        let p = intersect_token_permissions(&keys(&["me", "domain"]), &keys(&["me", "domain"]));
+        assert!(p.has("me") && p.has("domain"));
+
+        // The mailbox was moved back to `me`: the token loses `domain` at once,
+        // with no need to find and revoke it.
+        let p = intersect_token_permissions(&keys(&["me", "domain"]), &keys(&["me"]));
+        assert!(p.has("me") && !p.has("domain"));
+
+        // A token may be narrower than its mailbox, and stays that way.
+        let p = intersect_token_permissions(&keys(&["me"]), &keys(&["me", "domain"]));
+        assert!(p.has("me") && !p.has("domain"));
+
+        // An empty grant is not a wildcard.
+        let p = intersect_token_permissions(&keys(&[]), &keys(&["me", "domain"]));
+        assert!(!p.has("me") && !p.has("domain"));
     }
 }

@@ -1,6 +1,6 @@
 # API Reference
 
-DockPanel exposes 859 REST endpoints (555 backend + 304 agent) across 50+ categories — the figure derived from the two routers in `FEATURES.md` §Verified Metrics, which owns it. The tables below document the commonly used subset, not every route. All endpoints except `/api/health`, `/api/branding`, `/api/auth/setup-status`, and `/api/auth/login` require authentication.
+DockPanel exposes 868 REST endpoints (564 backend + 304 agent) across 50+ categories — the figure derived from the two routers in `FEATURES.md` §Verified Metrics, which owns it. The tables below document the commonly used subset, not every route. All endpoints except `/api/health`, `/api/branding`, `/api/auth/setup-status`, and `/api/auth/login` require authentication.
 
 ## Authentication
 
@@ -536,7 +536,7 @@ Add a DNS record.
 
 ---
 
-## Mail (39 endpoints)
+## Mail (48 endpoints)
 
 ### `POST /api/mail/install`
 Install Postfix + Dovecot + OpenDKIM. **Admin only.**
@@ -562,6 +562,29 @@ Add a mail domain.
 | Storage | GET `/api/mail/storage` |
 | Backup | POST `/api/mail/backup`, GET `backups`, POST `restore` |
 | Reputation | GET `/api/mail/blacklist-check` |
+| Mail API tokens | `/api/mail/api/tokens`, `/api/mail/api/tokens/{id}`, `rotate` — minted here, not in Roundcube |
+| Mail API access | `/api/mail/api/roles`, `/api/mail/api/grants`, `/api/mail/api/grants/{email}`, `/api/mail/api/permissions` |
+| Webmail token list | GET `/api/mail/webmail/tokens` — called by the webmail tab with its scoped key |
+
+### Mail API tokens and permissions
+
+Mail-API tokens are minted by the panel and stored (hashed) in `mail_api_tokens`. Every
+token carries its own subset of a two-entry permission catalog — `me` (`/v1/me/*`,
+`/v1/send`) and `domain` (`/v1/domains/*`, `/v1/queue`) — and the daemon intersects it on
+every request with what the mailbox is currently allowed, so revoking a permission
+downgrades tokens already handed out.
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/api/mail/api/permissions` | The fixed catalog |
+| GET/POST | `/api/mail/api/roles` | List roles / create a custom role |
+| PUT/DELETE | `/api/mail/api/roles/{id}` | Edit / delete (built-ins refuse both) |
+| GET | `/api/mail/api/grants` | Every per-mailbox assignment |
+| GET/PUT/DELETE | `/api/mail/api/grants/{email}` | Read / assign (role + extras) / reset to default |
+| GET/POST | `/api/mail/api/tokens` | List metadata / mint (returns the secret once) |
+| DELETE | `/api/mail/api/tokens/{id}` | Revoke |
+| POST | `/api/mail/api/tokens/{id}/rotate` | Replace the secret, keeping the grant |
+| GET | `/api/mail/webmail/tokens` | Read-only list for the webmail tab, scoped by key |
 
 **Account passwords** are hashed with **Argon2id** and stored in Dovecot's
 `{ARGON2ID}` scheme (since v2.13.1). Accounts created before v2.13.1 were stored

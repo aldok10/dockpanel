@@ -17,6 +17,7 @@ serde_json = "1"
 jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "hostname"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }
 # Talks to the panel backend over loopback only, so no TLS is needed.
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 sha2 = "0.10"

@@ -6,6 +6,7 @@ import ProvisionLog from "../components/ProvisionLog";
 import { PrereqCallout, type PrereqResult } from "../components/Prerequisite";
 import { InfoTip } from "../components/FieldHelp";
 import ConfirmDialog from "../components/ConfirmDialog";
+import MailApiPanel from "../components/MailApiPanel";
 
 interface MailServiceState {
   installed: boolean;
@@ -660,9 +661,11 @@ export default function Mail() {
           )}
 
           {/* Webmail (Roundcube) + Mail API — ONE card, because they are one
-              surface: the API's tokens are per-mailbox and are minted inside
-              Roundcube (Settings → Mail API), so splitting them put a "manage
-              tokens" button on one card that only pointed at the other. */}
+              surface: the API is the webmail's mailbox accounts, reached by an
+              API instead of a browser. The token *minting* surface has since
+              moved to the panel (the Mail API card below), which is why this
+              card now reports status and links, and no longer claims to be
+              where tokens come from. */}
           {(webmail || mailApi) && (
             <div className="bg-dark-800 rounded-lg border border-dark-500 p-3 elevation-1">
               <div className="flex items-center justify-between mb-2">
@@ -715,9 +718,11 @@ export default function Mail() {
                       </div>
                     )}
                   </div>
-                  {/* Per-mailbox identities are what the API authenticates; the
-                      minting surface lives in Roundcube, not here. */}
-                  <p className="text-[11px] text-dark-400 truncate">Tokens: Webmail → Settings → Mail API.</p>
+                  {/* Tokens are minted on this page now, not in Roundcube:
+                      the panel is where the role that bounds them is set, so
+                      splitting the two would hide the connection. The webmail
+                      tab only lists. */}
+                  <p className="text-[11px] text-dark-400 truncate">Tokens and permissions: the Mail API card below.</p>
                 </div>
               )}
             </div>
@@ -829,6 +834,17 @@ export default function Mail() {
               </>
             )}
           </div>
+        </div>
+      )}
+
+      {/* Mail API — tokens, roles and per-mailbox permissions. Tokens used to
+          be minted inside Roundcube; they are minted here now, so the grant
+          that bounds a token and the token that carries it live on one screen.
+          AdminUser-only on the backend, and full width because it is a table,
+          not a status tile. */}
+      {isAdmin && mailStatus?.installed && (
+        <div className="mb-6">
+          <MailApiPanel onMessage={setMessage} />
         </div>
       )}
 
