@@ -127,6 +127,11 @@ export const navGroups: NavGroup[] = [
     items: [
       { to: "/servers", label: "Servers", iconName: "servers", adminOnly: true },
       { to: "/users", label: "Users", iconName: "users", adminOnly: true },
+      // The SSH screen for the Linux logins the panel itself created: list them,
+      // lock/unlock their passwords, install the authorized keys that let someone
+      // in without one, and reach the daemon's own settings. Its own page, not a
+      // tab of Users, because keys and daemon state are not user attributes.
+      { to: "/ssh", label: "SSH", iconName: "terminal", adminOnly: true },
       { to: "/container-policies", label: "Container Policies", iconName: "servers", adminOnly: true },
       { to: "/integrations", label: "Integrations", iconName: "extensions", adminOnly: true },
       { to: "/secrets", label: "Secrets", iconName: "secrets", adminOnly: true },

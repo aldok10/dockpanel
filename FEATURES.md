@@ -85,6 +85,7 @@
 | **Reseller Accounts** | Admin→Reseller→User hierarchy, quotas, server allocation | `routes/resellers.rs`, `reseller_dashboard.rs` | `Resellers.tsx` (admin), `ResellerDashboard.tsx`, `ResellerUsers.tsx` | `reseller_profiles`, `reseller_servers` |
 | **White-Label** | Per-reseller logo, panel name, accent color, hide branding | `routes/settings.rs` (branding endpoint) | (in CommandLayout, Login) | `reseller_profiles` |
 | **Users** | CRUD, role assignment (admin/user/client; reseller is set in Resellers), optional per-user Linux/SSH login account on the panel host | `routes/users.rs` | (in Settings) | `users` |
+| **SSH** | The logins the panel created on this server: list, lock/unlock the SSH password, reset it, remove just the login, per-account authorized keys, plus the daemon's own settings (port, password auth, root login) and root's keys | `routes/ssh.rs` | `Ssh.tsx` | `users` (`os_username`, `os_locked`) |
 | **API Keys** | Key CRUD and rotation. `dp_`-prefixed keys authenticate requests since v2.221.0; see §Withdrawn Claims for the `dpiac_`/`dpx_` families, which still do not | `routes/api_keys.rs`, `auth.rs` | (in Settings) | `api_keys` |
 | **Extensions** | Webhook integrations, HMAC-signed events | `routes/extensions.rs` | `Extensions.tsx` | `extensions`, `extension_events` |
 | **Activity Log** | Full audit trail of all mutations | `routes/activity.rs` | (in Logs) | `activity_logs` |
@@ -242,10 +243,10 @@ honest:
 | Panel services RAM (agent + API) | ~49 MB | measured | 2026-07-27 |
 | Full-stack RAM (with bundled PostgreSQL) | ~109 MB | measured | 2026-07-27 |
 | App templates | 147 | derived | every commit |
-| HTTP routes | 846 (546 backend + 300 agent) | derived | every commit |
-| Regression-pin assertions | 4704 (143 suites) | derived | every commit |
-| Frontend pages | 52 | derived | every commit |
-| DB migrations | 139 | derived | every commit |
+| HTTP routes | 853 (551 backend + 302 agent) | derived | every commit |
+| Regression-pin assertions | 4746 (144 suites) | derived | every commit |
+| Frontend pages | 53 | derived | every commit |
+| DB migrations | 140 | derived | every commit |
 | Supervised background services | 17 | derived | every commit |
 
 Five of these were wrong when the register was built (s272), some by a factor of

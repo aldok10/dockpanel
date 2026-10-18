@@ -1,6 +1,6 @@
 # API Reference
 
-DockPanel exposes 846 REST endpoints (546 backend + 300 agent) across 50+ categories — the figure derived from the two routers in `FEATURES.md` §Verified Metrics, which owns it. The tables below document the commonly used subset, not every route. All endpoints except `/api/health`, `/api/branding`, `/api/auth/setup-status`, and `/api/auth/login` require authentication.
+DockPanel exposes 853 REST endpoints (551 backend + 302 agent) across 50+ categories — the figure derived from the two routers in `FEATURES.md` §Verified Metrics, which owns it. The tables below document the commonly used subset, not every route. All endpoints except `/api/health`, `/api/branding`, `/api/auth/setup-status`, and `/api/auth/login` require authentication.
 
 ## Authentication
 
@@ -757,6 +757,13 @@ leaves the stored value unchanged — there is no way to clear one through this 
 | GET | `/api/dashboard/docker` | Docker summary |
 | GET/POST | `/api/ssh-keys` | SSH key management |
 | DELETE | `/api/ssh-keys/{fingerprint}` | Remove SSH key |
+| GET | `/api/ssh/accounts` | List the Linux/SSH logins the panel created |
+| POST | `/api/ssh/accounts` | Give an existing panel user an SSH login |
+| DELETE | `/api/ssh/accounts/{id}` | Remove an SSH login (the panel account stays) |
+| POST | `/api/ssh/accounts/{id}/state` | Lock or unlock an SSH password |
+| GET | `/api/ssh/accounts/{id}/keys` | List an SSH login's authorized keys |
+| POST | `/api/ssh/accounts/{id}/keys` | Install an authorized key |
+| DELETE | `/api/ssh/accounts/{id}/keys/{fingerprint}` | Remove an authorized key |
 | GET/POST/POST | `/api/auto-updates/*` | Auto-update management |
 | GET/POST | `/api/backup-destinations` | Remote backup targets |
 | POST | `/api/traefik/install` | Install Traefik |

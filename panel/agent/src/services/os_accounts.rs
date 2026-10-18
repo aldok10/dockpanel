@@ -26,6 +26,8 @@
 //! created.
 
 use crate::safe_cmd::safe_command_unsandboxed;
+use base64::Engine as _;
+use sha2::{Digest, Sha256};
 use sha_crypt::{PasswordHasher, ShaCrypt};
 
 /// Longest login name Linux accepts in practice (`useradd`'s own cap is 32).
@@ -248,6 +250,16 @@ pub async fn deprovision(username: &str) -> Result<(), String> {
         return Err(format!("refusing to delete invalid login name '{username}'"));
     }
 
+    // Idempotent: `userdel` refuses a name that is not there, and the SSH
+    // screen's "remove this login" treats that non-zero exit as a failure it
+    // must not paper over. But an account already gone is the state we were
+    // asked to reach, so it is success — otherwise a login deleted on the box
+    // out-of-band could never be cleared from the panel.
+    if !account_exists(username).await {
+        tracing::info!("OS login account '{username}' was already absent");
+        return Ok(());
+    }
+
     let _ = safe_command_unsandboxed("pkill", &[]).args(["-9", "-u", username]).output().await;
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
@@ -265,6 +277,325 @@ pub async fn deprovision(username: &str) -> Result<(), String> {
 
     tracing::info!("OS login account removed: {username}");
     Ok(())
+}
+
+// ── Authorized keys ─────────────────────────────────────────────────────
+//
+// cPanel's SSH screen is mostly this: the public keys that let someone in
+// without typing the password the panel also holds. They live in the account's
+// own `~/.ssh/authorized_keys`, which sshd reads as that user — so, exactly like
+// the account operations above, the file writes must escape the agent sandbox:
+// `ProtectHome=yes` hides `/home` entirely inside the unit's namespace, and a
+// sandboxed `install` would answer EROFS. Reads go through `cat` and writes are
+// staged under `/var/lib/dockpanel` (which IS in `ReadWritePaths`) and then
+// installed outside the namespace with the right owner and mode.
+
+/// Why an SSH-key operation failed, so a caller can pick a status code.
+///
+/// Split deliberately rather than returned as a bare `String`: the three key
+/// routes have both a "the operator typed something wrong" failure (a bad name,
+/// a malformed key, an account with no key file) and a "the box failed" one
+/// (unreadable `/etc/passwd`, a failed `install`), and the panel turns the first
+/// into a 400 the operator can read and the second into a 500 it can only
+/// reference. Collapsing them is how a typo would reach a human as an incident
+/// id.
+#[derive(Debug, PartialEq)]
+pub enum KeyError {
+    /// The caller's mistake. Answers 400.
+    Client(String),
+    /// The box failed. Answers 500.
+    Server(String),
+}
+
+impl std::fmt::Display for KeyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KeyError::Client(m) | KeyError::Server(m) => f.write_str(m),
+        }
+    }
+}
+
+/// One key in an `authorized_keys` file, shaped for the panel to render.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct AuthorizedKey {
+    /// The key algorithm, e.g. `ssh-ed25519`.
+    pub key_type: String,
+    /// OpenSSH's `SHA256:…` fingerprint, the value the remove route matches on.
+    pub fingerprint: String,
+    /// Everything after the key body, treating the whole tail as the comment — a
+    /// comment can contain spaces, and the root-key reader already joins it.
+    pub comment: String,
+    /// A short, non-sensitive preview for the list.
+    pub preview: String,
+}
+
+/// OpenSSH's `SHA256:` fingerprint of a key's base64 body.
+///
+/// The literal format the `ssh-keygen -l` line prints, and the same value
+/// `routes/server_utils.rs` computes for root's keys, so a fingerprint shown on
+/// either screen is the one a person sees when they run `ssh-keygen`.
+fn fingerprint_of(key_data: &str) -> String {
+    // OpenSSH strips base64 padding from the key body, so try the padded engine
+    // and fall back to the unpadded one. Using the padded engine alone leaves an
+    // unpadded body undecoded, and hashing an EMPTY buffer still yields a
+    // well-formed `SHA256:…` — a wrong fingerprint that looks right.
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(key_data)
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(key_data))
+        .unwrap_or_default();
+    let hash = Sha256::digest(&decoded);
+    format!(
+        "SHA256:{}",
+        base64::engine::general_purpose::STANDARD
+            .encode(&hash)
+            .trim_end_matches('=')
+    )
+}
+
+/// True for a blank line or a comment — skipped by both the reader and the
+/// remover, so a `#`-commented key survives a removal it does not match.
+fn is_ignored_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.is_empty() || trimmed.starts_with('#')
+}
+
+/// Parse the non-comment lines of an `authorized_keys` file.
+///
+/// Pure, so the panel's view of a key file can be unit-tested without a box. A
+/// line with fewer than two whitespace-separated fields is not a key and is
+/// dropped rather than rendered as a broken row.
+pub fn parse_authorized_keys(content: &str) -> Vec<AuthorizedKey> {
+    content
+        .lines()
+        .filter(|l| !is_ignored_line(l))
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let key_type = parts.next()?.to_string();
+            let key_data = parts.next()?.to_string();
+            let comment = parts.collect::<Vec<_>>().join(" ");
+            Some(AuthorizedKey {
+                fingerprint: fingerprint_of(&key_data),
+                preview: format!("{} {}…", key_type, &key_data[..key_data.len().min(20)]),
+                key_type,
+                comment,
+            })
+        })
+        .collect()
+}
+
+/// True when `key` is one line of a public key we are willing to install.
+///
+/// Deliberately strict, and the same shape `routes/server_utils.rs` accepts for
+/// root's keys: a single line, a known algorithm prefix, a body of at least 16
+/// base64 characters, and no `authorized_keys` options. The options refusal is
+/// load-bearing — a `command="…"` prefix handed to an account whose keys we do
+/// not otherwise police is a way to pin that account to one program, and these
+/// keys are meant to be a plain login.
+pub fn validate_key(key: &str) -> Result<(), String> {
+    let key = key.trim();
+    if key.contains('\n') || key.contains('\r') || key.contains('\0') {
+        return Err("SSH key must be a single line".to_string());
+    }
+    if !key.starts_with("ssh-") && !key.starts_with("ecdsa-") && !key.starts_with("sk-") {
+        return Err("Invalid SSH key format".to_string());
+    }
+    let parts: Vec<&str> = key.split_whitespace().collect();
+    if parts.len() < 2 || parts[1].len() < 16 {
+        return Err("Invalid SSH key: missing key data".to_string());
+    }
+    for forbidden in ["command=", "from=", "restrict", "no-pty", "permitopen"] {
+        if key.contains(forbidden) {
+            return Err("SSH key options are not allowed".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// The account's home directory, from its `/etc/passwd` entry (field 6).
+///
+/// Not assumed to be `/home/<name>`: `useradd`'s base directory comes from
+/// `/etc/default/useradd` and `login.defs`, and a wrong guess would write a key
+/// file into a directory sshd never reads. `/etc` is readable under
+/// `ProtectSystem=strict`, and this is a read, so it needs no escape hatch.
+async fn home_dir(username: &str) -> Result<String, KeyError> {
+    let passwd = tokio::fs::read_to_string("/etc/passwd")
+        .await
+        .map_err(|e| KeyError::Server(format!("could not read /etc/passwd: {e}")))?;
+    for line in passwd.lines() {
+        let mut fields = line.split(':');
+        if fields.next() == Some(username) {
+            // After the name: password, uid, gid, gecos, then home. `nth(4)`
+            // consumes the four between and returns the home field.
+            if let Some(home) = fields.nth(4)
+                && home.starts_with('/')
+            {
+                return Ok(home.to_string());
+            }
+        }
+    }
+    Err(KeyError::Client(format!(
+        "no account named '{username}' exists on this server"
+    )))
+}
+
+/// The absolute path of the account's `authorized_keys`.
+async fn authorized_keys_path(username: &str) -> Result<String, KeyError> {
+    let home = home_dir(username).await?;
+    Ok(format!("{home}/.ssh/authorized_keys"))
+}
+
+/// Read a file from OUTSIDE the agent's sandbox, distinguishing "absent" from
+/// "unreadable". `Ok(None)` means the file genuinely does not exist.
+async fn read_file_unsandboxed(path: &str) -> Result<Option<String>, KeyError> {
+    let exists = safe_command_unsandboxed("test", &[])
+        .args(["-e", path])
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !exists {
+        return Ok(None);
+    }
+    let out = safe_command_unsandboxed("cat", &[])
+        .arg(path)
+        .output()
+        .await
+        .map_err(|e| KeyError::Server(format!("could not read {path}: {e}")))?;
+    if !out.status.success() {
+        return Err(KeyError::Server(format!(
+            "could not read {path}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(Some(String::from_utf8_lossy(&out.stdout).into_owned()))
+}
+
+/// Write an `authorized_keys` file, staging inside the sandbox and installing
+/// outside it, owned by the account and mode 600.
+async fn write_file_unsandboxed(
+    username: &str,
+    path: &str,
+    content: &str,
+) -> Result<(), KeyError> {
+    let staging = format!("/var/lib/dockpanel/.ssh_keys.{}", uuid::Uuid::new_v4());
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&staging)
+            .map_err(|e| KeyError::Server(format!("could not stage the key file: {e}")))?;
+        f.write_all(content.as_bytes())
+            .map_err(|e| KeyError::Server(format!("could not stage the key file: {e}")))?;
+    }
+
+    let result = async {
+        let Some((dir, _)) = path.rsplit_once('/') else {
+            return Err(KeyError::Server(format!(
+                "refusing to write a key file outside a directory: {path}"
+            )));
+        };
+        // `.ssh` must be 700 and owned by the account — sshd's StrictModes
+        // refuses a directory anyone but the user can write. `install -D` would
+        // create it 0755, so the directory is made explicitly first.
+        let dir_out = safe_command_unsandboxed("install", &[])
+            .args(["-d", "-m", "700", "-o", username, dir])
+            .output()
+            .await
+            .map_err(|e| KeyError::Server(format!("could not create {dir}: {e}")))?;
+        if !dir_out.status.success() {
+            return Err(KeyError::Server(format!(
+                "could not create {dir}: {}",
+                String::from_utf8_lossy(&dir_out.stderr).trim()
+            )));
+        }
+        let file_out = safe_command_unsandboxed("install", &[])
+            .args(["-m", "600", "-o", username, &staging, path])
+            .output()
+            .await
+            .map_err(|e| KeyError::Server(format!("could not install {path}: {e}")))?;
+        if !file_out.status.success() {
+            return Err(KeyError::Server(format!(
+                "could not install {path}: {}",
+                String::from_utf8_lossy(&file_out.stderr).trim()
+            )));
+        }
+        Ok(())
+    }
+    .await;
+
+    let _ = std::fs::remove_file(&staging);
+    result
+}
+
+/// List the public keys installed for `username`.
+pub async fn list_keys(username: &str) -> Result<Vec<AuthorizedKey>, KeyError> {
+    if !is_valid_username(username) {
+        return Err(KeyError::Client(format!(
+            "refusing to read keys for invalid login name '{username}'"
+        )));
+    }
+    let path = authorized_keys_path(username).await?;
+    let content = read_file_unsandboxed(&path).await?.unwrap_or_default();
+    Ok(parse_authorized_keys(&content))
+}
+
+/// Install one public key for `username`.
+pub async fn add_key(username: &str, key: &str) -> Result<(), KeyError> {
+    if !is_valid_username(username) {
+        return Err(KeyError::Client(format!(
+            "refusing to add a key for invalid login name '{username}'"
+        )));
+    }
+    let key = key.trim();
+    validate_key(key).map_err(KeyError::Client)?;
+    let path = authorized_keys_path(username).await?;
+    let mut content = read_file_unsandboxed(&path).await?.unwrap_or_default();
+    if content.lines().any(|line| line.trim() == key) {
+        return Err(KeyError::Client(
+            "This key is already installed for this account".to_string(),
+        ));
+    }
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str(key);
+    content.push('\n');
+    write_file_unsandboxed(username, &path, &content).await
+}
+
+/// Remove the key whose fingerprint is `fingerprint` from `username`.
+pub async fn remove_key(username: &str, fingerprint: &str) -> Result<(), KeyError> {
+    if !is_valid_username(username) {
+        return Err(KeyError::Client(format!(
+            "refusing to remove a key for invalid login name '{username}'"
+        )));
+    }
+    let path = authorized_keys_path(username).await?;
+    let content = read_file_unsandboxed(&path)
+        .await?
+        .ok_or_else(|| KeyError::Client("this account has no SSH keys".to_string()))?;
+
+    let new_content: String = content
+        .lines()
+        .filter(|line| {
+            if is_ignored_line(line) {
+                return true;
+            }
+            let mut parts = line.split_whitespace();
+            let _key_type = parts.next();
+            match parts.next() {
+                Some(data) => fingerprint_of(data) != fingerprint,
+                None => true,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    write_file_unsandboxed(username, &path, &format!("{new_content}\n")).await
 }
 
 #[cfg(test)]
@@ -302,5 +633,61 @@ mod tests {
         for name in ["vmail", "dockpanel"] {
             assert!(RESERVED_USERNAMES.contains(&name), "{name} dropped off the reserved list");
         }
+    }
+
+    /// A canonical, unpadded base64 key body — the exact shape OpenSSH writes.
+    const ED_BODY: &str =
+        "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEy";
+
+    #[test]
+    fn parses_only_real_key_lines() {
+        let content = format!(
+            "# a comment, not a key\n\nssh-ed25519 {ED_BODY} alice@laptop\nssh-ed25519 short body\n"
+        );
+        let keys = parse_authorized_keys(&content);
+        assert_eq!(keys.len(), 2, "comments and blanks are not keys");
+        assert_eq!(keys[0].key_type, "ssh-ed25519");
+        assert_eq!(keys[0].comment, "alice@laptop");
+        // A comment may contain spaces; the whole tail is one comment, not a
+        // third field dropped on the floor.
+        let spaced = parse_authorized_keys(&format!("ssh-ed25519 {ED_BODY} a b c\n"));
+        assert_eq!(spaced[0].comment, "a b c");
+    }
+
+    #[test]
+    fn fingerprints_match_openssh() {
+        // The literal `ssh-keygen -l` value for this body. A padded-only base64
+        // decoder leaves an unpadded body (as OpenSSH writes it) undecoded and
+        // hashes an EMPTY buffer — still a well-formed `SHA256:…`, so only a
+        // known-answer test catches it.
+        assert_eq!(
+            fingerprint_of(ED_BODY),
+            "SHA256:MwmEfO5FS0+Z3P6P3FURp7oWjOC25WhO9z+QMNAJuLU"
+        );
+        // A body whose length is 3 mod 4 exercises the other padding arm.
+        let rsa = "YW4gc3NoLWVkMjU1MTkga2V5IGJvZHkgb2YgZXhhY3RseSBmaWZ0eSBvbmUgYnl0ZXMhISE";
+        assert_eq!(
+            fingerprint_of(rsa),
+            "SHA256:1B2uyHlgB2nw5S3HULZrk4GV7xHErU/YYuhH18GayJo"
+        );
+        // And never the fingerprint of the empty buffer, which is what the
+        // undecoded path would produce.
+        assert_ne!(fingerprint_of(ED_BODY), fingerprint_of(""));
+    }
+
+    #[test]
+    fn accepts_a_plain_public_key_and_refuses_the_rest() {
+        let ok = format!("ssh-ed25519 {ED_BODY} a@b");
+        assert!(validate_key(&ok).is_ok());
+        // Unknown algorithm prefix.
+        assert!(validate_key(&format!("wat {ED_BODY}")).is_err());
+        // Missing body / too short.
+        assert!(validate_key("ssh-ed25519 short").is_err());
+        assert!(validate_key("ssh-ed25519").is_err());
+        // Newlines would let one request append several keys.
+        assert!(validate_key(&format!("ssh-ed25519 {ED_BODY}\nssh-ed25519 x")).is_err());
+        // authorized_keys options are how a login is pinned to one program.
+        assert!(validate_key(&format!("command=\"/bin/false\" ssh-ed25519 {ED_BODY}")).is_err());
+        assert!(validate_key(&format!("restrict ssh-ed25519 {ED_BODY}")).is_err());
     }
 }

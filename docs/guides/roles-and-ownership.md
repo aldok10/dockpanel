@@ -324,10 +324,39 @@ use for the panel.
   is changed — an administrator reset, the user's own *Account* change, a
   forgotten-password reset, and a reseller resetting a tenant. Rotating one
   rotates the other; the old password stops working for SSH too.
-- **Suspend and delete.** Suspending an account locks its password (`usermod -L`;
-  an SSH key the person installed keeps working, so it is "no new password
-  logins", not "signed out"), un-suspending unlocks it, and deleting the panel
-  account removes the Linux account and its home directory.
+- **Suspend, lock and delete.** Suspending an account locks its password
+  (`usermod -L`; an SSH key the person installed keeps working, so it is "no new
+  password logins", not "signed out"), and un-suspending restores it — but the
+  SSH screen also carries its own lock, independent of the panel account, so you
+  can shut off a shell while leaving the person signed in to the panel. Deleting
+  the panel account removes the Linux account and its home directory.
+
+### The SSH screen
+
+The **SSH** screen (Admin → SSH) is the front door for these logins once they
+exist. It lists every panel account that has an SSH username and, for each, lets
+you:
+
+- **Enable or disable password logins** — a lock independent of panel
+  suspension. A suspended account is locked regardless, and un-suspending only
+  restores the explicit lock, so a suspend/unsuspend cycle cannot silently
+  re-open SSH you deliberately shut.
+- **Reset the password** — the same one-credential rotation described above.
+- **Manage authorized keys** — install or remove the public keys that let
+  someone in without a password. The file is written to that account's own
+  `~/.ssh/authorized_keys`, owned by the account and mode 600.
+- **Remove the login** — takes the Linux account off the box and leaves the panel
+  account in place, the reverse of adding an SSH username.
+
+Adding a login to an account that is panel-only is the **Add SSH Login** button:
+pick a user, give it a login name and a password. The password also becomes that
+panel user's password, because they are one credential.
+
+The same screen shows the daemon's own settings — port, password authentication
+and root login — and root's `authorized_keys`, so key management lives in one
+place. Note that turning password authentication off shuts every password login
+listed above, including the ones the panel created; key-based logins keep
+working.
 
 This is a feature of the **panel host** — the machine the panel itself runs on.
 It does not reach a member of a server fleet, because the panel does not manage

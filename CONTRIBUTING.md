@@ -63,11 +63,11 @@ panel/
 ├── backend/     # Rust — API server, auth, DB, multi-server dispatch
 │   ├── src/routes/     # REST endpoints (62 files)
 │   ├── src/services/   # Background tasks (36 files)
-│   └── migrations/     # SQL migrations (139 files)
+│   └── migrations/     # SQL migrations (140 files)
 ├── cli/         # Rust — CLI tool (clap-based)
 │   └── src/commands/   # Subcommand handlers (11 files)
 └── frontend/    # React 19 + TypeScript + Tailwind 4
-    └── src/pages/      # Lazy-loaded page components (52 files)
+    └── src/pages/      # Lazy-loaded page components (53 files)
 ```
 
 **Agent** handles host-level operations: Docker, Nginx config, SSL certificates, file system, terminal (PTY), backups. Runs as root. Communicates via Unix socket (local) or HTTPS (remote servers).

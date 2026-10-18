@@ -114,6 +114,7 @@ const SecretsManager = lazyRetry(() => import("./pages/SecretsManager"));
 const Notifications = lazyRetry(() => import("./pages/Notifications"));
 const Integrations = lazyRetry(() => import("./pages/Integrations"));
 const Users = lazyRetry(() => import("./pages/Users"));
+const Ssh = lazyRetry(() => import("./pages/Ssh"));
 const ContainerPolicies = lazyRetry(() => import("./pages/ContainerPolicies"));
 const System = lazyRetry(() => import("./pages/System"));
 const Telemetry = lazyRetry(() => import("./pages/Telemetry"));
@@ -165,6 +166,7 @@ createRoot(document.getElementById("root")!).render(
               <Route path="/reseller/users" element={<ResellerUsers />} />
               <Route path="/resellers" element={<Resellers />} />
               <Route path="/users" element={<Users />} />
+              <Route path="/ssh" element={<Ssh />} />
               <Route path="/container-policies" element={<ContainerPolicies />} />
               <Route path="/backup-orchestrator" element={<BackupOrchestrator />} />
               {/* Incidents live in Monitoring's Status Page tab, so land there

@@ -43,6 +43,7 @@ pub mod ssl;
 pub mod system;
 pub mod terminal;
 pub mod users;
+pub mod ssh;
 pub mod reseller_dashboard;
 pub mod migration;
 pub mod resellers;
@@ -1113,6 +1114,15 @@ pub fn router() -> Router<AppState> {
         .route("/api/users/{id}/toggle-suspend", post(users::toggle_suspend))
         .route("/api/users/{id}/reset-password", post(users::reset_password))
         .route("/api/users/{id}/reset-2fa", post(users::reset_2fa))
+        // SSH login accounts (admin) — the screen for the Linux logins the panel
+        // made. Accounts are listed here rather than filtered out of /api/users
+        // so the list can carry `os_locked`, which the users surface has no need
+        // of but the SSH screen renders.
+        .route("/api/ssh/accounts", get(ssh::list_accounts).post(ssh::create_account))
+        .route("/api/ssh/accounts/{id}", delete(ssh::remove_account))
+        .route("/api/ssh/accounts/{id}/state", post(ssh::set_state))
+        .route("/api/ssh/accounts/{id}/keys", get(ssh::list_keys).post(ssh::add_key))
+        .route("/api/ssh/accounts/{id}/keys/{fingerprint}", delete(ssh::remove_key))
         // Sites
         .route("/api/sites", get(sites::list).post(sites::create))
         // Read-only, admin-only, and the ONLY site read that looks past

@@ -14,6 +14,10 @@ pub struct User {
     /// Linux login name of this user's SSH account on the panel host, or `None`
     /// for a panel-only account. Owned by `routes::users`; see the module there.
     pub os_username: Option<String>,
+    /// The administrator's explicit lock on this user's SSH password, set from
+    /// the SSH screen and independent of panel suspension. Owned by
+    /// `routes::ssh`; the effective lock is `role = 'suspended' OR os_locked`.
+    pub os_locked: bool,
     #[serde(skip_serializing)]
     pub email_token: Option<String>,
     #[serde(skip_serializing)]

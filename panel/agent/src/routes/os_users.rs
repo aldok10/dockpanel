@@ -2,7 +2,7 @@
 //! route module here: validation and response shaping only, with the real work
 //! in `services::os_accounts`.
 
-use axum::{extract::Path, http::StatusCode, routing::{delete, post}, Json, Router};
+use axum::{extract::Path, http::StatusCode, routing::{delete, get, post}, Json, Router};
 use serde::Deserialize;
 
 use super::AppState;
@@ -12,6 +12,15 @@ type ApiErr = (StatusCode, Json<serde_json::Value>);
 
 fn err(status: StatusCode, msg: &str) -> ApiErr {
     (status, Json(serde_json::json!({ "error": msg })))
+}
+
+/// Map a key-service failure to a status: the caller's mistake is a 400 it can
+/// read, the box failing is a 500 it can only reference.
+fn key_err(e: os_accounts::KeyError) -> ApiErr {
+    match e {
+        os_accounts::KeyError::Client(m) => err(StatusCode::BAD_REQUEST, &m),
+        os_accounts::KeyError::Server(m) => err(StatusCode::INTERNAL_SERVER_ERROR, &m),
+    }
 }
 
 #[derive(Deserialize)]
@@ -88,10 +97,42 @@ async fn remove(Path(username): Path<String>) -> Result<Json<serde_json::Value>,
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
+#[derive(Deserialize)]
+struct AddKeyRequest {
+    key: String,
+}
+
+/// GET /os-users/{username}/keys — the account's authorized_keys.
+async fn list_keys(Path(username): Path<String>) -> Result<Json<serde_json::Value>, ApiErr> {
+    let keys = os_accounts::list_keys(&username).await.map_err(key_err)?;
+    Ok(Json(serde_json::json!({ "keys": keys })))
+}
+
+/// POST /os-users/{username}/keys — install one public key.
+async fn add_key(
+    Path(username): Path<String>,
+    Json(body): Json<AddKeyRequest>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    os_accounts::add_key(&username, &body.key).await.map_err(key_err)?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// DELETE /os-users/{username}/keys/{fingerprint} — remove one key.
+async fn remove_key(
+    Path((username, fingerprint)): Path<(String, String)>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    os_accounts::remove_key(&username, &fingerprint)
+        .await
+        .map_err(key_err)?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/os-users/provision", post(provision))
         .route("/os-users/password", post(set_password))
         .route("/os-users/state", post(set_state))
         .route("/os-users/{username}", delete(remove))
+        .route("/os-users/{username}/keys", get(list_keys).post(add_key))
+        .route("/os-users/{username}/keys/{fingerprint}", delete(remove_key))
 }

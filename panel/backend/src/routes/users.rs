@@ -65,7 +65,7 @@ pub struct UserResponse {
 /// POSIX, 1-32 characters — so the panel can reject a bad name with a clear
 /// message before it ever reaches the agent. The authoritative check (is the
 /// name already taken on the box?) still happens at the agent.
-fn normalize_os_username(raw: &str) -> Result<Option<String>, ApiError> {
+pub(crate) fn normalize_os_username(raw: &str) -> Result<Option<String>, ApiError> {
     let name = raw.trim().to_ascii_lowercase();
     if name.is_empty() {
         return Ok(None);
@@ -93,7 +93,7 @@ fn normalize_os_username(raw: &str) -> Result<Option<String>, ApiError> {
 /// The `users` table's partial unique index is the backstop; this exists so the
 /// operator gets a sentence instead of a raw constraint violation. Case is not
 /// a concern because `normalize_os_username` has already lower-cased the value.
-async fn os_username_taken(
+pub(crate) async fn os_username_taken(
     db: &sqlx::PgPool,
     name: &str,
     exclude: Option<Uuid>,
@@ -204,7 +204,7 @@ const ASSIGNABLE_ROLES_MSG: &str = "Role must be one of: admin, reseller, user, 
 /// added"), and `534dc51`/v2.185.0 fixed a second-admin-visibility bug
 /// elsewhere in this arc. `list`/`create` are deliberately untouched: seeing
 /// the directory or minting a new account doesn't hand over an existing one.
-fn is_other_admin(target_role: &str, target_id: Uuid, caller_id: Uuid) -> bool {
+pub(crate) fn is_other_admin(target_role: &str, target_id: Uuid, caller_id: Uuid) -> bool {
     target_role == "admin" && target_id != caller_id
 }
 
@@ -605,7 +605,11 @@ pub async fn toggle_suspend(
     // The panel role has already changed by here, so a failure is reported with
     // that context rather than rolled back.
     if let Some(ref name) = user.os_username {
-        let locked = new_role == "suspended";
+        // Locked while suspended, and locked too if an administrator set the
+        // independent SSH-only lock on the SSH screen. Un-suspending restores
+        // that explicit lock rather than blindly unlocking, so a
+        // suspend/unsuspend cycle cannot re-open SSH that was deliberately shut.
+        let locked = new_role == "suspended" || user.os_locked;
         if let Err(e) = state
             .agents
             .local()
