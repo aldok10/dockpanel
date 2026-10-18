@@ -20,6 +20,12 @@
  * tokens found in it, granting them `me` and nothing more, so existing
  * integrations keep working while a mailbox moves to panel-minted tokens.
  *
+ * Layout note: the page is a table with two lines of context above it. The curl
+ * example is folded into a <details>, because the list is what a mailbox owner
+ * comes here for; the example is what they open once. Styles are structural and
+ * colourless (borders and spacing in rgba greys) so the page reads correctly in
+ * both of Roundcube's skins.
+ *
  * See panel/mailapi (Rust) for the API side and panel/backend for the tokens.
  */
 class dockpanel_mailapi extends rcube_plugin
@@ -124,17 +130,35 @@ class dockpanel_mailapi extends rcube_plugin
         }
 
         $out = '';
+        $out .= '<style>'
+            . '.mailapi-intro{margin:0 0 6px}'
+            . '.mailapi-endpoint{margin:0 0 8px;font-size:12px;opacity:.75}'
+            . '.mailapi-example{margin:0 0 14px}'
+            . '.mailapi-example summary{cursor:pointer;font-size:12px;opacity:.75}'
+            . '.mailapi-example summary:hover{opacity:1}'
+            . '.mailapi-example pre{overflow:auto;padding:10px;margin:8px 0 0;border-radius:6px;'
+            . 'background:rgba(127,127,127,.14);color:inherit}'
+            . '.mailapi-managed{border:1px solid rgba(127,127,127,.35);border-radius:6px;'
+            . 'padding:8px 10px;margin:0 0 14px;font-size:12px}'
+            . '.mailapi-managed p{margin:0}'
+            . '.mailapi-list-title{margin:0 0 4px}'
+            . '.mailapi-table{width:100%}'
+            . '.mailapi-table td,.mailapi-table th{vertical-align:top}'
+            . '.mailapi-nowrap{white-space:nowrap}'
+            . '.mailapi-legend{margin:8px 0 0;font-size:11px;opacity:.75}'
+            . '</style>';
+
         $out .= '<p class="mailapi-intro">' . rcube::Q($this->gettext('intro')) . '</p>';
 
-        $out .= '<p><strong>' . rcube::Q($this->gettext('endpoint')) . '</strong> '
+        $out .= '<p class="mailapi-endpoint">' . rcube::Q($this->gettext('endpoint')) . ' '
             . '<code>' . rcube::Q($base) . '/v1/send</code></p>';
 
         $example = "curl -X POST " . $base . "/v1/send \\\n"
             . "  -H \"Authorization: Bearer <TOKEN>\" \\\n"
             . "  -H \"Content-Type: application/json\" \\\n"
             . "  -d '{\"to\":\"someone@example.com\",\"subject\":\"Hello\",\"text\":\"Hi there\"}'";
-        $out .= '<pre style="overflow:auto;background:#0f172a;color:#e2e8f0;padding:12px;border-radius:8px;">'
-            . rcube::Q($example) . '</pre>';
+        $out .= '<details class="mailapi-example"><summary>' . rcube::Q($this->gettext('example_title')) . '</summary>'
+            . '<pre>' . rcube::Q($example) . '</pre></details>';
 
         $out .= $this->tokens_section($this->rc->get_user_name());
 
@@ -153,24 +177,27 @@ class dockpanel_mailapi extends rcube_plugin
                 . rcube::Q($this->gettext('open_panel')) . '</a>'
             : '';
 
-        $out = '<div class="mailapi-managed" style="border:1px solid #cbd5e1;border-radius:8px;padding:12px;margin:16px 0;background:#f8fafc;">'
-            . '<p style="margin:0 0 4px;font-weight:600;">' . rcube::Q($this->gettext('managed_title')) . '</p>'
-            . '<p style="margin:0;">' . rcube::Q($this->gettext('managed_body')) . $link . '</p>'
+        $out = '<div class="mailapi-managed">'
+            . '<p><strong>' . rcube::Q($this->gettext('managed_title')) . '</strong> '
+            . rcube::Q($this->gettext('managed_body')) . $link . '</p>'
             . '</div>';
-
-        $out .= '<h3 style="margin-bottom:4px;">' . rcube::Q($this->gettext('list_title')) . '</h3>';
 
         $tokens = $this->fetch_tokens($email);
         if ($tokens === null) {
-            $out .= '<p class="mailapi-unavailable">' . rcube::Q($this->gettext('unavailable')) . '</p>';
+            $out .= '<p class="mailapi-list-title"><strong>' . rcube::Q($this->gettext('list_title')) . '</strong></p>'
+                . '<p class="mailapi-unavailable">' . rcube::Q($this->gettext('unavailable')) . '</p>';
             return $out;
         }
         if (empty($tokens)) {
-            $out .= '<p class="mailapi-none">' . rcube::Q($this->gettext('notokens')) . '</p>';
+            $out .= '<p class="mailapi-list-title"><strong>' . rcube::Q($this->gettext('list_title')) . '</strong></p>'
+                . '<p class="mailapi-none">' . rcube::Q($this->gettext('notokens')) . '</p>';
             return $out;
         }
 
-        $h = '<table class="records-table" style="width:100%;margin-top:12px;"><thead><tr>'
+        $out .= '<p class="mailapi-list-title"><strong>' . rcube::Q($this->gettext('list_title'))
+            . '</strong> <span style="opacity:.6">(' . count($tokens) . ')</span></p>';
+
+        $h = '<table class="records-table mailapi-table"><thead><tr>'
             . '<th>' . rcube::Q($this->gettext('col_prefix')) . '</th>'
             . '<th>' . rcube::Q($this->gettext('col_name')) . '</th>'
             . '<th>' . rcube::Q($this->gettext('col_permissions')) . '</th>'
@@ -184,33 +211,54 @@ class dockpanel_mailapi extends rcube_plugin
                 ? implode(', ', array_map('strval', $r['permissions']))
                 : '';
             $h .= '<tr>'
-                . '<td><code>' . rcube::Q((string) ($r['token_prefix'] ?? '')) . '…</code></td>'
+                . '<td class="mailapi-nowrap"><code>' . rcube::Q((string) ($r['token_prefix'] ?? '')) . '…</code></td>'
                 . '<td>' . rcube::Q((string) ($r['name'] ?? '')) . '</td>'
                 . '<td>' . rcube::Q($perms) . '</td>'
-                . '<td>' . rcube::Q($this->expiry_label($r['expires_at'] ?? null)) . '</td>'
-                . '<td>' . rcube::Q((string) ($r['created_at'] ?? '')) . '</td>'
-                . '<td>' . rcube::Q(!empty($r['last_used_at']) ? (string) $r['last_used_at'] : $this->gettext('never')) . '</td>'
+                . '<td class="mailapi-nowrap">' . $this->expiry_cell($r['expires_at'] ?? null) . '</td>'
+                . '<td class="mailapi-nowrap">' . rcube::Q($this->short_date($r['created_at'] ?? null)) . '</td>'
+                . '<td class="mailapi-nowrap">'
+                . rcube::Q(!empty($r['last_used_at']) ? $this->short_date($r['last_used_at']) : $this->gettext('never'))
+                . '</td>'
                 . '</tr>';
         }
 
-        return $out . $h . '</tbody></table>';
+        $out .= $h . '</tbody></table>';
+        $out .= '<p class="mailapi-legend">' . rcube::Q($this->gettext('perms_legend')) . '</p>';
+
+        return $out;
     }
 
     /**
-     * "never", an ISO date, or "expired <date>" once that date is behind us — so
-     * a token that has silently stopped working says so on the page rather than
-     * looking valid until a send fails.
+     * The expiry cell: "never", a date, or "expired <date>" — so a token that
+     * has silently stopped working says so on the page rather than looking valid
+     * until a send fails. Marked up rather than coloured, so it stays legible in
+     * both skins.
      */
-    private function expiry_label($expires_at)
+    private function expiry_cell($expires_at)
     {
         $value = trim((string) $expires_at);
         if ($value === '') {
-            return $this->gettext('never');
+            return rcube::Q($this->gettext('never'));
         }
         $ts = strtotime($value);
         if ($ts !== false && $ts < time()) {
-            return $this->gettext('expired') . ' ' . $value;
+            return '<strong>' . rcube::Q($this->gettext('expired')) . '</strong> '
+                . rcube::Q(date('Y-m-d', $ts));
         }
-        return $value;
+        return rcube::Q($ts !== false ? date('Y-m-d', $ts) : $value);
+    }
+
+    /**
+     * "2026-10-18 07:12" — a compact, sortable date in place of the raw ISO
+     * timestamp the panel returns. Unknown values are passed through unchanged.
+     */
+    private function short_date($value)
+    {
+        $value = trim((string) $value);
+        if ($value === '') {
+            return '';
+        }
+        $ts = strtotime($value);
+        return $ts !== false ? date('Y-m-d H:i', $ts) : $value;
     }
 }

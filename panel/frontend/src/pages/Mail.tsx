@@ -1131,27 +1131,41 @@ export default function Mail() {
                     ) : (
                       <div className="divide-y divide-dark-600">
                         {accounts.map((acc) => (
-                          <div key={acc.id} className="py-3 flex items-center justify-between">
+                          <div key={acc.id} className="py-2.5 px-2 -mx-2 rounded flex items-center justify-between hover:bg-dark-700/20 transition-colors">
                             <div className="min-w-0">
                               <div className="flex items-center gap-2">
                                 <span className="text-sm text-dark-50 font-mono truncate">{acc.email}</span>
-                                {!acc.enabled && <span className="px-1.5 py-0.5 text-[9px] bg-dark-600 text-dark-300 uppercase">Disabled</span>}
-                                {acc.forward_to && <span className="px-1.5 py-0.5 text-[9px] bg-accent-500/15 text-accent-400 uppercase">Fwd</span>}
-                                {acc.autoresponder_enabled && <span className="px-1.5 py-0.5 text-[9px] bg-accent-600/15 text-accent-400 uppercase">Auto</span>}
+                                {!acc.enabled && <span className="px-1.5 py-0.5 text-[9px] rounded bg-dark-600 text-dark-300 uppercase tracking-wider">Disabled</span>}
+                                {acc.forward_to && <span className="px-1.5 py-0.5 text-[9px] rounded bg-accent-500/15 text-accent-400 uppercase tracking-wider">Fwd</span>}
+                                {acc.autoresponder_enabled && <span className="px-1.5 py-0.5 text-[9px] rounded bg-accent-600/15 text-accent-400 uppercase tracking-wider">Auto</span>}
                               </div>
+                              {/* `display_name` is optional, so the two facts are
+                                  joined rather than printed as a bare "· 1024 MB
+                                  quota". A quota of 0 means unlimited, which
+                                  "0 MB quota" never said — and an unlimited
+                                  mailbox has no fraction to draw a bar from. */}
                               <div className="flex items-center gap-2 flex-wrap">
-                                <span className="text-xs text-dark-300">{acc.display_name || ""} · {acc.quota_mb} MB quota</span>
+                                <span className="text-xs text-dark-300">
+                                  {[acc.display_name, acc.quota_mb > 0 ? `${acc.quota_mb} MB quota` : "Unlimited"].filter(Boolean).join(" · ")}
+                                </span>
                                 {storage[acc.email] && (
                                   <div className="flex items-center gap-2">
-                                    <div className="w-20 h-1.5 bg-dark-600 rounded-full overflow-hidden">
-                                      <div className="h-full bg-rust-500 rounded-full" style={{ width: `${Math.min(100, (storage[acc.email].mb / acc.quota_mb) * 100)}%` }} />
-                                    </div>
-                                    <span className="text-xs text-dark-300 font-mono">{storage[acc.email].mb} / {acc.quota_mb} MB</span>
+                                    {acc.quota_mb > 0 && (
+                                      <div className="w-20 h-1.5 bg-dark-600 rounded-full overflow-hidden">
+                                        <div
+                                          className={`h-full rounded-full ${storage[acc.email].mb / acc.quota_mb >= 0.9 ? "bg-danger-400" : "bg-rust-500"}`}
+                                          style={{ width: `${Math.min(100, (storage[acc.email].mb / acc.quota_mb) * 100)}%` }}
+                                        />
+                                      </div>
+                                    )}
+                                    <span className="text-xs text-dark-300 font-mono">
+                                      {acc.quota_mb > 0 ? `${storage[acc.email].mb} / ${acc.quota_mb} MB` : `${storage[acc.email].mb} MB used`}
+                                    </span>
                                   </div>
                                 )}
                               </div>
                             </div>
-                            <div className="flex items-center gap-1 shrink-0 ml-2">
+                            <div className="flex items-center gap-0.5 shrink-0 ml-2">
                               {/* `mailbox_backup` is AdminUser and writes to the
                                   host's backup directory, so it sits in the
                                   admin half even though the mailbox beside it
@@ -1164,7 +1178,7 @@ export default function Mail() {
                                 try { await api.post("/mail/backup", { email: acc.email }); setMessage({ text: `Backup created for ${acc.email}`, type: "success" }); loadBackups(); }
                                 catch (e) { setMessage({ text: e instanceof Error ? e.message : "Failed", type: "error" }); }
                                 finally { setBackingUp(null); }
-                              }} className="p-1.5 text-dark-300 hover:text-rust-400 disabled:opacity-50" title="Backup">
+                              }} className="p-1.5 rounded text-dark-300 hover:bg-dark-700 hover:text-rust-400 disabled:opacity-50 transition-colors" title="Backup">
                                 {backingUp === acc.email ? (
                                   <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>
                                 ) : (
@@ -1172,10 +1186,10 @@ export default function Mail() {
                                 )}
                               </button>
                               )}
-                              <button onClick={() => openEditAccount(acc)} className="p-1.5 text-dark-300 hover:text-accent-400" title="Edit">
+                              <button onClick={() => openEditAccount(acc)} className="p-1.5 rounded text-dark-300 hover:bg-dark-700 hover:text-accent-400 transition-colors" title="Edit">
                                 <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="m16.862 4.487 1.687-1.688a1.875 1.875 0 1 1 2.652 2.652L10.582 16.07a4.5 4.5 0 0 1-1.897 1.13L6 18l.8-2.685a4.5 4.5 0 0 1 1.13-1.897l8.932-8.931Zm0 0L19.5 7.125" /></svg>
                               </button>
-                              <button onClick={() => handleDeleteAccount(acc)} className="p-1.5 text-dark-300 hover:text-danger-400" title="Delete">
+                              <button onClick={() => handleDeleteAccount(acc)} className="p-1.5 rounded text-dark-300 hover:bg-dark-700 hover:text-danger-400 transition-colors" title="Delete">
                                 <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="m14.74 9-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 0 1-2.244 2.077H8.084a2.25 2.25 0 0 1-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 0 0-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 0 1 3.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 0 0-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 0 0-7.5 0" /></svg>
                               </button>
                             </div>

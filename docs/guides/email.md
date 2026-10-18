@@ -246,14 +246,17 @@ into the sender's **Sent** folder, so it shows up in Roundcube like any other me
 ### Getting a token
 
 1. Open the panel and go to **Mail**
-2. Under **Mail API — Tokens & Permissions**, type the mailbox's address under *Mint a token for
-   a mailbox*
-3. Tick the permissions the token should have, pick how long it should live (or *Never*),
-   give it a label if you like, and click **Create token** — it is shown only once
+2. Under **Mail API — Tokens & Permissions**, type the mailbox's address into the *Mailbox* field
+   of the mint row
+3. Leave the field to read what that mailbox may be given — the permission chips appear, all of
+   them switched on — then switch off the ones the token should not have, pick how long it should
+   live (or *Never*), give it a label if you like, and click **Create token**. It is shown only
+   once, with a *Copy* button beside it
 
-A token belongs to the mailbox you name and can only send as that address. Rotate or revoke it
-from the same card when it is no longer needed; the *Expiry…* menu on a token's row changes its
-lifetime without touching the secret.
+A token belongs to the mailbox you name and can only send as that address. *Rotate* and *Revoke*
+sit in the token's **Actions** column; clicking its expiry — *never*, *30d left* or *expired* —
+changes the lifetime without touching the secret. Revoked tokens drop out of the table unless you
+ask for them with *show revoked*.
 
 ### Permissions
 
@@ -294,8 +297,9 @@ edited or deleted:
 | `mail-user` | `send`, `read`, `write` — the default for every mailbox |
 | `mail-admin` | `send`, `read`, `write`, `domain` |
 
-Add a custom role when a mailbox needs something between the two, then assign it (with any
-extra permissions) under *Mailbox permissions*. A mailbox with no assignment gets `mail-user`.
+Add a custom role when a mailbox needs something between the two — *+ New role* on the
+**Roles & access** tab — then assign it, with any *Extra* permissions, under *Mailbox
+permissions*. A mailbox with no assignment gets `mail-user`.
 
 ### Sending
 
