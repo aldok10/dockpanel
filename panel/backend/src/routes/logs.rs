@@ -452,13 +452,22 @@ pub async fn check_errors(
 }
 
 /// GET /api/system/processes — Top processes (admin only).
+///
+/// `?all=true` forwards to the agent's full list (the Process Manager page);
+/// without it the agent answers with the top 20 the Dashboard widget wants.
 pub async fn processes(
     State(_state): State<AppState>,
     AdminUser(_claims): AdminUser,
     ServerScope(_server_id, agent): ServerScope,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let path = if params.get("all").map(|v| v == "true" || v == "1").unwrap_or(false) {
+        "/system/processes?all=true"
+    } else {
+        "/system/processes"
+    };
     let result = agent
-        .get("/system/processes")
+        .get(path)
         .await
         .map_err(|e| agent_error("System processes", e))?;
 

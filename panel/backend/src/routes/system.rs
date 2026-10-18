@@ -49,6 +49,54 @@ pub async fn info(
     Ok(Json(data))
 }
 
+/// GET /api/system/services — DockPanel's own daemons and the installed stack,
+/// with state, uptime, CPU/RAM and restart count (admin only).
+pub async fn services(
+    State(_state): State<AppState>,
+    AdminUser(_claims): AdminUser,
+    ServerScope(_server_id, agent): ServerScope,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let data = agent
+        .get("/system/services")
+        .await
+        .map_err(|e| agent_error("System services", e))?;
+    Ok(Json(data))
+}
+
+/// POST /api/system/services/action — start, stop or restart one managed
+/// service (admin only). The agent re-validates that `unit` is on its own
+/// catalogue and that `action` is one of the three verbs.
+pub async fn service_action(
+    State(state): State<AppState>,
+    AdminUser(claims): AdminUser,
+    ServerScope(server_id, agent): ServerScope,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let unit = body.get("unit").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let action = body.get("action").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+    let data = agent
+        .post("/system/services/action", Some(body))
+        .await
+        .map_err(|e| agent_error("Service action", e))?;
+
+    activity::log_activity_on_server(
+        &state.db,
+        claims.sub,
+        &claims.email,
+        "system.service_action",
+        Some("service"),
+        Some(&unit),
+        Some(&action),
+        None,
+        Some(server_id),
+        claims.key_id,
+    )
+    .await;
+
+    Ok(Json(data))
+}
+
 /// GET /api/agent/diagnostics — Proxy to agent's diagnostics (admin only).
 pub async fn diagnostics(
     State(_state): State<AppState>,

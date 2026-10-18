@@ -1359,6 +1359,8 @@ pub fn router() -> Router<AppState> {
         .route("/api/health", get(system::health))
         .route("/api/system/info", get(system::info))
         .route("/api/system/processes", get(logs::processes))
+        .route("/api/system/services", get(system::services))
+        .route("/api/system/services/action", post(system::service_action))
         .route("/api/system/network", get(logs::network))
         // System Updates
         .route("/api/system/updates", get(system::updates_list))

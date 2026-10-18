@@ -117,6 +117,7 @@ const Users = lazyRetry(() => import("./pages/Users"));
 const Ssh = lazyRetry(() => import("./pages/Ssh"));
 const ContainerPolicies = lazyRetry(() => import("./pages/ContainerPolicies"));
 const System = lazyRetry(() => import("./pages/System"));
+const ProcessManager = lazyRetry(() => import("./pages/ProcessManager"));
 const Telemetry = lazyRetry(() => import("./pages/Telemetry"));
 
 createRoot(document.getElementById("root")!).render(
@@ -179,6 +180,7 @@ createRoot(document.getElementById("root")!).render(
               <Route path="/notifications" element={<Notifications />} />
               <Route path="/monitoring" element={<Monitoring />} />
               <Route path="/system" element={<System />} />
+              <Route path="/processes" element={<ProcessManager />} />
               <Route path="/telemetry" element={<Telemetry />} />
               <Route path="/security-hardening" element={<Navigate to="/security?tab=lockdown" replace />} />
               <Route path="/monitors" element={<Navigate to="/monitoring" replace />} />

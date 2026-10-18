@@ -28,6 +28,7 @@ pub mod os_accounts;
 pub mod ownership;
 pub mod phone_home;
 pub mod pkg;
+pub mod process_manager;
 pub mod remote_backup;
 pub mod security;
 pub mod security_scanner;

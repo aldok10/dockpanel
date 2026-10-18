@@ -1,6 +1,6 @@
 # API Reference
 
-DockPanel exposes 869 REST endpoints (564 backend + 305 agent) across 50+ categories — the figure derived from the two routers in `FEATURES.md` §Verified Metrics, which owns it. The tables below document the commonly used subset, not every route. All endpoints except `/api/health`, `/api/branding`, `/api/auth/setup-status`, and `/api/auth/login` require authentication.
+DockPanel exposes 873 REST endpoints (566 backend + 307 agent) across 50+ categories — the figure derived from the two routers in `FEATURES.md` §Verified Metrics, which owns it. The tables below document the commonly used subset, not every route. All endpoints except `/api/health`, `/api/branding`, `/api/auth/setup-status`, and `/api/auth/login` require authentication.
 
 ## Authentication
 
@@ -712,11 +712,13 @@ leaves the stored value unchanged — there is no way to clear one through this 
 | DELETE | `/api/api-keys/{id}` | Revoke |
 | POST | `/api/api-keys/{id}/rotate` | Rotate key |
 
-### System (10)
+### System (12)
 | Method | Path | Purpose |
 |--------|------|---------|
 | GET | `/api/system/info` | CPU, RAM, disk, OS |
 | GET | `/api/system/processes` | Running processes |
+| GET | `/api/system/services` | DockPanel + stack service status (state, uptime, CPU/RAM, restarts) |
+| POST | `/api/system/services/action` | Start/stop/restart one managed service |
 | GET | `/api/system/network` | Network stats |
 | GET | `/api/system/disk-io` | Disk I/O |
 | POST | `/api/system/cleanup` | Clean temp files |

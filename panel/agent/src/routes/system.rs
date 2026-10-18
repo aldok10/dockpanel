@@ -1,8 +1,13 @@
 use crate::safe_cmd::{safe_command, safe_command_unsandboxed};
-use axum::{extract::State, routing::get, Json, Router};
-use serde::Serialize;
+use axum::{
+    extract::{Query, State},
+    http::StatusCode,
+    routing::{get, post},
+    Json, Router,
+};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use sysinfo::{Components, Networks, System};
+use sysinfo::{Components, Networks, ProcessStatus, System, Users};
 
 use super::{AppState, NetworkSnapshot};
 
@@ -36,7 +41,30 @@ struct ProcessInfo {
     name: String,
     cpu_pct: f32,
     mem_mb: u64,
+    /// Share of total physical memory, so the UI can colour a row without
+    /// knowing the host's RAM.
+    mem_pct: f32,
+    /// Owning account, resolved from the process's UID.
+    user: String,
+    /// Full command line (falls back to the process name when argv is empty,
+    /// e.g. a kernel thread).
+    cmd: String,
+    /// Seconds since the process started — the "uptime" column.
+    uptime_secs: u64,
+    /// `running`, `sleeping`, `zombie`, … .
+    status: String,
 }
+
+/// `?all=true` returns every process; the default keeps the Dashboard's top-20.
+#[derive(Deserialize)]
+struct ProcessQuery {
+    all: Option<bool>,
+}
+
+/// Upper bound on the `all=true` payload. A busy host can carry a few thousand
+/// processes; the cap keeps one Poll from marshalling an unbounded list, and
+/// sits far above anything an operator scrolls.
+const PROCESS_LIST_CAP: usize = 2000;
 
 #[derive(Serialize)]
 struct NetworkInfo {
@@ -131,28 +159,109 @@ async fn system_info(State(state): State<AppState>) -> Json<SystemInfo> {
     })
 }
 
-async fn processes() -> Json<Vec<ProcessInfo>> {
+async fn processes(Query(q): Query<ProcessQuery>) -> Json<Vec<ProcessInfo>> {
     let mut sys = System::new();
     sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
     // Brief pause then refresh again for accurate CPU readings
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
 
+    let users = Users::new_with_refreshed_list();
+    let total_mem = sys.total_memory().max(1);
+
     let mut procs: Vec<ProcessInfo> = sys
         .processes()
         .values()
-        .map(|p| ProcessInfo {
-            pid: p.pid().as_u32(),
-            name: p.name().to_string_lossy().to_string(),
-            cpu_pct: p.cpu_usage(),
-            mem_mb: p.memory() / 1_048_576,
+        .map(|p| {
+            let name = p.name().to_string_lossy().to_string();
+            let cmd = p
+                .cmd()
+                .iter()
+                .map(|c| c.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let user = p
+                .user_id()
+                .and_then(|uid| users.get_user_by_id(uid))
+                .map(|u| u.name().to_string())
+                .unwrap_or_default();
+            ProcessInfo {
+                pid: p.pid().as_u32(),
+                name,
+                cpu_pct: p.cpu_usage(),
+                mem_mb: p.memory() / 1_048_576,
+                mem_pct: (p.memory() as f64 / total_mem as f64 * 100.0) as f32,
+                user,
+                cmd,
+                uptime_secs: p.run_time(),
+                status: process_status_label(p.status()).to_string(),
+            }
         })
         .collect();
 
     procs.sort_by(|a, b| b.cpu_pct.partial_cmp(&a.cpu_pct).unwrap_or(std::cmp::Ordering::Equal));
-    procs.truncate(20);
+    if q.all.unwrap_or(false) {
+        procs.truncate(PROCESS_LIST_CAP);
+    } else {
+        procs.truncate(20);
+    }
 
     Json(procs)
+}
+
+fn process_status_label(status: ProcessStatus) -> &'static str {
+    match status {
+        ProcessStatus::Run => "running",
+        ProcessStatus::Sleep => "sleeping",
+        ProcessStatus::Idle => "idle",
+        ProcessStatus::Stop => "stopped",
+        ProcessStatus::Zombie => "zombie",
+        ProcessStatus::Dead => "dead",
+        ProcessStatus::Parked => "parked",
+        ProcessStatus::LockBlocked => "blocked",
+        ProcessStatus::UninterruptibleDiskSleep => "disk-sleep",
+        ProcessStatus::Tracing => "tracing",
+        ProcessStatus::Wakekill => "wakekill",
+        ProcessStatus::Waking => "waking",
+        _ => "unknown",
+    }
+}
+
+#[derive(Serialize)]
+struct ServicesResponse {
+    /// `systemd`, `openrc` or `none` — tells the UI what it is looking at.
+    init: &'static str,
+    services: Vec<crate::services::process_manager::ServiceEntry>,
+}
+
+/// GET /system/services — DockPanel's own daemons plus the installed stack,
+/// with state, uptime, CPU/RAM and restart count.
+async fn services() -> Json<ServicesResponse> {
+    let init = match crate::services::init::init_system() {
+        crate::services::init::InitSystem::Systemd => "systemd",
+        crate::services::init::InitSystem::OpenRc => "openrc",
+        crate::services::init::InitSystem::None => "none",
+    };
+    Json(ServicesResponse {
+        init,
+        services: crate::services::process_manager::collect().await,
+    })
+}
+
+#[derive(Deserialize)]
+struct ServiceAction {
+    unit: String,
+    action: String,
+}
+
+/// POST /system/services/action — start, stop or restart one managed service.
+async fn service_action(
+    Json(body): Json<ServiceAction>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    match crate::services::process_manager::perform_action(&body.unit, &body.action).await {
+        Ok(()) => Ok(Json(serde_json::json!({ "ok": true }))),
+        Err(e) => Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e })))),
+    }
 }
 
 async fn network(State(state): State<AppState>) -> Json<Vec<NetworkInfo>> {
@@ -339,6 +448,8 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/system/info", get(system_info))
         .route("/system/processes", get(processes))
+        .route("/system/services", get(services))
+        .route("/system/services/action", post(service_action))
         .route("/system/network", get(network))
         .route("/system/disk-io", get(disk_io))
         .route("/system/port-check", get(port_check))
