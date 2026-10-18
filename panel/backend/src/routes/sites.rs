@@ -3793,11 +3793,22 @@ pub async fn enable_sftp(
 
     let agent = crate::helpers::agent_for_site_server(&state, site.server_id, &site.domain).await?;
 
-    let (allocated,): (i32,) = sqlx::query_as("SELECT nextval('sftp_id_seq')::int")
-        .fetch_one(&state.db)
-        .await
-        .map_err(|e| internal_error("allocate sftp uid", e))?;
-    let (uid, gid) = (allocated, allocated);
+    // Reuse the uid this site was already issued when it still has one. A
+    // disable/enable cycle must not mint a fresh identity every time the owner
+    // flips the toggle: that burned a sequence value per round, handed the
+    // site a new login name each time, and left the previous account for
+    // someone to chase. The sequence is only touched by a site that has never
+    // had an account.
+    let (uid, gid) = match (site.sftp_uid, site.sftp_gid) {
+        (Some(uid), Some(gid)) => (uid, gid),
+        _ => {
+            let (allocated,): (i32,) = sqlx::query_as("SELECT nextval('sftp_id_seq')::int")
+                .fetch_one(&state.db)
+                .await
+                .map_err(|e| internal_error("allocate sftp uid", e))?;
+            (allocated, allocated)
+        }
+    };
 
     agent.post(
         &format!("/sftp/sites/{}/enable", site.domain),
@@ -3980,13 +3991,29 @@ pub async fn reset_sftp_password(
     Ok(Json(serde_json::json!({ "ok": true, "password": password })))
 }
 
+/// The first uid `sftp_id_seq` hands out — restated from the agent's
+/// `SFTP_UID_BASE`. The two crates share no library, so
+/// `tests/sftp-accounts-pin-e2e.sh` pins that both spell the same rule.
+const SFTP_UID_BASE: i32 = 30000;
+
+/// The login name of the site account on `uid`: `usr` plus the account's own
+/// 1-based number, zero-padded to five digits — `usr00001`, `usr00002`, …
+///
+/// Must be identical to the agent's `sftp_username`: this is what the PHP-FPM
+/// pool's `user =` is written with, so a divergence here would point a site at
+/// an account that does not exist. Derived from the uid rather than stored, so
+/// the name cannot drift from the identity it names.
+fn site_account_name(uid: i32) -> String {
+    format!("usr{:05}", uid - SFTP_UID_BASE + 1)
+}
+
 /// The site's Linux login name — the same identity SFTP uses, which is what
 /// makes the two one account with one password and one key set.
 fn site_linux_username(site: &Site) -> Result<String, ApiError> {
     let uid = site
         .sftp_uid
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "This site has no Linux account yet"))?;
-    Ok(format!("sftp{uid}"))
+    Ok(site_account_name(uid))
 }
 
 /// POST /api/sites/{id}/ssh/enable — give the site's Linux account a jailed
@@ -4028,11 +4055,19 @@ pub async fn enable_site_ssh(
     let agent = crate::helpers::agent_for_site_server(&state, site.server_id, &site.domain).await?;
 
     if !site.sftp_enabled {
-        let (allocated,): (i32,) = sqlx::query_as("SELECT nextval('sftp_id_seq')::int")
-            .fetch_one(&state.db)
-            .await
-            .map_err(|e| internal_error("allocate site uid", e))?;
-        let (uid, gid) = (allocated, allocated);
+        // Same reuse rule as the SFTP enable: a site that has had an account
+        // before gets ITS uid back, so turning SSH on after a disable does not
+        // mint a second identity for what is still one site.
+        let (uid, gid) = match (site.sftp_uid, site.sftp_gid) {
+            (Some(uid), Some(gid)) => (uid, gid),
+            _ => {
+                let (allocated,): (i32,) = sqlx::query_as("SELECT nextval('sftp_id_seq')::int")
+                    .fetch_one(&state.db)
+                    .await
+                    .map_err(|e| internal_error("allocate site uid", e))?;
+                (allocated, allocated)
+            }
+        };
 
         agent
             .post(
@@ -4121,7 +4156,7 @@ pub async fn enable_site_ssh(
     Ok(Json(serde_json::json!({
         "ok": true,
         "ssh_shell_enabled": true,
-        "username": format!("sftp{uid}"),
+        "username": site_account_name(uid),
     })))
 }
 
@@ -4594,7 +4629,7 @@ pub(crate) fn build_nginx_body(site: &crate::models::Site) -> serde_json::Value 
         // two definitions byte-for-byte identical; a drift here means the
         // panel tells the wrong pool owner to a `write_php_pool_config` call
         // that already succeeded under a different name.
-        body["pool_user"] = serde_json::json!(format!("sftp{uid}"));
+        body["pool_user"] = serde_json::json!(site_account_name(uid));
         body["pool_group"] = serde_json::json!(format!("sftpg{gid}"));
     }
     body

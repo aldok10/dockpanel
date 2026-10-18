@@ -77,6 +77,7 @@
 | **ARI-Driven Renewal** | ACME Renewal Information (RFC 9773) — auto-healer queries CA's suggested renewal window instead of static threshold; profile-aware fallback | `services/auto_healer.rs` | `services/ssl.rs` (`fetch_ari`) | — | `sites.ssl_renewal_at`, `sites.ssl_renewal_checked_at` |
 | **User Suspend/Reset** | Suspend/unsuspend users with session invalidation, admin password reset | `routes/users.rs` | — | (in Settings) | `users` |
 | **System Updates** | OS package updates, auto-updates toggle, reboot | `routes/system.rs` | `updates.rs` | (in Settings) | — |
+| **Process Manager** | Every running process (PID, user, command, CPU/RAM, uptime, state) and every DockPanel-managed service — the panel's own daemons (`dockpanel-agent`, `dockpanel-api`, `dockpanel-mailapi`, `dockpanel-mcp`), the installed stack (nginx, PHP-FPM, databases, MTA, DNS, security) and per-site app units — with state, uptime, CPU/RAM and restart count, plus start/stop/restart. Self-hosting units are restarted via a detached transient timer | `routes/system.rs` (`/system/services`, `/system/services/action`) | `services/process_manager.rs`, `system.rs` | `ProcessManager.tsx` | — |
 
 ## Admin
 
@@ -244,10 +245,10 @@ honest:
 | Panel services RAM (agent + API) | ~49 MB | measured | 2026-07-27 |
 | Full-stack RAM (with bundled PostgreSQL) | ~109 MB | measured | 2026-07-27 |
 | App templates | 147 | derived | every commit |
-| HTTP routes | 869 (564 backend + 305 agent) | derived | every commit |
-| Regression-pin assertions | 4770 (144 suites) | derived | every commit |
-| Frontend pages | 53 | derived | every commit |
-| DB migrations | 143 | derived | every commit |
+| HTTP routes | 873 (566 backend + 307 agent) | derived | every commit |
+| Regression-pin assertions | 4772 (144 suites) | derived | every commit |
+| Frontend pages | 54 | derived | every commit |
+| DB migrations | 144 | derived | every commit |
 | Supervised background services | 17 | derived | every commit |
 
 Five of these were wrong when the register was built (s272), some by a factor of

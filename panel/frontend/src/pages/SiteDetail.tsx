@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { useParams, useNavigate, Link } from "react-router-dom";
 import { api, ApiError } from "../api";
-import { formatDate } from "../utils/format";
+import { formatDate, siteAccountName } from "../utils/format";
 import { statusColors, runtimeLabelsDetailed as runtimeLabels } from "../constants";
 import { PrereqCallout, useDnsPrereq, prereqBlocks } from "../components/Prerequisite";
 import PhpVersionPicker from "../components/PhpVersionPicker";
@@ -1784,16 +1784,16 @@ export default function SiteDetail() {
               <div className="grid grid-cols-1 gap-3 text-xs font-mono sm:grid-cols-3">
                 <div>
                   <div className="text-dark-400 uppercase tracking-wide mb-1">Username</div>
-                  <div className="text-dark-100">sftp{site.sftp_uid}</div>
+                  <div className="text-dark-100">{siteAccountName(site.sftp_uid)}</div>
                 </div>
                 <div>
                   <div className="text-dark-400 uppercase tracking-wide mb-1">SFTP</div>
-                  <div className="text-dark-100 truncate">sftp sftp{site.sftp_uid}@{site.domain}</div>
+                  <div className="text-dark-100 truncate">sftp {siteAccountName(site.sftp_uid)}@{site.domain}</div>
                 </div>
                 <div>
                   <div className="text-dark-400 uppercase tracking-wide mb-1">SSH</div>
                   <div className="text-dark-100 truncate">
-                    {site.ssh_shell_enabled ? `ssh sftp${site.sftp_uid}@${site.domain}` : "off"}
+                    {site.ssh_shell_enabled ? `ssh ${siteAccountName(site.sftp_uid)}@${site.domain}` : "off"}
                   </div>
                 </div>
               </div>

@@ -1,7 +1,7 @@
 import { useState, useEffect, FormEvent } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../api";
-import { formatDate } from "../utils/format";
+import { formatDate, siteAccountName } from "../utils/format";
 import { statusColors, runtimeLabels } from "../constants";
 import ProvisionLog from "../components/ProvisionLog";
 import { PrereqCallout, useDnsPrereq } from "../components/Prerequisite";
@@ -534,8 +534,8 @@ export default function Sites() {
                     <div className="flex items-center gap-1.5">
                       {(
                         [
-                          { label: "FTP", on: site.sftp_enabled, hint: site.sftp_enabled && site.sftp_uid != null ? `sftp sftp${site.sftp_uid}@${site.domain}` : "Turn SFTP on for this site" },
-                          { label: "SSH", on: site.ssh_shell_enabled, hint: site.ssh_shell_enabled && site.sftp_uid != null ? `ssh sftp${site.sftp_uid}@${site.domain}` : "Turn the SSH shell on for this site" },
+                          { label: "FTP", on: site.sftp_enabled, hint: site.sftp_enabled && site.sftp_uid != null ? `sftp ${siteAccountName(site.sftp_uid)}@${site.domain}` : "Turn SFTP on for this site" },
+                          { label: "SSH", on: site.ssh_shell_enabled, hint: site.ssh_shell_enabled && site.sftp_uid != null ? `ssh ${siteAccountName(site.sftp_uid)}@${site.domain}` : "Turn the SSH shell on for this site" },
                         ]
                       ).map((a) => (
                         <Link

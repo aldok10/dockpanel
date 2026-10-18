@@ -63,12 +63,59 @@ const RUNTIME_DIRS: &[&str] = &["bin", "dev", "etc", "lib", "lib64", "usr", "tmp
 /// the SFTP user's own session can never reach or edit it.
 pub const OWNER_MARKER_DIR: &str = "/etc/dockpanel/sftp-owners";
 
+/// The first uid `sftp_id_seq` hands out. Site uids are allocated from here
+/// upward so they can never collide with a system account — which is exactly
+/// what makes the uid a poor thing to put in a login name.
+const SFTP_UID_BASE: i32 = 30000;
+
+/// The login name behind `uid`: `usr` plus the account's own 1-based number,
+/// zero-padded to five digits — `usr00001`, `usr00002`, …
+///
+/// The number is DERIVED from the uid rather than stored, so a name can never
+/// drift from the identity it names: [`SFTP_UID_BASE`] is the sequence's start,
+/// so uid 30000 is account 1. Restated verbatim in the backend
+/// (`routes::sites::site_account_name`) — the two crates share no library, so
+/// `tests/sftp-accounts-pin-e2e.sh` pins that both spell this exact expression.
 pub fn sftp_username(uid: i32) -> String {
-    format!("sftp{uid}")
+    format!("usr{:05}", uid - SFTP_UID_BASE + 1)
 }
 
 pub fn sftp_groupname(gid: i32) -> String {
     format!("sftpg{gid}")
+}
+
+/// The login currently holding `uid` in `/etc/passwd`, if any.
+///
+/// Identity is resolved by UID, never by name: the name is a label this panel
+/// chooses, and a label from an older scheme (`sftp<uid>`) still names a real
+/// account until it is cleaned up. Resolving by uid is what lets a teardown or
+/// a provision find that account instead of failing to recognise it.
+async fn passwd_entry_for_uid(uid: i32) -> Result<Option<String>, String> {
+    let passwd = tokio::fs::read_to_string("/etc/passwd")
+        .await
+        .map_err(|e| format!("cannot read /etc/passwd: {e}"))?;
+    Ok(passwd.lines().find_map(|line| {
+        let mut f = line.split(':');
+        let name = f.next()?;
+        let _pw = f.next()?;
+        let id: i32 = f.next()?.parse().ok()?;
+        (id == uid).then(|| name.to_string())
+    }))
+}
+
+/// The group currently holding `gid` in `/etc/group`, if any. See
+/// [`passwd_entry_for_uid`] for why this resolves by id.
+async fn group_entry_for_gid(gid: i32) -> Result<Option<String>, String> {
+    let group = tokio::fs::read_to_string("/etc/group")
+        .await
+        .map_err(|e| format!("cannot read /etc/group: {e}"))?;
+    Ok(group.lines().find_map(|line| {
+        let mut f = line.split(':');
+        let name = f.next()?;
+        let _pw = f.next()?;
+        let id: i32 = f.next()?.parse().ok()?;
+        (id == gid).then(|| name.to_string())
+    }))
 }
 
 fn jail_root(domain: &str) -> String {
@@ -104,10 +151,12 @@ async fn mount_unit_name(content_dir: &str) -> Result<String, String> {
 
 /// Provision the SFTP account for `domain`: shared group (once), per-site
 /// user+group, the jail tree, the bind-mount unit, and re-owns the site's real
-/// content directory. Idempotent on the group/sshd-group-membership steps;
-/// NOT idempotent on the user/mount-unit steps (`enable_sftp` on the backend
-/// already no-ops when `sftp_enabled` is already true, so this only ever runs
-/// once per site).
+/// content directory. Idempotent on the shared-group and per-site id steps: a
+/// site whose uid is already held by its own account reuses it, and a uid held
+/// by a retired (`sftp<uid>`) account is reclaimed — see the claim step below.
+/// NOT idempotent on the mount-unit step (`enable_sftp` on the backend already
+/// no-ops when `sftp_enabled` is already true, so this only ever runs once per
+/// site).
 pub async fn provision(domain: &str, uid: i32, gid: i32) -> Result<(), String> {
     let username = sftp_username(uid);
     let groupname = sftp_groupname(gid);
@@ -129,45 +178,97 @@ pub async fn provision(domain: &str, uid: i32, gid: i32) -> Result<(), String> {
         .output()
         .await;
 
-    // 2. Per-site primary group, then the user itself. Both are genuinely new
-    // per site — a failure here must be a real error, not swallowed.
-    let out = safe_command_unsandboxed("groupadd", &[])
-        .args(["-g", &gid.to_string(), &groupname])
-        .output()
-        .await
-        .map_err(|e| format!("groupadd failed to run: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "groupadd {groupname} (gid {gid}) failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        ));
+    // 2. Claim this uid/gid for the CURRENT name, then create what is missing.
+    //
+    // Both halves exist because of real states the caller can hand us:
+    //
+    // - An account created under the retired name (`sftp<uid>`) still holds
+    //   exactly this uid until its site is re-enabled. `useradd -u` would fail
+    //   with "UID already in use" and that site could never come back, so the
+    //   leftover goes first — looked up BY UID, never by a wildcard over
+    //   `sftp*`, which would take out a different site's live account. Its
+    //   processes go first for the same reason `deprovision()` kills them:
+    //   userdel refuses a uid that is still running (a PHP-FPM pool pointed at
+    //   this identity will have workers under it).
+    // - A previous teardown whose userdel/groupdel failed left OUR OWN
+    //   identity behind. That is not an error to report, it is the account to
+    //   reuse: a disable/enable cycle must not fail because cleanup was
+    //   incomplete.
+    if let Some(holder) = passwd_entry_for_uid(uid).await? {
+        if holder != username {
+            tracing::info!(
+                "removing retired account {holder} that holds uid {uid} before provisioning {username}"
+            );
+            let _ = safe_command_unsandboxed("pkill", &[])
+                .args(["-9", "-u", &uid.to_string()])
+                .output()
+                .await;
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            match safe_command_unsandboxed("userdel", &[]).args([&holder]).output().await {
+                Ok(o) if !o.status.success() => tracing::warn!(
+                    "userdel {holder} failed (retired account may still exist): {}",
+                    String::from_utf8_lossy(&o.stderr)
+                ),
+                Err(e) => tracing::warn!("userdel {holder} failed to run: {e}"),
+                Ok(_) => {}
+            }
+        }
+    }
+    if let Some(holder) = group_entry_for_gid(gid).await? {
+        if holder != groupname {
+            tracing::info!(
+                "removing stale group {holder} that holds gid {gid} before provisioning {groupname}"
+            );
+            let _ = safe_command_unsandboxed("groupdel", &[]).args([&holder]).output().await;
+        }
+    }
+
+    // 2b. Per-site primary group, then the user itself — created only when the
+    // id is genuinely free, so a repeat enable reuses an identity that
+    // survived an incomplete teardown instead of erroring on "already exists".
+    // A failure here is a real error, not swallowed.
+    if group_entry_for_gid(gid).await? != Some(groupname.clone()) {
+        let out = safe_command_unsandboxed("groupadd", &[])
+            .args(["-g", &gid.to_string(), &groupname])
+            .output()
+            .await
+            .map_err(|e| format!("groupadd failed to run: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "groupadd {groupname} (gid {gid}) failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
     }
 
     let jail = jail_root(domain);
-    let out = safe_command_unsandboxed("useradd", &[])
-        .args([
-            "-u",
-            &uid.to_string(),
-            "-g",
-            &groupname,
-            "-G",
-            SFTP_GROUP,
-            "-d",
-            &jail,
-            "-s",
-            "/usr/sbin/nologin",
-            &username,
-        ])
-        .output()
-        .await
-        .map_err(|e| format!("useradd failed to run: {e}"))?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-        // Roll back the group we just created — a half-provisioned site (group
-        // present, no user) is worse than none, since a retry's groupadd would
-        // then fail on "already exists" and mask the real problem.
-        let _ = safe_command_unsandboxed("groupdel", &[]).args([&groupname]).output().await;
-        return Err(format!("useradd {username} (uid {uid}) failed: {stderr}"));
+    if passwd_entry_for_uid(uid).await? != Some(username.clone()) {
+        let out = safe_command_unsandboxed("useradd", &[])
+            .args([
+                "-u",
+                &uid.to_string(),
+                "-g",
+                &groupname,
+                "-G",
+                SFTP_GROUP,
+                "-d",
+                &jail,
+                "-s",
+                "/usr/sbin/nologin",
+                &username,
+            ])
+            .output()
+            .await
+            .map_err(|e| format!("useradd failed to run: {e}"))?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            // Roll back the group we just created — a half-provisioned site
+            // (group present, no user) is worse than none, since a retry's
+            // groupadd would then fail on "already exists" and mask the real
+            // problem.
+            let _ = safe_command_unsandboxed("groupdel", &[]).args([&groupname]).output().await;
+            return Err(format!("useradd {username} (uid {uid}) failed: {stderr}"));
+        }
     }
 
     // 3. Jail tree: root-owned boundary (OpenSSH requires this, not
@@ -362,6 +463,65 @@ pub async fn deprovision(domain: &str, uid: i32, gid: i32, last_sftp_site: bool)
 
     tracing::info!("SFTP deprovisioned for {domain}: user={username}");
     Ok(())
+}
+
+/// Remove site accounts this panel created under the retired `sftp<uid>` name.
+///
+/// The login scheme is now `usr#####` (see [`sftp_username`]), so an account
+/// still called `sftp<uid>` is one the panel will never reference again:
+/// migration `20261018040000` marks every site carrying one as needing
+/// re-enable, and the next Enable re-creates the account under the current
+/// name, reclaiming the same uid (see [`provision`]).
+///
+/// Deliberately narrow rather than a sweep for "any name starting with sftp":
+/// only `sftp` + digits, only for a uid inside the range this panel allocates
+/// from. An account matching that is ours by construction — no admin hands
+/// themselves `sftp` + digits inside 30000+ — while a prefix sweep would also
+/// match whatever an operator named `sftp-backup` or `sftp_old`. Runs at every
+/// startup and is a no-op once they are gone.
+pub async fn purge_retired_accounts() {
+    let passwd = match tokio::fs::read_to_string("/etc/passwd").await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("retired site-account cleanup skipped, cannot read /etc/passwd: {e}");
+            return;
+        }
+    };
+    for line in passwd.lines() {
+        let mut f = line.split(':');
+        let (Some(name), Some(_pw), Some(id)) = (f.next(), f.next(), f.next()) else {
+            continue;
+        };
+        let Ok(uid) = id.parse::<i32>() else { continue };
+        if uid < SFTP_UID_BASE || !is_retired_name(name) {
+            continue;
+        }
+
+        tracing::info!("removing retired site account {name} (uid {uid})");
+        // Same order `deprovision()` uses, for the same reason: userdel refuses
+        // a uid that still has processes, and a PHP-FPM pool pointed at this
+        // identity will have workers under it.
+        let _ = safe_command_unsandboxed("pkill", &[])
+            .args(["-9", "-u", id])
+            .output()
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        match safe_command_unsandboxed("userdel", &[]).args([name]).output().await {
+            Ok(o) if !o.status.success() => tracing::warn!(
+                "userdel {name} failed (retired account may still exist): {}",
+                String::from_utf8_lossy(&o.stderr)
+            ),
+            Err(e) => tracing::warn!("userdel {name} failed to run: {e}"),
+            Ok(_) => {}
+        }
+    }
+}
+
+/// `sftp` followed by nothing but digits — the shape of the retired
+/// site-account name, and of nothing this panel creates today.
+fn is_retired_name(name: &str) -> bool {
+    name.strip_prefix("sftp")
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// Set (or reset) `domain`'s SFTP password. Hashes in-process (glibc

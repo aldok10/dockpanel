@@ -312,6 +312,11 @@ async fn main() {
         services::init::ensure_web_user();
     }
 
+    // Retire accounts from the old `sftp<uid>` login scheme (sites are now
+    // `usr#####`) before anything can log into one. Idempotent, and a no-op on
+    // a box that never had any. See `sftp_accounts::purge_retired_accounts`.
+    tokio::spawn(services::sftp_accounts::purge_retired_accounts());
+
     // Start phone-home if configured (remote agent mode)
     if let Some(mut ph_config) = services::phone_home::PhoneHomeConfig::from_env() {
         ph_config.cert_fingerprint = Some(cert_fingerprint.clone());

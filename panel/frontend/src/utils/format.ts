@@ -48,3 +48,17 @@ export function formatUptime(seconds: number): string {
   if (h > 0) return `${h}h ${m}m`;
   return `${m}m`;
 }
+
+/** The first uid the panel allocates site accounts from (`sftp_id_seq`
+ *  starts here, mirrored from the backend's `SFTP_UID_BASE`). */
+const SFTP_UID_BASE = 30000;
+
+/** A site account's login name: `usr` plus the account's own 1-based number,
+ *  zero-padded to five digits — `usr00001`, `usr00002`, …
+ *
+ *  Mirrors the backend's `site_account_name`, which derives the same number
+ *  from the uid the panel allocated. The derivation has to agree everywhere it
+ *  is shown, or the panel would print a login that does not exist. */
+export function siteAccountName(uid: number): string {
+  return `usr${String(uid - SFTP_UID_BASE + 1).padStart(5, "0")}`;
+}

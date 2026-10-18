@@ -198,14 +198,22 @@ must_contain "$BACKEND_FLAT" 'ifsite.sftp_enabled&&let(Some(uid),Some(gid))=(sit
 
 echo
 echo "── G: the naming convention is duplicated correctly, not merely once ──"
-must_contain "$BACKEND_FLAT" 'format!("sftp{uid}")' \
-  "backend's pool_user naming matches sftp{uid}"
-must_contain "$SVC_FLAT" 'format!("sftp{uid}")' \
-  "agent's sftp_username naming matches sftp{uid}"
+must_contain "$BACKEND_FLAT" 'format!("usr{:05}",uid-SFTP_UID_BASE+1)' \
+  "backend's site_account_name is usr##### derived from the uid, not the raw uid"
+must_contain "$SVC_FLAT" 'format!("usr{:05}",uid-SFTP_UID_BASE+1)' \
+  "agent's sftp_username is usr##### derived from the uid, not the raw uid"
 must_contain "$BACKEND_FLAT" 'format!("sftpg{gid}")' \
   "backend's pool_group naming matches sftpg{gid}"
 must_contain "$SVC_FLAT" 'format!("sftpg{gid}")' \
   "agent's sftp_groupname naming matches sftpg{gid}"
+
+echo
+echo "── G2: re-enabling reuses the site's identity; retired accounts are ──"
+echo "──     recognised by exact shape, never swept by prefix ──"
+must_contain "$BACKEND_FLAT" '(Some(uid),Some(gid))=>(uid,gid)' \
+  "enable paths reuse an existing sftp_uid instead of burning a new identity per toggle"
+must_contain "$SVC_FLAT" '!rest.is_empty()&&rest.bytes().all(|b|b.is_ascii_digit())' \
+  "a retired sftp<uid> account is matched as sftp+digits only — never every name starting with sftp"
 
 echo
 echo "── H: PHP-FPM pool template actually takes the owner as a parameter ──"
