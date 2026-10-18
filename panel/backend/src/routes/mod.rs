@@ -1732,7 +1732,10 @@ pub fn router() -> Router<AppState> {
             get(mail_api::get_grant).put(mail_api::put_grant).delete(mail_api::delete_grant),
         )
         .route("/api/mail/api/tokens", get(mail_api::list_tokens).post(mail_api::create_token))
-        .route("/api/mail/api/tokens/{id}", delete(mail_api::revoke_token))
+        .route(
+            "/api/mail/api/tokens/{id}",
+            put(mail_api::update_token).delete(mail_api::revoke_token),
+        )
         .route("/api/mail/api/tokens/{id}/rotate", post(mail_api::rotate_token))
         .route("/api/mail/webmail/tokens", get(mail_api::webmail_tokens))
         // Mail: SMTP Relay

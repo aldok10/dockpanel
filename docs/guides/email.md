@@ -248,37 +248,51 @@ into the sender's **Sent** folder, so it shows up in Roundcube like any other me
 1. Open the panel and go to **Mail**
 2. Under **Mail API — Tokens & Permissions**, type the mailbox's address under *Mint a token for
    a mailbox*
-3. Tick the permissions the token should have, give it a label if you like, and click
-   **Create token** — it is shown only once
+3. Tick the permissions the token should have, pick how long it should live (or *Never*),
+   give it a label if you like, and click **Create token** — it is shown only once
 
 A token belongs to the mailbox you name and can only send as that address. Rotate or revoke it
-from the same card when it is no longer needed.
+from the same card when it is no longer needed; the *Expiry…* menu on a token's row changes its
+lifetime without touching the secret.
 
 ### Permissions
 
-A token carries its own permissions, from a catalog of two:
+A token carries its own permissions, from a catalog of four:
 
 | Permission | Grants |
 |---|---|
-| `me` | `/v1/me/*` and `/v1/send` — manage and send as the token's own mailbox |
-| `domain` | `/v1/domains/*` and `/v1/queue` — administer the whole server's mail |
+| `send` | `POST /v1/send` and `/emails` — mail out as the token's own mailbox, and nothing else |
+| `read` | every `GET /v1/me/*` — messages, folders, contacts, identities, settings, quota |
+| `write` | the mutating `/v1/me/*` routes — profile and password, forwarding, autoresponder, folders, messages, contacts, identities, settings. Implies `read` |
+| `domain` | `/v1/domains/*` and `/v1/queue` — administer the whole server's mail. Implies `send`, `read` and `write` |
 
-`domain` implies `me`. A token's permissions are an **upper bound**: on every request the
-service intersects them with what the mailbox is currently allowed, which is recorded per
-mailbox as a *role* in the panel. Two things follow, and they are the point of the design:
+The point of the split is that a token can be narrower than the mailbox it belongs to. A
+monitoring script wants `read` and nothing more; a contact form wants `send` alone — that one
+can mail out but cannot read a single message, delete one, or change a mailbox password.
+`me`, the earlier single permission covering the whole mailbox, is still accepted anywhere a
+permission list is, and expands to `send`+`read`+`write`.
 
-* **A `/me`-only token stays `/me`-only**, even if its mailbox is an administrator's. An
+A token's permissions are an **upper bound**: on every request the service intersects them with
+what the mailbox is currently allowed, which is recorded per mailbox as a *role* in the panel.
+Two things follow, and they are the point of the design:
+
+* **A `send`-only token stays `send`-only**, even if its mailbox is an administrator's. An
   application gets exactly what it needs and no path to the rest of the server.
 * **Revoking is immediate.** Move a mailbox off `mail-admin`, or drop an extra permission, and
   tokens already handed out lose `domain` on their next request — no need to hunt them down.
+
+A token may also carry an **expiry**. Past it the token is refused exactly as it would be if
+revoked, so a credential minted for a one-off job does not outlive the job. You pick the
+lifetime when minting — 30, 90, 180 or 365 days, or *Never* — and can change it afterwards
+without rotating the secret.
 
 **Roles** are named permission bundles, managed on the same card. Two are built in and cannot be
 edited or deleted:
 
 | Role | Permissions |
 |---|---|
-| `mail-user` | `me` — the default for every mailbox |
-| `mail-admin` | `me`, `domain` |
+| `mail-user` | `send`, `read`, `write` — the default for every mailbox |
+| `mail-admin` | `send`, `read`, `write`, `domain` |
 
 Add a custom role when a mailbox needs something between the two, then assign it (with any
 extra permissions) under *Mailbox permissions*. A mailbox with no assignment gets `mail-user`.

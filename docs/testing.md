@@ -372,23 +372,25 @@ found things from coming back.
 
 **On every commit** (`ci.yml`, `codeql.yml`):
 
-- **810 unit tests** across the crates — 474 in the backend, 336 in the agent.
-  (The CLI crate carries none of its own today.) Re-derive rather than trust
-  this line: `for c in agent backend cli; do (cd panel/$c && cargo test
-  --release); done` and sum the `test result:` lines. Nothing recomputes this
-  figure on a push — unlike the regression-pin total below, which
-  `docs-claims-pin-e2e.sh` re-reads from each suite — so it is exactly the kind
-  of number that goes quietly stale, and it had: this line still read 294 when
-  the count was measured for v2.48.0.
+- **903 unit tests** across the crates — 496 in the backend, 378 in the agent,
+  29 in `panel/mailapi`. (The CLI crate carries none of its own today.)
+  Re-derive rather than trust this line: `for c in agent backend cli mailapi; do
+  (cd panel/$c && cargo test --release); done` and sum the `test result:` lines.
+  Nothing recomputes this figure on a push — unlike the regression-pin total
+  below, which `docs-claims-pin-e2e.sh` re-reads from each suite — so it is
+  exactly the kind of number that goes quietly stale, and it had: this line
+  still read 294 when the count was measured for v2.48.0.
 
   **And it went stale again, twice.** It read `493 — 334 backend, 159 agent`
   until v2.113.0, against a real 537, and then `701 — 437 backend, 264 agent`
-  until v2.222.0, against a real 810. The paragraph above correctly names the
-  reason — nothing recomputes it — so the warning was not the missing part.
-  Treat every figure on this page that no suite re-derives as suspect by
-  default, and note that five unit tests are `#[ignore]`d and therefore
-  excluded from the count above: they need a Docker daemon and are described
-  under the drills.
+  until v2.222.0, against a real 810. The third time was worse than drift:
+  `panel/mailapi` had been carrying unit tests since it was written and the
+  sentence did not name it, so the total undercounted the tree rather than
+  lagging behind it. The paragraph above correctly names the reason — nothing
+  recomputes it — so the warning was not the missing part. Treat every figure on
+  this page that no suite re-derives as suspect by default, and note that five
+  unit tests are `#[ignore]`d and therefore excluded from the count above: they
+  need a Docker daemon and are described under the drills.
 - **`cargo audit` on all three crates, enforcing.** A real advisory fails the
   build. One accepted, upstream-blocked item is ignored narrowly, in a
   committed config, with the reason written down.

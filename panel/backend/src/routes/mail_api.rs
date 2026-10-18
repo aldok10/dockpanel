@@ -10,15 +10,22 @@
 //!
 //! Here, instead, a mailbox is assigned a **role** (a named bundle of
 //! permissions) and every token carries its own **subset** of what the mailbox
-//! is allowed. The catalog is deliberately small — two entries — because a
-//! capability the mail API does not have is not worth a name:
+//! is allowed. The catalog names four capabilities, so the two halves of
+//! `/v1/me/*` are separable and a token need not be all-or-nothing:
 //!
-//!   * `me`     — `/v1/me/*` and `/v1/send` (self-service)
-//!   * `domain` — `/v1/domains/*` and `/v1/queue` (server-wide administration)
+//!   * `send`   — `/v1/send` and `/emails`
+//!   * `read`   — the `GET` half of `/v1/me/*`
+//!   * `write`  — the mutating half of `/v1/me/*` (implies `read`)
+//!   * `domain` — `/v1/domains/*` and `/v1/queue` (implies all three above)
 //!
-//! The effective permission set of a mailbox is `role ∪ extras` (or just `me`
-//! when it has no grant, so an empty table is still correct), and a token's
-//! effective set is its own `permissions` intersected with that *live* value.
+//! `me`, the earlier single self-service entry, is accepted as an alias that
+//! expands to `send`+`read`+`write`, so nothing minted before the split is
+//! narrowed.
+//!
+//! The effective permission set of a mailbox is `role ∪ extras` (or the
+//! self-service three when it has no grant, so an empty table is still correct),
+//! and a token's effective set is its own `permissions` intersected with that
+//! *live* value.
 //! The intersection is the important half: it means removing `domain` from a
 //! role, or moving a mailbox off `mail-admin`, downgrades tokens that are
 //! already in somebody's application, without needing to find and revoke them.
@@ -45,23 +52,49 @@ use crate::AppState;
 
 /// The permission catalog. Fixed in code, not a table: a permission has no
 /// meaning without a route that checks it, so the two have to ship together.
-pub const PERMISSION_CATALOG: [(&str, &str, &str); 2] = [
+pub const PERMISSION_CATALOG: [(&str, &str, &str); 4] = [
     (
-        "me",
-        "Mailbox (self-service)",
-        "Send as the mailbox's own address, and read and change only that mailbox: \
-         profile, password, forwarding, autoresponder, quota, folders, messages, \
-         contacts, contact groups, identities, settings and canned responses.",
+        "send",
+        "Send",
+        "Send as the mailbox's own address: `POST /v1/send` and `POST /emails`. Nothing \
+         else — this token can mail out but cannot read a mailbox, change one, or touch \
+         the server.",
+    ),
+    (
+        "read",
+        "Read",
+        "Read the mailbox: profile, quota, folders, messages, contacts, contact groups, \
+         identities, settings and canned responses. Every `GET /v1/me/*` route.",
+    ),
+    (
+        "write",
+        "Manage",
+        "Change the mailbox: its profile and password, forwarding, autoresponder, folders, \
+         messages (save, flag, move, delete, empty Trash), contacts, contact groups, \
+         identities, settings and canned responses. Implies `read`.",
     ),
     (
         "domain",
         "Server (mail administration)",
-        "Everything `me` allows, plus the server-wide surface: mail domains and their \
-         mailboxes and aliases, and the mail queue.",
+        "Everything `send`, `read` and `write` allow, plus the server-wide surface: mail \
+         domains and their mailboxes and aliases, and the mail queue.",
     ),
 ];
 
-const PERM_ME: &str = "me";
+const PERM_SEND: &str = "send";
+const PERM_READ: &str = "read";
+const PERM_WRITE: &str = "write";
+const PERM_DOMAIN: &str = "domain";
+
+/// What a mailbox may do when it has no grant at all: the whole of self-service,
+/// which is what the old single `me` entry meant.
+fn self_service() -> Vec<String> {
+    vec![
+        PERM_SEND.to_string(),
+        PERM_READ.to_string(),
+        PERM_WRITE.to_string(),
+    ]
+}
 
 /// Prefix for a minted mail-API token. Deliberately not `dp_`: that prefix is the
 /// panel's own long-lived API key and `panel/mailapi` routes it down a different,
@@ -102,6 +135,8 @@ pub struct MailApiToken {
     pub token_prefix: String,
     pub permissions: Vec<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// When the token stops being accepted. `None` means it never does.
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
     pub last_used_at: Option<chrono::DateTime<chrono::Utc>>,
     pub revoked: bool,
 }
@@ -132,6 +167,16 @@ pub struct CreateTokenRequest {
     pub name: Option<String>,
     /// The subset to grant the token. Omitted means "everything the mailbox has".
     pub permissions: Option<Vec<String>>,
+    /// Lifetime in days. Omitted (or `null`) means the token never expires.
+    pub expires_in_days: Option<i64>,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateTokenRequest {
+    pub name: Option<String>,
+    /// `0` (or negative) clears the expiry; a positive number sets it that many
+    /// days out; the field left out of the body leaves the current expiry alone.
+    pub expires_in_days: Option<i64>,
 }
 
 // ── Permission helpers ───────────────────────────────────────────────────
@@ -145,17 +190,36 @@ fn is_known(k: &str) -> bool {
 }
 
 /// Keep only known permissions, drop duplicates, and order them the way the
-/// catalog lists them (so `me` always precedes `domain` and two equal sets
+/// catalog lists them (so `send` always precedes `read`, and two equal sets
 /// compare equal as arrays).
 ///
-/// `domain` implies `me`: the catalog describes `domain` as "everything `me`
-/// allows, plus the server-wide surface", so a set that named only `domain` would
-/// contradict its own definition. Normalising here means no caller — a role, an
-/// extra, or a token's requested subset — can produce that set.
+/// Two implications complete a set here, so that no caller — a role, an extra,
+/// or a token's requested subset — can produce a set that contradicts the
+/// catalog's own wording:
+///
+///   * `write` implies `read`: a credential allowed to change a mailbox but not
+///     to look at it is not a combination any route needs, and the read half of a
+///     change (fetch, then patch) is how every mutating handler here works.
+///   * `domain` implies `send`+`read`+`write`: the catalog describes it as
+///     "everything those allow, plus the server-wide surface".
+///
+/// `me` is the pre-split spelling of `send`+`read`+`write`, accepted as an alias
+/// so a row minted before the catalog grew is neither dropped nor narrowed.
 fn canonicalize(mut perms: Vec<String>) -> Vec<String> {
+    if perms.iter().any(|p| p == "me") {
+        perms.retain(|p| p != "me");
+        perms.push(PERM_SEND.to_string());
+        perms.push(PERM_READ.to_string());
+        perms.push(PERM_WRITE.to_string());
+    }
     perms.retain(|p| is_known(p));
-    if perms.iter().any(|p| p == "domain") {
-        perms.push("me".to_string());
+    if perms.iter().any(|p| p == PERM_WRITE) {
+        perms.push(PERM_READ.to_string());
+    }
+    if perms.iter().any(|p| p == PERM_DOMAIN) {
+        perms.push(PERM_SEND.to_string());
+        perms.push(PERM_READ.to_string());
+        perms.push(PERM_WRITE.to_string());
     }
     perms.sort_by_key(|p| catalog_index(p).unwrap_or(usize::MAX));
     perms.dedup();
@@ -167,10 +231,13 @@ fn parse_permissions(input: &[String]) -> Result<Vec<String>, ApiError> {
     let mut out = Vec::new();
     for p in input {
         let k = p.trim().to_ascii_lowercase();
-        if !is_known(&k) {
+        // `me` is not in the catalog any more, but it is the name every token
+        // minted before the split carries, so it is still accepted (and expanded
+        // by `canonicalize`) rather than rejected with a puzzling error.
+        if !is_known(&k) && k != "me" {
             return Err(err(
                 StatusCode::BAD_REQUEST,
-                &format!("Unknown permission `{k}`. Known permissions: me, domain."),
+                &format!("Unknown permission `{k}`. Known permissions: send, read, write, domain."),
             ));
         }
         out.push(k);
@@ -191,8 +258,9 @@ fn is_unique_violation(e: &sqlx::Error) -> bool {
 }
 
 /// What a mailbox may do right now: its role's permissions plus any extras, or
-/// `me` alone when it has no grant. `me` is a floor — every mailbox can always
-/// manage itself — which is why an unconfigured install is still correct.
+/// the self-service set when it has no grant. Self-service is a floor — every
+/// mailbox can always manage itself — which is why an unconfigured install is
+/// still correct.
 pub async fn effective_permissions(db: &sqlx::PgPool, email: &str) -> Result<Vec<String>, ApiError> {
     let email = email.trim().to_ascii_lowercase();
     let row: Option<(Option<Vec<String>>, Vec<String>)> = sqlx::query_as(
@@ -208,10 +276,10 @@ pub async fn effective_permissions(db: &sqlx::PgPool, email: &str) -> Result<Vec
 
     let mut perms: Vec<String> = match row {
         Some((role, extra)) => role.unwrap_or_default().into_iter().chain(extra).collect(),
-        None => vec![PERM_ME.to_string()],
+        None => self_service(),
     };
     if perms.is_empty() {
-        perms.push(PERM_ME.to_string());
+        perms = self_service();
     }
     Ok(canonicalize(perms))
 }
@@ -242,6 +310,26 @@ fn normalize_email(raw: &str) -> Result<String, ApiError> {
         return Err(err(StatusCode::BAD_REQUEST, "A mailbox email address is required"));
     }
     Ok(email)
+}
+
+/// Turn a requested lifetime into an absolute expiry.
+///
+/// `None` is "never expires". A value is bounded so a slipped keystroke cannot
+/// mint a credential that outlives the database — ten years is already far past
+/// any operational reason to keep one.
+fn expiry_from_days(days: Option<i64>) -> Result<Option<chrono::DateTime<chrono::Utc>>, ApiError> {
+    match days {
+        None => Ok(None),
+        Some(d) if d <= 0 => Err(err(
+            StatusCode::BAD_REQUEST,
+            "expires_in_days must be a positive number of days (omit the field for no expiry)",
+        )),
+        Some(d) if d > 3650 => Err(err(
+            StatusCode::BAD_REQUEST,
+            "expires_in_days must be at most 3650 (ten years)",
+        )),
+        Some(d) => Ok(Some(chrono::Utc::now() + chrono::Duration::days(d))),
+    }
 }
 
 // ── Webmail client key ───────────────────────────────────────────────────
@@ -675,7 +763,7 @@ pub async fn delete_grant(
 // ── Tokens ───────────────────────────────────────────────────────────────
 
 fn token_select() -> &'static str {
-    "SELECT id, email, name, token_prefix, permissions, created_at, last_used_at, revoked \
+    "SELECT id, email, name, token_prefix, permissions, created_at, expires_at, last_used_at, revoked \
        FROM mail_api_tokens"
 }
 
@@ -729,7 +817,7 @@ pub async fn create_token(
             if wanted.is_empty() {
                 return Err(err(
                     StatusCode::BAD_REQUEST,
-                    "A token must be granted at least one permission (me or domain).",
+                    "A token must be granted at least one permission (send, read, write or domain).",
                 ));
             }
             if !is_subset(&wanted, &effective) {
@@ -747,18 +835,20 @@ pub async fn create_token(
     };
 
     let name = body.name.as_deref().map(str::trim).filter(|n| !n.is_empty());
+    let expires_at = expiry_from_days(body.expires_in_days)?;
     let (raw, hash, prefix) = mint_token();
 
     let token: MailApiToken = sqlx::query_as(&format!(
-        "INSERT INTO mail_api_tokens (email, name, token_hash, token_prefix, permissions, created_by) \
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING {}",
-        "id, email, name, token_prefix, permissions, created_at, last_used_at, revoked"
+        "INSERT INTO mail_api_tokens (email, name, token_hash, token_prefix, permissions, expires_at, created_by) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING {}",
+        "id, email, name, token_prefix, permissions, created_at, expires_at, last_used_at, revoked"
     ))
     .bind(&email)
     .bind(name)
     .bind(&hash)
     .bind(&prefix)
     .bind(&permissions)
+    .bind(expires_at)
     .bind(claims.sub)
     .fetch_one(&state.db)
     .await
@@ -787,6 +877,7 @@ pub async fn create_token(
             "token_prefix": token.token_prefix,
             "permissions": token.permissions,
             "created_at": token.created_at,
+            "expires_at": token.expires_at,
         })),
     ))
 }
@@ -827,33 +918,36 @@ pub async fn revoke_token(
 }
 
 /// POST /api/mail/api/tokens/{id}/rotate — replace the secret, keeping the
-/// token's email and permissions. The old secret stops working immediately.
+/// token's email, permissions and expiry. The old secret stops working
+/// immediately.
 pub async fn rotate_token(
     State(state): State<AppState>,
     AdminUser(claims): AdminUser,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let existing: Option<(String, Option<String>, Vec<String>)> = sqlx::query_as(
-        "SELECT email, name, permissions FROM mail_api_tokens WHERE id = $1",
-    )
-    .bind(id)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| internal_error("mail_api rotate_token", e))?;
-    let (email, name, permissions) =
+    let existing: Option<(String, Option<String>, Vec<String>, Option<chrono::DateTime<chrono::Utc>>)> =
+        sqlx::query_as(
+            "SELECT email, name, permissions, expires_at FROM mail_api_tokens WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| internal_error("mail_api rotate_token", e))?;
+    let (email, name, permissions, expires_at) =
         existing.ok_or_else(|| err(StatusCode::NOT_FOUND, "No such token"))?;
 
     let (raw, hash, prefix) = mint_token();
     let new: MailApiToken = sqlx::query_as(&format!(
-        "INSERT INTO mail_api_tokens (email, name, token_hash, token_prefix, permissions, created_by) \
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING {}",
-        "id, email, name, token_prefix, permissions, created_at, last_used_at, revoked"
+        "INSERT INTO mail_api_tokens (email, name, token_hash, token_prefix, permissions, expires_at, created_by) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING {}",
+        "id, email, name, token_prefix, permissions, created_at, expires_at, last_used_at, revoked"
     ))
     .bind(&email)
     .bind(name.as_deref())
     .bind(&hash)
     .bind(&prefix)
     .bind(&permissions)
+    .bind(expires_at)
     .bind(claims.sub)
     .fetch_one(&state.db)
     .await
@@ -886,7 +980,77 @@ pub async fn rotate_token(
         "token_prefix": new.token_prefix,
         "permissions": new.permissions,
         "created_at": new.created_at,
+        "expires_at": new.expires_at,
     })))
+}
+
+/// PUT /api/mail/api/tokens/{id} — rename a token and/or change its expiry.
+/// The secret is untouched; rotate is what replaces that.
+///
+/// `expires_in_days` is a tri-state on purpose: left out, the current expiry
+/// stands; a positive number sets a new one that many days out; `0` clears it
+/// (never expires). A handful of calls in a UI is all this serves, so the three
+/// states are worth spelling out rather than inventing a nested `Option`.
+pub async fn update_token(
+    State(state): State<AppState>,
+    AdminUser(claims): AdminUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<UpdateTokenRequest>,
+) -> Result<Json<MailApiToken>, ApiError> {
+    let email: Option<String> = sqlx::query_scalar("SELECT email FROM mail_api_tokens WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| internal_error("mail_api update_token", e))?;
+    let email = email.ok_or_else(|| err(StatusCode::NOT_FOUND, "No such token"))?;
+
+    let name = body.name.as_deref().map(str::trim).filter(|n| !n.is_empty());
+
+    // `None` leaves the column alone; `Some(None)` clears it; `Some(Some(_))`
+    // sets it. Validating before the UPDATE keeps a rejected value from having
+    // already renamed the token.
+    let expiry: Option<Option<chrono::DateTime<chrono::Utc>>> = match body.expires_in_days {
+        None => None,
+        Some(d) if d <= 0 => Some(None),
+        Some(d) => Some(expiry_from_days(Some(d))?),
+    };
+
+    let token: MailApiToken = match expiry {
+        None => sqlx::query_as(&format!(
+            "UPDATE mail_api_tokens SET name = COALESCE($2, name) WHERE id = $1 RETURNING {}",
+            "id, email, name, token_prefix, permissions, created_at, expires_at, last_used_at, revoked"
+        ))
+        .bind(id)
+        .bind(name)
+        .fetch_one(&state.db)
+        .await,
+        Some(expires_at) => sqlx::query_as(&format!(
+            "UPDATE mail_api_tokens SET name = COALESCE($2, name), expires_at = $3 \
+              WHERE id = $1 RETURNING {}",
+            "id, email, name, token_prefix, permissions, created_at, expires_at, last_used_at, revoked"
+        ))
+        .bind(id)
+        .bind(name)
+        .bind(expires_at)
+        .fetch_one(&state.db)
+        .await,
+    }
+    .map_err(|e| internal_error("mail_api update_token", e))?;
+
+    activity::log_activity(
+        &state.db,
+        claims.sub,
+        &claims.email,
+        "mail.api_token_update",
+        Some("mail_account"),
+        Some(&email),
+        None,
+        None,
+        claims.key_id,
+    )
+    .await;
+
+    Ok(Json(token))
 }
 
 /// GET /api/mail/webmail/tokens?email= — what the Roundcube Mail API tab calls.
@@ -913,4 +1077,92 @@ pub async fn webmail_tokens(
     .map_err(|e| internal_error("mail_api webmail_tokens", e))?;
 
     Ok(Json(serde_json::json!({ "tokens": tokens })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn keys(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// `domain` is defined as the whole self-service set *plus* the server-wide
+    /// surface, and `write` as every change a mailbox can make — which a route
+    /// also has to be able to read first. A set naming only the narrow half is
+    /// completed rather than accepted, in the catalog's order so that two equal
+    /// sets serialize as two equal arrays.
+    #[test]
+    fn canonicalize_completes_the_implied_permissions() {
+        assert_eq!(
+            canonicalize(keys(&["domain"])),
+            keys(&["send", "read", "write", "domain"])
+        );
+        assert_eq!(canonicalize(keys(&["write"])), keys(&["read", "write"]));
+        assert_eq!(canonicalize(keys(&["read"])), keys(&["read"]));
+        assert_eq!(
+            canonicalize(keys(&["write", "send"])),
+            keys(&["send", "read", "write"])
+        );
+    }
+
+    /// `me` predates the split. It is expanded, not dropped: a grant, an extra or
+    /// a token minted against it keeps every self-service right it had and gains
+    /// nothing server-wide. Anything unrecognised is dropped instead — the same
+    /// thing `canonicalize` does with a typo.
+    #[test]
+    fn me_is_the_legacy_spelling_of_self_service() {
+        assert_eq!(canonicalize(keys(&["me"])), keys(&["send", "read", "write"]));
+        assert_eq!(
+            canonicalize(keys(&["me", "domain"])),
+            keys(&["send", "read", "write", "domain"])
+        );
+        assert_eq!(canonicalize(keys(&["nonsense", "read"])), keys(&["read"]));
+        // ...and the old spelling still parses, in any case a client sends it.
+        assert_eq!(
+            parse_permissions(&keys(&[" Me "])).unwrap(),
+            keys(&["send", "read", "write"])
+        );
+    }
+
+    /// An unknown permission is refused rather than silently dropped: a role
+    /// built on a typo would otherwise look like it had granted something.
+    #[test]
+    fn an_unknown_permission_is_refused() {
+        let (status, body) =
+            parse_permissions(&keys(&["rda"])).expect_err("`rda` is not a permission");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let msg = body.0["error"].as_str().unwrap_or_default();
+        assert!(msg.contains("rda"), "{msg}");
+        assert!(msg.contains("send, read, write, domain"), "{msg}");
+    }
+
+    /// Minting must never be able to ask for more than the mailbox allows, while
+    /// a narrower subset is exactly the point of the feature.
+    #[test]
+    fn a_token_cannot_exceed_its_mailbox() {
+        let allowance = keys(&["send", "read", "write"]);
+        assert!(is_subset(&keys(&["read"]), &allowance));
+        assert!(is_subset(&keys(&["send"]), &allowance));
+        assert!(!is_subset(&keys(&["domain"]), &allowance));
+        assert!(!is_subset(
+            &keys(&["send", "read", "write", "domain"]),
+            &allowance
+        ));
+    }
+
+    /// A lifetime is optional, and a mistake in one is refused rather than
+    /// minting a credential that outlives the database.
+    #[test]
+    fn expiry_is_optional_and_bounded() {
+        assert_eq!(expiry_from_days(None).unwrap(), None);
+        assert!(expiry_from_days(Some(0)).is_err());
+        assert!(expiry_from_days(Some(-5)).is_err());
+        assert!(expiry_from_days(Some(3651)).is_err());
+
+        let at = expiry_from_days(Some(30)).unwrap().expect("30 days is an expiry");
+        let now = chrono::Utc::now();
+        assert!(at > now + chrono::Duration::days(29), "{at}");
+        assert!(at < now + chrono::Duration::days(31), "{at}");
+    }
 }

@@ -5,14 +5,16 @@ import { api } from "../api";
  * Mail API administration: roles, per-mailbox permissions, and tokens.
  *
  * This is where mail-API tokens are minted now. Each token carries its own
- * subset of a two-entry permission catalog — `me` (the token's own mailbox) and
- * `domain` (the whole server) — and its effective set is that subset
- * *intersected* with what the mailbox is currently allowed, recomputed by the
- * daemon on every request. Two consequences the UI has to make visible rather
- * than hide:
+ * subset of a four-entry permission catalog — `send`, `read`, `write` (the two
+ * halves of managing its own mailbox) and `domain` (the whole server) — and its
+ * effective set is that subset *intersected* with what the mailbox is currently
+ * allowed, recomputed by the daemon on every request. A token may also carry an
+ * expiry, after which it is refused like a revoked one. Two consequences the UI
+ * has to make visible rather than hide:
  *
- *   * a token can be narrower than its mailbox, and the narrowest useful one is
- *     `me` alone — the default, and the safe choice;
+ *   * a token can be narrower than its mailbox — a monitoring credential wants
+ *     `read` alone, a contact form `send` alone — and the narrowest useful token
+ *     is the safe choice;
  *   * changing a mailbox's role or removing an extra permission downgrades the
  *     tokens already handed out, so it is a revocation, not just a setting.
  *
@@ -48,6 +50,7 @@ interface MailApiToken {
   token_prefix: string;
   permissions: string[];
   created_at: string;
+  expires_at: string | null;
   last_used_at: string | null;
   revoked: boolean;
 }
@@ -145,8 +148,12 @@ function TokensTab({
   const [name, setName] = useState("");
   const [allowed, setAllowed] = useState<string[]>([]);
   const [chosen, setChosen] = useState<string[]>([]);
+  const [lifetime, setLifetime] = useState("0");
   const [minted, setMinted] = useState<{ token: string; email: string } | null>(null);
   const [busy, setBusy] = useState(false);
+
+  /** Whether a token is past its expiry and therefore already refused. */
+  const expired = (t: MailApiToken) => !!t.expires_at && new Date(t.expires_at).getTime() <= Date.now();
 
   // Look up what the mailbox is allowed so the picker can only offer that. A
   // token asking for more than the mailbox has is refused by the backend, so
@@ -166,19 +173,35 @@ function TokensTab({
   const mint = async () => {
     setBusy(true);
     try {
+      const days = Number(lifetime);
       const r = await api.post<{ token: string; email: string }>("/mail/api/tokens", {
         email: email.trim().toLowerCase(),
         name: name.trim() || undefined,
         permissions: chosen,
+        // Omitted (not 0) means "never expires"; the backend refuses a 0.
+        expires_in_days: days > 0 ? days : undefined,
       });
       setMinted({ token: r.token, email: r.email });
       setName("");
+      setLifetime("0");
       onMessage({ text: "Token created. Copy it now — it is shown only once.", type: "success" });
       onChanged();
     } catch (e) {
       onMessage({ text: e instanceof Error ? e.message : "Could not create the token", type: "error" });
     } finally {
       setBusy(false);
+    }
+  };
+
+  // `0` clears the expiry, a positive number sets it that many days out — the
+  // two states the backend's `expires_in_days` carries.
+  const setExpiry = async (id: string, days: string) => {
+    try {
+      await api.put(`/mail/api/tokens/${id}`, { expires_in_days: Number(days) });
+      onMessage({ text: Number(days) > 0 ? `Expiry set to ${days} days` : "Expiry cleared", type: "success" });
+      onChanged();
+    } catch (e) {
+      onMessage({ text: e instanceof Error ? e.message : "Could not change the expiry", type: "error" });
     }
   };
 
@@ -229,6 +252,17 @@ function TokensTab({
             <input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Monitoring"
               className="w-full px-2 py-1.5 bg-dark-900 border border-dark-600 rounded text-xs text-dark-50 focus:border-dark-400 outline-none" />
           </label>
+          <label className="w-36">
+            <span className="block text-[10px] text-dark-400 uppercase tracking-wider mb-1">Expires</span>
+            <select value={lifetime} onChange={(e) => setLifetime(e.target.value)}
+              className="w-full px-2 py-1.5 bg-dark-900 border border-dark-600 rounded text-xs text-dark-50 focus:border-dark-400 outline-none">
+              <option value="0">Never</option>
+              <option value="30">In 30 days</option>
+              <option value="90">In 90 days</option>
+              <option value="180">In 180 days</option>
+              <option value="365">In 1 year</option>
+            </select>
+          </label>
           <button onClick={mint} disabled={busy || !email.includes("@") || chosen.length === 0}
             className="px-3 py-1.5 bg-rust-500 text-white rounded text-xs font-medium hover:bg-rust-600 disabled:opacity-40 transition-colors">
             Create token
@@ -263,7 +297,7 @@ function TokensTab({
         <table className="w-full text-[11px]">
           <thead>
             <tr className="text-dark-400 uppercase tracking-wider text-left">
-              <th className="py-1">Token</th><th>Mailbox</th><th>Name</th><th>Permissions</th><th>Last used</th><th></th>
+              <th className="py-1">Token</th><th>Mailbox</th><th>Name</th><th>Permissions</th><th>Expires</th><th>Last used</th><th></th>
             </tr>
           </thead>
           <tbody>
@@ -273,12 +307,25 @@ function TokensTab({
                 <td className="text-dark-100">{t.email}</td>
                 <td className="text-dark-300">{t.name || "—"}</td>
                 <td className="font-mono text-dark-100">{t.permissions.join(", ") || "—"}</td>
+                <td className={expired(t) && !t.revoked ? "text-rust-400" : "text-dark-300"}>
+                  {t.expires_at
+                    ? `${expired(t) ? "expired " : ""}${new Date(t.expires_at).toLocaleDateString()}`
+                    : "never"}
+                </td>
                 <td className="text-dark-300">{t.last_used_at ? new Date(t.last_used_at).toLocaleString() : "never"}</td>
                 <td className="text-right">
                   {t.revoked ? (
                     <span className="text-dark-500">revoked</span>
                   ) : (
-                    <span className="inline-flex gap-1">
+                    <span className="inline-flex gap-1 items-center">
+                      <select value="" onChange={(e) => { if (e.target.value) setExpiry(t.id, e.target.value); }}
+                        className="px-1 py-0.5 bg-dark-900 border border-dark-600 rounded text-[11px] text-dark-100">
+                        <option value="">Expiry…</option>
+                        <option value="0">Never</option>
+                        <option value="30">+30 days</option>
+                        <option value="90">+90 days</option>
+                        <option value="365">+1 year</option>
+                      </select>
                       <button onClick={() => rotate(t.id)} className="px-2 py-0.5 bg-dark-700 text-dark-100 rounded hover:bg-dark-600">Rotate</button>
                       <button onClick={() => revoke(t.id)} className="px-2 py-0.5 bg-dark-700 text-dark-100 rounded hover:bg-dark-600">Revoke</button>
                     </span>
@@ -363,7 +410,7 @@ function AccessTab({
   const unassign = async (email: string) => {
     try {
       await api.delete(`/mail/api/grants/${encodeURIComponent(email)}`);
-      onMessage({ text: "Mailbox reset to the default (me only)", type: "success" });
+      onMessage({ text: "Mailbox reset to the default (self-service)", type: "success" });
       onChanged();
     } catch (e) {
       onMessage({ text: e instanceof Error ? e.message : "Could not reset", type: "error" });
@@ -432,7 +479,7 @@ function AccessTab({
             <span className="block text-[10px] text-dark-400 uppercase tracking-wider mb-1">Role</span>
             <select value={assignRole} onChange={(e) => setAssignRole(e.target.value)}
               className="w-full px-2 py-1.5 bg-dark-900 border border-dark-600 rounded text-xs text-dark-50 focus:border-dark-400 outline-none">
-              <option value="">Default (me only)</option>
+              <option value="">Default (self-service)</option>
               {roles.map((r) => <option key={r.id} value={r.id}>{r.name}</option>)}
             </select>
           </label>
@@ -447,7 +494,7 @@ function AccessTab({
       <div className="border border-dark-600 rounded-lg p-3">
         <p className="text-[11px] text-dark-300 mb-2">Assigned mailboxes</p>
         {grants.length === 0 ? (
-          <p className="text-[11px] text-dark-400">None. Every mailbox gets the default (<span className="font-mono">me</span> only) until assigned here.</p>
+          <p className="text-[11px] text-dark-400">None. Every mailbox gets the default (<span className="font-mono">send, read, write</span>) until assigned here.</p>
         ) : (
           <table className="w-full text-[11px]">
             <thead>

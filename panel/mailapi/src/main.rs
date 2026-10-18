@@ -16,22 +16,30 @@
 //!     `mail_api_tokens` table, over the same Postgres the panel uses), or
 //!   * a token minted by the bundled Roundcube plugin before the panel took
 //!     over — its sha256 is looked up in Roundcube's SQLite
-//!     `dockpanel_mailapi_tokens` table and it is granted `me` and nothing more, or
+//!     `dockpanel_mailapi_tokens` table and it is granted self-service and nothing more, or
 //!   * a JWT signed with the panel's `JWT_SECRET` (HS256) that carries an
 //!     `email` claim — the "internal" path used by the panel itself, or
 //!   * a panel API key (`dp_…`), which is forwarded to the backend untouched so
 //!     the panel's own authorization decides what it may do.
 //!
 //! A token identifies a MAILBOX and carries its own set of PERMISSIONS, drawn
-//! from a two-entry catalog:
-//!   * `me`     — `/v1/me/*` and `/v1/send`; manage only the token's own mailbox
+//! from a four-entry catalog:
+//!   * `send`   — `/v1/send` and `/emails`; mail out as the mailbox
+//!   * `read`   — the `GET` half of `/v1/me/*`; look, do not touch
+//!   * `write`  — the mutating half of `/v1/me/*` (implies `read`)
 //!   * `domain` — `/v1/domains/*` and `/v1/queue`; manage the whole server
+//!
+//! `me`, the earlier single self-service entry, is still honoured as an alias for
+//! `send`+`read`+`write`, so a token minted before the split keeps its access.
 //!
 //! The token's permissions are an upper bound, not a floor: they are intersected
 //! on every request with what the mailbox is *currently* allowed (its role in the
-//! panel, `panel/backend/src/routes/mail_api.rs`). That is what makes a `/me`-only
-//! token stay `/me`-only even for an administrator mailbox, and what makes
-//! removing `domain` from a mailbox take effect on tokens already handed out.
+//! panel, `panel/backend/src/routes/mail_api.rs`). That is what makes a
+//! `send`-only token stay `send`-only even for an administrator mailbox, and what
+//! makes removing `domain` from a mailbox take effect on tokens already handed
+//! out. A token may also carry an expiry (`mail_api_tokens.expires_at`); an
+//! expired row is filtered out of the lookup, so it is refused exactly like a
+//! revoked one.
 //! Management is not reimplemented here: the daemon calls the panel backend's
 //! existing `/api/mail/*` routes over loopback, so there is one implementation of
 //! each operation and one place where its authorization rule lives. The `dp_` key
@@ -269,14 +277,20 @@ fn generate_message_id(identity: &str) -> String {
 
 /// The permissions a mail-API token can hold.
 ///
-/// Deliberately two booleans rather than a `Vec<String>`: there are exactly two
-/// entries, and a typo in a lookup is then a compile error instead of a
-/// permission that silently never matches.
+/// Four booleans rather than a `Vec<String>`: the catalog is fixed, so a typo in
+/// a lookup is a compile error instead of a permission that silently never
+/// matches. `write` and `domain` are *implications* — `expand` completes them
+/// into the wider set, exactly as the panel's `canonicalize` does, so a stored
+/// row can never mean a combination the catalog's own wording denies.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Permissions {
-    /// `/v1/me/*` and `/v1/send` — manage the token's own mailbox.
-    me: bool,
-    /// `/v1/domains/*` and `/v1/queue` — manage the whole server.
+    /// `/v1/send` and `/emails` — mail out as the token's own mailbox.
+    send: bool,
+    /// The `GET` half of `/v1/me/*` — read the mailbox, change nothing.
+    read: bool,
+    /// The mutating half of `/v1/me/*`. Implies `read`.
+    write: bool,
+    /// `/v1/domains/*` and `/v1/queue` — the whole server. Implies all of the above.
     domain: bool,
 }
 
@@ -285,14 +299,18 @@ impl Permissions {
     /// `dp_` key the backend has already authorised, or a host-local static
     /// token. None of these is a mailbox token — they belong to the panel and to
     /// root on the box, so they keep the whole surface.
-    const ALL: Permissions = Permissions { me: true, domain: true };
+    const ALL: Permissions = Permissions { send: true, read: true, write: true, domain: true };
 
-    /// A token minted by the old Roundcube plugin: `me`, and nothing wider.
-    const ME: Permissions = Permissions { me: true, domain: false };
+    /// A token whose mailbox has no grant, or one minted by the old Roundcube
+    /// plugin: the whole of self-service, and nothing server-wide.
+    const SELF_SERVICE: Permissions =
+        Permissions { send: true, read: true, write: true, domain: false };
 
     fn has(self, key: &str) -> bool {
         match key {
-            "me" => self.me,
+            "send" => self.send,
+            "read" => self.read,
+            "write" => self.write,
             "domain" => self.domain,
             _ => false,
         }
@@ -300,14 +318,69 @@ impl Permissions {
 
     fn names(self) -> Vec<&'static str> {
         let mut out = Vec::new();
-        if self.me {
-            out.push("me");
+        if self.send {
+            out.push("send");
+        }
+        if self.read {
+            out.push("read");
+        }
+        if self.write {
+            out.push("write");
         }
         if self.domain {
             out.push("domain");
         }
         out
     }
+
+    /// Everything both sets agree on. Used to cap a token by its mailbox.
+    fn and(self, other: Permissions) -> Permissions {
+        Permissions {
+            send: self.send && other.send,
+            read: self.read && other.read,
+            write: self.write && other.write,
+            domain: self.domain && other.domain,
+        }
+    }
+}
+
+/// The permission names a mailbox with no grant — or an empty one — holds: the
+/// whole of self-service. Kept as names because it feeds `expand` beside the
+/// rows read from the database, and is the same set `Permissions::SELF_SERVICE`
+/// stands for.
+const SELF_SERVICE_PERMISSIONS: [&str; 3] = ["send", "read", "write"];
+
+/// Read a stored permission list into flags, completing the implications.
+///
+/// This is where the old `me` spelling is kept alive: it contributes the whole
+/// self-service trio, so a token row that predates the four-entry catalog behaves
+/// exactly as it used to. `write` then pulls in `read`, and `domain` pulls in
+/// everything — applied here as well as in the panel so the daemon never depends
+/// on a row having been normalised first.
+fn expand(keys: &[String]) -> Permissions {
+    let mut p = Permissions::default();
+    for k in keys {
+        match k.as_str() {
+            "me" => {
+                p.send = true;
+                p.read = true;
+                p.write = true;
+            }
+            "send" => p.send = true,
+            "read" => p.read = true,
+            "write" => p.write = true,
+            "domain" => p.domain = true,
+            _ => {}
+        }
+    }
+    if p.write || p.domain {
+        p.read = true;
+    }
+    if p.domain {
+        p.send = true;
+        p.write = true;
+    }
+    p
 }
 
 /// Credentials the daemon can resolve without the panel: the panel's JWT and the
@@ -348,11 +421,11 @@ fn resolve_local_identity(cfg: &Config, token: &str) -> Option<(String, Permissi
 /// Look up `token_hash` in Roundcube's **legacy** token table.
 ///
 /// Tokens minted by the old plugin (before the panel took over) still
-/// authenticate here, and they are granted `me` and nothing more — deliberately.
-/// The old model decided a token's power from the mailbox's *address*, so a row
-/// in this table was potentially a server-wide one; refusing to read anything
-/// wider than `me` out of it is what stops the old behaviour surviving the
-/// change. A mailbox that wants `domain` mints a panel token.
+/// authenticate here, and they are granted self-service and nothing more —
+/// deliberately. The old model decided a token's power from the mailbox's
+/// *address*, so a row in this table was potentially a server-wide one; refusing
+/// to read anything server-wide out of it is what stops the old behaviour
+/// surviving the change. A mailbox that wants `domain` mints a panel token.
 fn lookup_roundcube_token(cfg: &Config, token_hash: &str) -> Option<String> {
     let db = cfg.roundcube_db.as_ref()?;
     if !db.exists() {
@@ -381,20 +454,11 @@ fn lookup_roundcube_token(cfg: &Config, token_hash: &str) -> Option<String> {
 ///
 /// Split out from `lookup_panel_token` so the rule can be pinned without a
 /// database: this is the function that makes a revocation immediate, and it is
-/// the only place the two lists meet.
+/// the only place the two lists meet. Both sides are `expand`ed first, so a row
+/// written before the catalog grew (`me`) or one missing an implication (`write`
+/// without `read`) is completed before the intersection rather than after.
 fn intersect_token_permissions(token_perms: &[String], allowance: &[String]) -> Permissions {
-    let mut effective = Permissions::default();
-    for key in token_perms {
-        if !allowance.iter().any(|a| a == key) {
-            continue;
-        }
-        match key.as_str() {
-            "me" => effective.me = true,
-            "domain" => effective.domain = true,
-            _ => {}
-        }
-    }
-    effective
+    expand(token_perms).and(expand(allowance))
 }
 
 /// Look up a panel-minted token by its hash, returning the mailbox and the
@@ -404,6 +468,10 @@ fn intersect_token_permissions(token_perms: &[String], allowance: &[String]) -> 
 /// intersection is the point of the whole design: a token that was granted
 /// `domain` stops having it the moment the mailbox's role stops granting it, so
 /// revoking does not require finding every token that was handed out.
+///
+/// An expired row (`expires_at` in the past) is filtered out here, so it is
+/// refused exactly like a revoked one — `401`, and never a fall-through to the
+/// legacy table.
 async fn lookup_panel_token(
     pg: &sqlx::PgPool,
     token_hash: &str,
@@ -413,7 +481,8 @@ async fn lookup_panel_token(
            FROM mail_api_tokens t \
            LEFT JOIN mail_api_grants g ON g.email = t.email \
            LEFT JOIN mail_api_roles r ON r.id = g.role_id \
-          WHERE t.token_hash = $1 AND t.revoked = FALSE",
+          WHERE t.token_hash = $1 AND t.revoked = FALSE \
+            AND (t.expires_at IS NULL OR t.expires_at > NOW())",
     )
     .bind(token_hash)
     .fetch_optional(pg)
@@ -423,15 +492,19 @@ async fn lookup_panel_token(
         return Ok(None);
     };
 
-    // No grant row at all is the default allowance — `me` alone, the same rule
-    // the panel applies. A grant whose role was deleted falls back the same way.
-    let allowance: Vec<String> = match (role_perms, extra) {
-        (None, None) => vec!["me".to_string()],
-        (role, extra) => role
-            .unwrap_or_default()
-            .into_iter()
-            .chain(extra.unwrap_or_default())
-            .collect(),
+    let allowance: Vec<String> = role_perms
+        .unwrap_or_default()
+        .into_iter()
+        .chain(extra.unwrap_or_default())
+        .collect();
+    // No grant row at all is the default allowance — the whole of self-service,
+    // the same rule the panel's `effective_permissions` applies. A grant whose
+    // role was deleted, or one that names no role and no extras, falls back the
+    // same way, so the two sides never disagree about an empty allowance.
+    let allowance = if allowance.is_empty() {
+        SELF_SERVICE_PERMISSIONS.iter().map(|s| s.to_string()).collect()
+    } else {
+        allowance
     };
 
     let effective = intersect_token_permissions(&token_perms, &allowance);
@@ -464,10 +537,6 @@ impl Principal {
     }
 }
 
-async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<String, ApiErr> {
-    Ok(principal(state, headers).await?.email)
-}
-
 /// Resolve a bearer credential into the mailbox it speaks for and the
 /// permissions it holds.
 ///
@@ -478,7 +547,7 @@ async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<String, A
 ///   * a panel JWT or a host-local static token — trusted, full surface;
 ///   * a panel-minted mail-API token — a mailbox plus its own permissions,
 ///     intersected with what the mailbox is allowed right now;
-///   * a legacy Roundcube token — a mailbox, `me` only.
+///   * a legacy Roundcube token — a mailbox, self-service only.
 async fn principal(state: &AppState, headers: &HeaderMap) -> Result<Principal, ApiErr> {
     let token = bearer_token(headers)
         .ok_or_else(|| ApiErr::unauthorized("Missing API token (Authorization: Bearer <token>)"))?;
@@ -518,8 +587,8 @@ async fn principal(state: &AppState, headers: &HeaderMap) -> Result<Principal, A
             Ok(None) => {}
             Err(e) => {
                 // Fail closed. Falling through to the legacy table on a database
-                // error would still authenticate the token — as `me` — and a
-                // broken connection would then look like a token that had been
+                // error would still authenticate the token — as self-service — and
+                // a broken connection would then look like a token that had been
                 // narrowed, which is exactly the outcome to refuse.
                 tracing::error!("panel mail-API token lookup failed: {e}");
                 return Err(ApiErr::new(
@@ -530,11 +599,11 @@ async fn principal(state: &AppState, headers: &HeaderMap) -> Result<Principal, A
         }
     }
 
-    // The old Roundcube table: `me` only, never wider.
+    // The old Roundcube table: self-service only, never wider.
     if let Some(email) = lookup_roundcube_token(&state.cfg, &hash) {
         return Ok(Principal {
             email: email.to_lowercase(),
-            permissions: Permissions::ME,
+            permissions: Permissions::SELF_SERVICE,
             passthrough_key: None,
         });
     }
@@ -544,20 +613,23 @@ async fn principal(state: &AppState, headers: &HeaderMap) -> Result<Principal, A
 
 /// Refuse a route the caller's token was not granted.
 ///
-/// The refusal names the permission and where to grant it, because the common
-/// case is an operator who minted a `/me`-only token and then pointed it at a
-/// management route — the fix is a grant in the panel, not a different token.
+/// The refusal names the permission, what the token *does* hold, and where to
+/// grant it, because the common case is an operator who minted a narrow token and
+/// then pointed it at a wider route — the fix is a grant in the panel, not a
+/// different token.
 fn require_permission(p: &Principal, permission: &str) -> Result<(), ApiErr> {
     if p.permissions.has(permission) {
         return Ok(());
     }
+    let held = p.permissions.names();
+    let held = if held.is_empty() { "none".to_string() } else { held.join(", ") };
     let msg = match permission {
         "domain" => format!(
-            "{} may not administer the whole server: its token was not granted the `domain` permission. Grant it in the panel under Mail -> Mail API, then mint a token with it.",
+            "{} may not administer the whole server: its token was not granted the `domain` permission (it holds: {held}). Grant it in the panel under Mail -> Mail API, then mint a token with it.",
             p.email
         ),
         other => format!(
-            "{} may not use this route: its token was not granted the `{other}` permission.",
+            "{} may not use this route: its token was not granted the `{other}` permission (it holds: {held}).",
             p.email
         ),
     };
@@ -701,7 +773,9 @@ async fn send(
     headers: HeaderMap,
     Json(body): Json<SendRequest>,
 ) -> Result<Json<Value>, ApiErr> {
-    let identity = authenticate(&state, &headers).await?;
+    let p = principal(&state, &headers).await?;
+    require_permission(&p, "send")?;
+    let identity = p.email;
     let draft = Draft::resolve(&identity, body)?;
     if draft.to.is_empty() {
         return Err(ApiErr::bad("At least one 'to' recipient is required"));
@@ -1058,6 +1132,7 @@ async fn me_update(
     Json(body): Json<AccountPatch>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
+    require_permission(&p, "write")?;
     let value = patch_account(&state, &p, json!({ "display_name": body.display_name })).await?;
     Ok(Json(value))
 }
@@ -1074,6 +1149,7 @@ async fn me_password(
     Json(body): Json<PasswordChange>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
+    require_permission(&p, "write")?;
     if body.new_password.is_empty() {
         return Err(ApiErr::bad("new_password is required"));
     }
@@ -1093,6 +1169,7 @@ async fn me_forward_get(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
+    require_permission(&p, "read")?;
     let acc = fetch_account(&state, &p, &p.email).await?;
     Ok(Json(json!({ "forward_to": acc.get("forward_to").cloned().unwrap_or(Value::Null) })))
 }
@@ -1104,6 +1181,7 @@ async fn me_forward_put(
     Json(body): Json<ForwardSetting>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
+    require_permission(&p, "write")?;
     // A PUT replaces the setting, so an omitted field means "no forwarding"
     // rather than "leave it as it was" — the backend clears on an empty string.
     let value =
@@ -1128,6 +1206,7 @@ async fn me_autoresponder_get(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
+    require_permission(&p, "read")?;
     let acc = fetch_account(&state, &p, &p.email).await?;
     Ok(Json(json!({
         "enabled": acc.get("autoresponder_enabled").cloned().unwrap_or(Value::Bool(false)),
@@ -1143,6 +1222,7 @@ async fn me_autoresponder_put(
     Json(body): Json<AutoresponderSetting>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
+    require_permission(&p, "write")?;
     let patch = json!({
         "autoresponder_enabled": body.enabled,
         "autoresponder_subject": body.subject,
@@ -1165,6 +1245,7 @@ async fn me_quota(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
+    require_permission(&p, "read")?;
 
     //        INBOX messages=8 vsize=12345
     let out = doveadm(&["mailbox", "status", "-u", &p.email, "messages vsize", "*"])
@@ -1212,6 +1293,7 @@ async fn me_folders(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
+    require_permission(&p, "read")?;
     let out = doveadm(&["mailbox", "list", "-u", &p.email])
         .await
         .map_err(|e| ApiErr::internal(format!("doveadm mailbox list: {e}")))?;
@@ -1227,6 +1309,7 @@ async fn me_folder_create(
     Json(body): Json<FolderCreate>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
+    require_permission(&p, "write")?;
     if body.name.trim().is_empty() {
         return Err(ApiErr::bad("name is required"));
     }
@@ -1244,6 +1327,7 @@ async fn me_folder_delete(
     Query(q): Query<FolderQuery>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
+    require_permission(&p, "write")?;
     // Refuse to remove a folder Dovecot treats as structural.
     const PROTECTED: [&str; 3] = ["INBOX", "Sent", "Trash"];
     if PROTECTED.iter().any(|f| f.eq_ignore_ascii_case(&q.name)) {
@@ -2239,6 +2323,7 @@ async fn me_messages(
     Query(q): Query<MessagesQuery>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
+    require_permission(&p, "read")?;
     let folder = q.folder.clone().unwrap_or_else(|| "INBOX".to_string());
     known_folder(&p.email, &folder).await?;
 
@@ -2288,6 +2373,7 @@ async fn me_message(
     Query(q): Query<MessageQuery>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
+    require_permission(&p, "read")?;
     let uid = parse_uid(&uid)?;
     known_folder(&p.email, &q.folder).await?;
     let uid_arg = uid.to_string();
@@ -2324,6 +2410,7 @@ async fn me_message_delete(
     Query(q): Query<MessageQuery>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
+    require_permission(&p, "write")?;
     let uid = parse_uid(&uid)?;
     known_folder(&p.email, &q.folder).await?;
     let uid_arg = uid.to_string();
@@ -2364,6 +2451,7 @@ async fn me_message_move(
     Json(body): Json<MessageMove>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
+    require_permission(&p, "write")?;
     let uid = parse_uid(&uid)?;
     known_folder(&p.email, &body.folder).await?;
     known_folder(&p.email, &body.to).await?;
@@ -2399,6 +2487,7 @@ async fn me_message_flags(
     Json(body): Json<FlagsChange>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
+    require_permission(&p, "write")?;
     let uid = parse_uid(&uid)?;
     known_folder(&p.email, &body.folder).await?;
     let uid_arg = uid.to_string();
@@ -2457,6 +2546,7 @@ async fn me_message_append(
     Json(body): Json<MessageAppend>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
+    require_permission(&p, "write")?;
     known_folder(&p.email, &body.folder).await?;
     // Everything is validated before anything is written: a bad flag or a bad
     // address must not leave behind a message the caller cannot then find.
@@ -2507,6 +2597,7 @@ async fn me_trash_empty(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
+    require_permission(&p, "write")?;
     // Counted first, because `expunge` reports nothing about what it removed and
     // "how much" is the only thing a caller can check afterwards.
     let before = doveadm_json(&["mailbox", "status", "-u", &p.email, "messages", "Trash"]).await?;
@@ -2764,6 +2855,7 @@ async fn contacts_list(
     Query(q): Query<roundcube::ContactQuery>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
+    require_permission(&p, "read")?;
     Ok(Json(roundcube::contacts(
         state.cfg.roundcube_db.as_deref(),
         &p.email,
@@ -2778,6 +2870,7 @@ async fn contacts_create(
     Json(body): Json<roundcube::ContactInput>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
+    require_permission(&p, "write")?;
     Ok(Json(roundcube::contact_create(
         state.cfg.roundcube_db.as_deref(),
         &p.email,
@@ -2792,6 +2885,7 @@ async fn contact_get(
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
+    require_permission(&p, "read")?;
     Ok(Json(roundcube::contact_get(
         state.cfg.roundcube_db.as_deref(),
         &p.email,
@@ -2807,6 +2901,7 @@ async fn contact_update(
     Json(body): Json<roundcube::ContactInput>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
+    require_permission(&p, "write")?;
     Ok(Json(roundcube::contact_update(
         state.cfg.roundcube_db.as_deref(),
         &p.email,
@@ -2822,6 +2917,7 @@ async fn contact_delete(
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
+    require_permission(&p, "write")?;
     Ok(Json(roundcube::contact_delete(
         state.cfg.roundcube_db.as_deref(),
         &p.email,
@@ -2835,6 +2931,7 @@ async fn groups_list(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
+    require_permission(&p, "read")?;
     Ok(Json(roundcube::groups(state.cfg.roundcube_db.as_deref(), &p.email)?))
 }
 
@@ -2845,6 +2942,7 @@ async fn group_create(
     Json(body): Json<roundcube::GroupInput>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
+    require_permission(&p, "write")?;
     Ok(Json(roundcube::group_create(
         state.cfg.roundcube_db.as_deref(),
         &p.email,
@@ -2859,6 +2957,7 @@ async fn group_get(
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
+    require_permission(&p, "read")?;
     Ok(Json(roundcube::group_get(
         state.cfg.roundcube_db.as_deref(),
         &p.email,
@@ -2874,6 +2973,7 @@ async fn group_update(
     Json(body): Json<roundcube::GroupInput>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
+    require_permission(&p, "write")?;
     Ok(Json(roundcube::group_update(
         state.cfg.roundcube_db.as_deref(),
         &p.email,
@@ -2889,6 +2989,7 @@ async fn group_delete(
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
+    require_permission(&p, "write")?;
     Ok(Json(roundcube::group_delete(
         state.cfg.roundcube_db.as_deref(),
         &p.email,
@@ -2904,6 +3005,7 @@ async fn group_set_members(
     Json(body): Json<roundcube::GroupMembers>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
+    require_permission(&p, "write")?;
     Ok(Json(roundcube::group_set_members(
         state.cfg.roundcube_db.as_deref(),
         &p.email,
@@ -2918,6 +3020,7 @@ async fn identities_list(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
+    require_permission(&p, "read")?;
     Ok(Json(roundcube::identities(
         state.cfg.roundcube_db.as_deref(),
         &p.email,
@@ -2931,6 +3034,7 @@ async fn identity_create(
     Json(body): Json<roundcube::IdentityInput>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
+    require_permission(&p, "write")?;
     Ok(Json(roundcube::identity_create(
         state.cfg.roundcube_db.as_deref(),
         &p.email,
@@ -2946,6 +3050,7 @@ async fn identity_update(
     Json(body): Json<roundcube::IdentityInput>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
+    require_permission(&p, "write")?;
     Ok(Json(roundcube::identity_update(
         state.cfg.roundcube_db.as_deref(),
         &p.email,
@@ -2961,6 +3066,7 @@ async fn identity_delete(
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
+    require_permission(&p, "write")?;
     Ok(Json(roundcube::identity_delete(
         state.cfg.roundcube_db.as_deref(),
         &p.email,
@@ -2974,6 +3080,7 @@ async fn responses_list(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
+    require_permission(&p, "read")?;
     Ok(Json(roundcube::responses(
         state.cfg.roundcube_db.as_deref(),
         &p.email,
@@ -2987,6 +3094,7 @@ async fn response_create(
     Json(body): Json<roundcube::ResponseInput>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
+    require_permission(&p, "write")?;
     Ok(Json(roundcube::response_create(
         state.cfg.roundcube_db.as_deref(),
         &p.email,
@@ -3002,6 +3110,7 @@ async fn response_update(
     Json(body): Json<roundcube::ResponseInput>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
+    require_permission(&p, "write")?;
     Ok(Json(roundcube::response_update(
         state.cfg.roundcube_db.as_deref(),
         &p.email,
@@ -3017,6 +3126,7 @@ async fn response_delete(
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
+    require_permission(&p, "write")?;
     Ok(Json(roundcube::response_delete(
         state.cfg.roundcube_db.as_deref(),
         &p.email,
@@ -3030,6 +3140,7 @@ async fn settings_get(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
+    require_permission(&p, "read")?;
     Ok(Json(roundcube::preferences_get(
         state.cfg.roundcube_db.as_deref(),
         &p.email,
@@ -3043,6 +3154,7 @@ async fn settings_put(
     Json(body): Json<Map<String, Value>>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
+    require_permission(&p, "write")?;
     Ok(Json(roundcube::preferences_put(
         state.cfg.roundcube_db.as_deref(),
         &p.email,
@@ -3064,6 +3176,7 @@ async fn collected_list(
     Query(q): Query<CollectedQuery>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
+    require_permission(&p, "read")?;
     Ok(Json(roundcube::collected(
         state.cfg.roundcube_db.as_deref(),
         &p.email,
@@ -3078,6 +3191,7 @@ async fn collected_delete(
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
+    require_permission(&p, "write")?;
     Ok(Json(roundcube::collected_delete(
         state.cfg.roundcube_db.as_deref(),
         &p.email,
@@ -3098,6 +3212,7 @@ async fn autocomplete(
     Query(q): Query<AutocompleteQuery>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
+    require_permission(&p, "read")?;
     Ok(Json(roundcube::autocomplete(
         state.cfg.roundcube_db.as_deref(),
         &p.email,
@@ -3165,7 +3280,8 @@ async fn main() {
         // Send
         .route("/v1/send", post(send))
         .route("/emails", post(send))
-        // Self-service — any mailbox token, and only for its own mailbox
+        // Self-service — gated per route by `send`, `read` or `write`, and only
+        // ever against the token's own mailbox.
         .route("/v1/me", get(me).put(me_update))
         .route("/v1/me/password", post(me_password))
         .route("/v1/me/forward", get(me_forward_get).put(me_forward_put))
@@ -3594,21 +3710,58 @@ mod tests {
     fn a_token_is_capped_by_its_mailbox() {
         let keys = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
-        // Granted `domain` and `me`, mailbox still allowed both.
-        let p = intersect_token_permissions(&keys(&["me", "domain"]), &keys(&["me", "domain"]));
-        assert!(p.has("me") && p.has("domain"));
+        // Granted the whole catalog, mailbox still allowed all of it.
+        let p = intersect_token_permissions(
+            &keys(&["send", "read", "write", "domain"]),
+            &keys(&["send", "read", "write", "domain"]),
+        );
+        assert!(p.has("domain") && p.has("write") && p.has("read") && p.has("send"));
 
-        // The mailbox was moved back to `me`: the token loses `domain` at once,
-        // with no need to find and revoke it.
-        let p = intersect_token_permissions(&keys(&["me", "domain"]), &keys(&["me"]));
-        assert!(p.has("me") && !p.has("domain"));
+        // The mailbox was moved back to self-service: the token loses `domain` at
+        // once, with no need to find and revoke it.
+        let p = intersect_token_permissions(
+            &keys(&["send", "read", "write", "domain"]),
+            &keys(&["send", "read", "write"]),
+        );
+        assert!(!p.has("domain") && p.has("write"));
 
         // A token may be narrower than its mailbox, and stays that way.
-        let p = intersect_token_permissions(&keys(&["me"]), &keys(&["me", "domain"]));
-        assert!(p.has("me") && !p.has("domain"));
+        let p = intersect_token_permissions(&keys(&["send"]), &keys(&["send", "read", "write"]));
+        assert!(p.has("send") && !p.has("read") && !p.has("write") && !p.has("domain"));
 
         // An empty grant is not a wildcard.
-        let p = intersect_token_permissions(&keys(&[]), &keys(&["me", "domain"]));
-        assert!(!p.has("me") && !p.has("domain"));
+        let p = intersect_token_permissions(&keys(&[]), &keys(&["send", "read", "write"]));
+        assert!(!p.has("send") && !p.has("read"));
+    }
+
+    /// The four permissions imply one another the way the catalog says they do:
+    /// `write` brings `read`, and `domain` brings the whole self-service trio.
+    /// `expand` is what keeps a hand-written or half-normalised row honest.
+    #[test]
+    fn implications_complete_a_permission_set() {
+        let keys = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        let p = expand(&keys(&["write"]));
+        assert!(p.has("write") && p.has("read") && !p.has("send") && !p.has("domain"));
+
+        let p = expand(&keys(&["domain"]));
+        assert!(p.has("domain") && p.has("send") && p.has("read") && p.has("write"));
+
+        let p = expand(&keys(&["read"]));
+        assert!(p.has("read") && !p.has("write") && !p.has("send") && !p.has("domain"));
+    }
+
+    /// `me` is the pre-split spelling of self-service; a row that still carries
+    /// it keeps the whole mailbox and gains nothing server-wide.
+    #[test]
+    fn legacy_me_expands_to_self_service() {
+        let keys = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let p = expand(&keys(&["me"]));
+        assert_eq!(p, Permissions::SELF_SERVICE);
+        assert_eq!(p.names(), vec!["send", "read", "write"]);
+
+        // And it is still capped by the mailbox, never widened by the alias.
+        let p = intersect_token_permissions(&keys(&["me"]), &keys(&["send", "read"]));
+        assert!(p.has("send") && p.has("read") && !p.has("write") && !p.has("domain"));
     }
 }

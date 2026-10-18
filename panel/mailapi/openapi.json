@@ -3,7 +3,7 @@
   "info": {
     "title": "DockPanel Mail API",
     "version": "1.0.0",
-    "description": "Send and manage mail on a DockPanel host over REST.\n\nMessages are injected through Postfix's local `sendmail` wrapper, so they are DKIM-signed and delivered on exactly the same path as mail sent from the webmail, and a copy is filed into the sender's **Sent** folder.\n\n## Authentication\n\nEvery route except `GET /health` requires `Authorization: Bearer <token>`. Three kinds of token are accepted, and only one of them is a *mailbox*:\n\n* **A mailbox token** — minted per-mailbox in the panel under **Mail → Mail API**. It carries its own subset of the permission catalog (`me`, `domain`), so a token intended for one application can be narrower than the mailbox it belongs to. This is the token an application should hold.\n* **A panel API key** — one beginning with `dp_`, created in the panel under **Settings → API keys**. It is not bound to a mailbox; it authenticates as the panel does.\n* **A legacy Roundcube token** — minted by the bundled webmail's *Mail API* tab before the panel took over. It is granted `me` and nothing more.\n\n## Permissions\n\nA token's permissions are drawn from a two-entry catalog and are an upper bound, not a floor: they are intersected on every request with what the mailbox is **currently** allowed, which the panel records as a *role* per mailbox.\n\n* `me` — `/v1/me/*` and `/v1/send`: send as the mailbox's own address and manage only that mailbox.\n* `domain` — `/v1/domains/*` and `/v1/queue`: the whole server's mail domains, mailboxes, aliases and queue.\n\nSo a `/me`-only token is refused (`403`) on a management route even when its mailbox is an administrator's, and removing `domain` from a mailbox in the panel downgrades the tokens already handed out. `GET /v1/me` reports the permissions the presented token currently holds."
+    "description": "Send and manage mail on a DockPanel host over REST.\n\nMessages are injected through Postfix's local `sendmail` wrapper, so they are DKIM-signed and delivered on exactly the same path as mail sent from the webmail, and a copy is filed into the sender's **Sent** folder.\n\n## Authentication\n\nEvery route except `GET /health` requires `Authorization: Bearer <token>`. Three kinds of token are accepted, and only one of them is a *mailbox*:\n\n* **A mailbox token** — minted per-mailbox in the panel under **Mail → Mail API**. It carries its own subset of the permission catalog (`send`, `read`, `write`, `domain`), so a token intended for one application can be narrower than the mailbox it belongs to — a monitoring credential can hold `read` alone, a contact form `send` alone. It may also carry an expiry, after which it is refused like a revoked one. This is the token an application should hold.\n* **A panel API key** — one beginning with `dp_`, created in the panel under **Settings → API keys**. It is not bound to a mailbox; it authenticates as the panel does.\n* **A legacy Roundcube token** — minted by the bundled webmail's *Mail API* tab before the panel took over. It is granted self-service (`send`, `read`, `write`) and nothing more.\n\n## Permissions\n\nA token's permissions are drawn from a four-entry catalog and are an upper bound, not a floor: they are intersected on every request with what the mailbox is **currently** allowed, which the panel records as a *role* per mailbox.\n\n* `send` — `POST /v1/send` and `POST /emails`: mail out as the mailbox's own address.\n* `read` — every `GET /v1/me/*`: look at the mailbox, change nothing.\n* `write` — the mutating `/v1/me/*` routes: profile, password, forwarding, autoresponder, folders, messages, contacts, identities, settings. Implies `read`.\n* `domain` — `/v1/domains/*` and `/v1/queue`: the whole server's mail domains, mailboxes, aliases and queue. Implies `send`, `read` and `write`.\n\n`me` is the earlier single self-service entry; it is still accepted anywhere a permission list is accepted and expands to `send`+`read`+`write`, so nothing minted before the split changed meaning.\n\nSo a `send`-only token is refused (`403`) on a read route, and on a management route too, even when its mailbox is an administrator's; removing `domain` from a mailbox in the panel downgrades the tokens already handed out. `GET /v1/me` reports the permissions the presented token currently holds, and a panel-minted token's `expires_at` says when it stops being accepted."
   },
   "servers": [
     {
@@ -22,7 +22,7 @@
     },
     {
       "name": "Self-service",
-      "description": "The caller's own mailbox. Any mailbox token may use these, and only for its own address."
+      "description": "The caller's own mailbox, and only for its own address. Requires the `read` permission for a `GET`, and `write` for anything that changes the mailbox."
     },
     {
       "name": "Management",
@@ -1931,8 +1931,8 @@
           "domain": { "type": "string", "description": "The mailbox's domain." },
           "permissions": {
             "type": "array",
-            "items": { "type": "string", "enum": ["me", "domain"] },
-            "description": "What this particular token may do right now. `domain` implies `me`. A token never holds more than the mailbox it belongs to is currently allowed."
+            "items": { "type": "string", "enum": ["send", "read", "write", "domain"] },
+            "description": "What this particular token may do right now. `write` implies `read`; `domain` implies `send`+`read`+`write`. A token never holds more than the mailbox it belongs to is currently allowed, and never holds anything once its expiry has passed."
           }
         },
         "required": ["email", "permissions"]

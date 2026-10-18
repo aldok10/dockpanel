@@ -569,10 +569,18 @@ Add a mail domain.
 ### Mail API tokens and permissions
 
 Mail-API tokens are minted by the panel and stored (hashed) in `mail_api_tokens`. Every
-token carries its own subset of a two-entry permission catalog — `me` (`/v1/me/*`,
-`/v1/send`) and `domain` (`/v1/domains/*`, `/v1/queue`) — and the daemon intersects it on
-every request with what the mailbox is currently allowed, so revoking a permission
-downgrades tokens already handed out.
+token carries its own subset of a four-entry permission catalog — `send` (`POST /v1/send`
+and `/emails`), `read` (every `GET /v1/me/*`), `write` (the mutating `/v1/me/*` routes, and
+it implies `read`) and `domain` (`/v1/domains/*` and `/v1/queue`, and it implies the other
+three) — and the daemon intersects that on every request with what the mailbox is
+currently allowed, so revoking a permission downgrades tokens already handed out. The
+narrowest useful tokens are the interesting ones: a monitoring credential wants `read` alone
+and a contact form `send` alone, neither of which can delete mail or change a password.
+`me`, the earlier single self-service entry, is still accepted wherever a permission list is
+and expands to `send`+`read`+`write`.
+
+A token may also carry an expiry (`expires_in_days` when minting or updating). Once past it
+the daemon refuses the token exactly as it would a revoked one.
 
 | Method | Path | Purpose |
 |--------|------|---------|
@@ -581,9 +589,10 @@ downgrades tokens already handed out.
 | PUT/DELETE | `/api/mail/api/roles/{id}` | Edit / delete (built-ins refuse both) |
 | GET | `/api/mail/api/grants` | Every per-mailbox assignment |
 | GET/PUT/DELETE | `/api/mail/api/grants/{email}` | Read / assign (role + extras) / reset to default |
-| GET/POST | `/api/mail/api/tokens` | List metadata / mint (returns the secret once) |
+| GET/POST | `/api/mail/api/tokens` | List metadata / mint (returns the secret once; `expires_in_days` optional) |
+| PUT | `/api/mail/api/tokens/{id}` | Rename / change the expiry (`0` clears it) |
 | DELETE | `/api/mail/api/tokens/{id}` | Revoke |
-| POST | `/api/mail/api/tokens/{id}/rotate` | Replace the secret, keeping the grant |
+| POST | `/api/mail/api/tokens/{id}/rotate` | Replace the secret, keeping the grant and the expiry |
 | GET | `/api/mail/webmail/tokens` | Read-only list for the webmail tab, scoped by key |
 
 **Account passwords** are hashed with **Argon2id** and stored in Dovecot's

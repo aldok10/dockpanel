@@ -174,6 +174,7 @@ class dockpanel_mailapi extends rcube_plugin
             . '<th>' . rcube::Q($this->gettext('col_prefix')) . '</th>'
             . '<th>' . rcube::Q($this->gettext('col_name')) . '</th>'
             . '<th>' . rcube::Q($this->gettext('col_permissions')) . '</th>'
+            . '<th>' . rcube::Q($this->gettext('col_expires')) . '</th>'
             . '<th>' . rcube::Q($this->gettext('col_created')) . '</th>'
             . '<th>' . rcube::Q($this->gettext('col_lastused')) . '</th>'
             . '</tr></thead><tbody>';
@@ -186,11 +187,30 @@ class dockpanel_mailapi extends rcube_plugin
                 . '<td><code>' . rcube::Q((string) ($r['token_prefix'] ?? '')) . '…</code></td>'
                 . '<td>' . rcube::Q((string) ($r['name'] ?? '')) . '</td>'
                 . '<td>' . rcube::Q($perms) . '</td>'
+                . '<td>' . rcube::Q($this->expiry_label($r['expires_at'] ?? null)) . '</td>'
                 . '<td>' . rcube::Q((string) ($r['created_at'] ?? '')) . '</td>'
                 . '<td>' . rcube::Q(!empty($r['last_used_at']) ? (string) $r['last_used_at'] : $this->gettext('never')) . '</td>'
                 . '</tr>';
         }
 
         return $out . $h . '</tbody></table>';
+    }
+
+    /**
+     * "never", an ISO date, or "expired <date>" once that date is behind us — so
+     * a token that has silently stopped working says so on the page rather than
+     * looking valid until a send fails.
+     */
+    private function expiry_label($expires_at)
+    {
+        $value = trim((string) $expires_at);
+        if ($value === '') {
+            return $this->gettext('never');
+        }
+        $ts = strtotime($value);
+        if ($ts !== false && $ts < time()) {
+            return $this->gettext('expired') . ' ' . $value;
+        }
+        return $value;
     }
 }
