@@ -303,6 +303,37 @@ which supplies the missing constraint. A note in an earlier revision of this gui
 described the flags being "reset to their defaults on every use"; that could not
 have happened, since no save ever succeeded.
 
+## SSH login accounts
+
+A panel account and a Linux login are two different things, and DockPanel keeps
+them that way by default: every account above is **panel-only**. When you create
+a user on the **Users** screen you may also give it an **SSH username**, and the
+panel then provisions the matching Linux account on the machine the panel runs
+on, so that person can log in to the server over SSH with the same password they
+use for the panel.
+
+- **Optional.** Leave the SSH username blank and nothing is created on the box —
+  the account exists only in the panel. The username is chosen by the
+  administrator who creates the account; it is lower-case POSIX
+  (`alice`, `dev-2`, `ops_1`) and must not collide with an account that already
+  exists on the server.
+- **No privilege.** The account is never added to `sudo` or `wheel`. A `user` or
+  `client` login can read and write only what an ordinary unprivileged login can;
+  escalation is a separate, deliberate act on the box.
+- **One credential.** The SSH password follows the panel password everywhere it
+  is changed — an administrator reset, the user's own *Account* change, a
+  forgotten-password reset, and a reseller resetting a tenant. Rotating one
+  rotates the other; the old password stops working for SSH too.
+- **Suspend and delete.** Suspending an account locks its password (`usermod -L`;
+  an SSH key the person installed keeps working, so it is "no new password
+  logins", not "signed out"), un-suspending unlocks it, and deleting the panel
+  account removes the Linux account and its home directory.
+
+This is a feature of the **panel host** — the machine the panel itself runs on.
+It does not reach a member of a server fleet, because the panel does not manage
+logins on those machines. If you need that today, create the accounts there
+yourself.
+
 ## A note on what Teams is not
 
 The panel has `/api/teams` endpoints. **They grant no access to anything** —

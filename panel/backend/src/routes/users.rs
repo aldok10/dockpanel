@@ -21,12 +21,22 @@ pub struct CreateUserRequest {
     pub email: String,
     pub password: String,
     pub role: Option<String>,
+    /// Optional Linux login name for an SSH account on the panel host. When
+    /// present the agent provisions the OS account as part of this request; when
+    /// absent the user is panel-only, which is the default.
+    #[serde(default)]
+    pub os_username: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
 pub struct UpdateUserRequest {
     pub role: Option<String>,
     pub password: Option<String>,
+    /// Add an SSH login to a user that does not have one yet. Setting it on an
+    /// account that already has one is refused (the OS account cannot be
+    /// renamed in place); it is never used to *change* an existing login.
+    #[serde(default)]
+    pub os_username: Option<String>,
 }
 
 #[derive(serde::Serialize, sqlx::FromRow)]
@@ -42,6 +52,108 @@ pub struct UserResponse {
     /// would be a button that refuses on most of the list — the shape this panel
     /// keeps having to remove.
     pub totp_enabled: bool,
+    /// The SSH login this user holds on the panel host, or null. Carried so the
+    /// table can show who can log in to the box and offer to remove an account.
+    pub os_username: Option<String>,
+}
+
+/// Normalise and validate an operator-supplied OS login name.
+///
+/// Empty means "no SSH account" (`Ok(None)`), matching the optional-by-design
+/// policy: a panel user without a login is the common case. The syntax is
+/// mirrored from `agent::services::os_accounts::is_valid_username` — lower-case
+/// POSIX, 1-32 characters — so the panel can reject a bad name with a clear
+/// message before it ever reaches the agent. The authoritative check (is the
+/// name already taken on the box?) still happens at the agent.
+fn normalize_os_username(raw: &str) -> Result<Option<String>, ApiError> {
+    let name = raw.trim().to_ascii_lowercase();
+    if name.is_empty() {
+        return Ok(None);
+    }
+    let first_ok = name
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_lowercase() || c == '_')
+        .unwrap_or(false);
+    let rest_ok = name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
+    if name.len() > 32 || !first_ok || !rest_ok {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "SSH username must be 1-32 characters, start with a lowercase letter or \
+             underscore, then lowercase letters, digits, underscores or hyphens",
+        ));
+    }
+    Ok(Some(name))
+}
+
+/// Refuse an `os_username` another panel account already claims.
+///
+/// The `users` table's partial unique index is the backstop; this exists so the
+/// operator gets a sentence instead of a raw constraint violation. Case is not
+/// a concern because `normalize_os_username` has already lower-cased the value.
+async fn os_username_taken(
+    db: &sqlx::PgPool,
+    name: &str,
+    exclude: Option<Uuid>,
+) -> Result<bool, ApiError> {
+    let row: Option<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM users WHERE os_username = $1 AND ($2::uuid IS NULL OR id <> $2)")
+            .bind(name)
+            .bind(exclude)
+            .fetch_optional(db)
+            .await
+            .map_err(|e| internal_error("check os_username", e))?;
+    Ok(row.is_some())
+}
+
+/// Push a password to a user's SSH account, when they have one.
+///
+/// Every door that changes a panel password calls this so the panel login and
+/// the SSH login stay the same credential — an administrator resetting it, the
+/// user changing it themselves, a forgotten-password reset, and a reseller
+/// resetting a tenant. A panel-only user (no `os_username`) is a no-op.
+///
+/// It is deliberately NOT best-effort: a password that changed for the panel but
+/// not for SSH leaves the OLD SSH password working, which is the security half
+/// of the change silently absent. Callers surface the failure; the panel hash is
+/// already written by then, so the message says exactly that.
+pub async fn sync_ssh_password(
+    state: &AppState,
+    user_id: Uuid,
+    password: &str,
+) -> Result<(), ApiError> {
+    let row: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT os_username FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_optional(&state.db)
+            .await
+            .map_err(|e| internal_error("sync ssh password", e))?;
+
+    let name = match row {
+        Some((Some(name),)) => name,
+        _ => return Ok(()),
+    };
+
+    state
+        .agents
+        .local()
+        .post(
+            "/os-users/password",
+            Some(serde_json::json!({ "username": name, "password": password })),
+        )
+        .await
+        .map_err(|e| {
+            err(
+                StatusCode::BAD_GATEWAY,
+                &format!(
+                    "The panel password was changed, but the SSH account '{name}' password \
+                     could not be updated ({e})"
+                ),
+            )
+        })?;
+    Ok(())
 }
 
 /// GET /api/users — List all users (admin only).
@@ -53,7 +165,7 @@ pub async fn list(
     let users: Vec<UserResponse> = sqlx::query_as(
         "SELECT u.id, u.email, u.role, u.reseller_id, u.created_at, \
          COALESCE((SELECT COUNT(*) FROM sites WHERE user_id = u.id), 0) as site_count, \
-         u.totp_enabled \
+         u.totp_enabled, u.os_username \
          FROM users u ORDER BY u.created_at ASC",
     )
     .fetch_all(&state.db)
@@ -120,6 +232,16 @@ pub async fn create(
         return Err(err(StatusCode::BAD_REQUEST, ASSIGNABLE_ROLES_MSG));
     }
 
+    // Optional SSH account. Validated and reserved-checked here so a bad name
+    // never reaches the agent; the agent still owns the "already on the box"
+    // refusal, which only it can answer.
+    let os_username = normalize_os_username(body.os_username.as_deref().unwrap_or(""))?;
+    if let Some(ref name) = os_username {
+        if os_username_taken(&state.db, name, None).await? {
+            return Err(err(StatusCode::CONFLICT, "SSH username already in use"));
+        }
+    }
+
     // Check email uniqueness
     let existing: Option<(Uuid,)> =
         sqlx::query_as("SELECT id FROM users WHERE email = $1")
@@ -155,15 +277,45 @@ pub async fn create(
     // would mean issuing a token and sending mail from an admin action, which
     // reintroduces the dependency on SMTP that caused the lockout.
     let user: User = sqlx::query_as(
-        "INSERT INTO users (email, password_hash, role, email_verified) \
-         VALUES ($1, $2, $3, TRUE) RETURNING *",
+        "INSERT INTO users (email, password_hash, role, email_verified, os_username) \
+         VALUES ($1, $2, $3, TRUE, $4) RETURNING *",
     )
     .bind(&body.email)
     .bind(&hash)
     .bind(role)
+    .bind(&os_username)
     .fetch_one(&state.db)
     .await
     .map_err(|e| internal_error("create users", e))?;
+
+    // The OS account is created AFTER the row, so that `os_username` is already
+    // persisted and the agent's `userdel` has a panel record to belong to. If
+    // the agent refuses or fails, the row is deleted again: a panel user that
+    // silently has no SSH login would be a promise the create screen did not
+    // keep, and a half-created pair is worse than a clean failure the operator
+    // can retry.
+    if let Some(ref name) = os_username {
+        let provisioned = state
+            .agents
+            .local()
+            .post(
+                "/os-users/provision",
+                Some(serde_json::json!({ "username": name, "password": body.password })),
+            )
+            .await;
+        if let Err(e) = provisioned {
+            let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+                .bind(user.id)
+                .execute(&state.db)
+                .await;
+            return Err(err(
+                StatusCode::BAD_GATEWAY,
+                &format!(
+                    "User was not created: the SSH account '{name}' could not be provisioned ({e})"
+                ),
+            ));
+        }
+    }
 
     tracing::info!("User created by {}: {} ({})", claims.email, user.email, role);
     let ip = crate::routes::client_ip(&headers);
@@ -205,6 +357,7 @@ pub async fn create(
             "id": user.id,
             "email": user.email,
             "role": user.role,
+            "os_username": user.os_username,
         })),
     ))
 }
@@ -230,6 +383,36 @@ pub async fn update(
         return Err(err(
             StatusCode::FORBIDDEN,
             "Cannot modify another administrator's account",
+        ));
+    }
+
+    // Adding an SSH login to a user that has none. An existing login cannot be
+    // renamed through this route: the OS account would have to be torn down and
+    // rebuilt (losing its home directory and any keys in it), which is a
+    // deliberate operator act, not a field edit.
+    let new_os_username = match normalize_os_username(body.os_username.as_deref().unwrap_or(""))? {
+        None => None,
+        Some(name) => match _user.os_username.as_deref() {
+            Some(existing) if existing != name => {
+                return Err(err(
+                    StatusCode::BAD_REQUEST,
+                    "This user already has an SSH account and its login name cannot be \
+                     changed here — remove the account and add a new one instead",
+                ))
+            }
+            Some(_) => None,
+            None => {
+                if os_username_taken(&state.db, &name, Some(id)).await? {
+                    return Err(err(StatusCode::CONFLICT, "SSH username already in use"));
+                }
+                Some(name)
+            }
+        },
+    };
+    if new_os_username.is_some() && body.password.is_none() {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "Set a password in the same request to create the SSH account",
         ));
     }
 
@@ -300,6 +483,37 @@ pub async fn update(
         // A password change must evict the user's live token(s) — same invariant as
         // reset_password (admin + self-service) and reseller update_user.
         crate::routes::auth::revoke_all_user_sessions(&state, id).await;
+    }
+
+    // Provision the new SSH account, if one was requested. The column is written
+    // first so a failed provision can simply clear it again, mirroring `create`.
+    if let Some(ref name) = new_os_username {
+        sqlx::query("UPDATE users SET os_username = $1, updated_at = NOW() WHERE id = $2")
+            .bind(name)
+            .bind(id)
+            .execute(&state.db)
+            .await
+            .map_err(|e| internal_error("update users", e))?;
+
+        let plaintext = body.password.as_deref().unwrap_or("");
+        if let Err(e) = state
+            .agents
+            .local()
+            .post(
+                "/os-users/provision",
+                Some(serde_json::json!({ "username": name, "password": plaintext })),
+            )
+            .await
+        {
+            let _ = sqlx::query("UPDATE users SET os_username = NULL WHERE id = $1")
+                .bind(id)
+                .execute(&state.db)
+                .await;
+            return Err(err(
+                StatusCode::BAD_GATEWAY,
+                &format!("The SSH account '{name}' could not be provisioned ({e})"),
+            ));
+        }
     }
 
     let ip = crate::routes::client_ip(&headers);
@@ -385,6 +599,34 @@ pub async fn toggle_suspend(
     // up to 2h (and the suspended user could keep whatever role their token carries).
     crate::routes::auth::revoke_all_user_sessions(&state, id).await;
 
+    // Lock or unlock the SSH account's password alongside the panel suspension.
+    // A `-L` prefixes the stored hash; an SSH key the person installed keeps
+    // working, which is why this is "no new password logins", not "logged out".
+    // The panel role has already changed by here, so a failure is reported with
+    // that context rather than rolled back.
+    if let Some(ref name) = user.os_username {
+        let locked = new_role == "suspended";
+        if let Err(e) = state
+            .agents
+            .local()
+            .post(
+                "/os-users/state",
+                Some(serde_json::json!({ "username": name, "locked": locked })),
+            )
+            .await
+        {
+            let state_word = if locked { "suspended" } else { "unsuspended" };
+            let verb = if locked { "locked" } else { "unlocked" };
+            return Err(err(
+                StatusCode::BAD_GATEWAY,
+                &format!(
+                    "The account was {state_word} in the panel, but the SSH account \
+                     '{name}' could not be {verb} ({e})"
+                ),
+            ));
+        }
+    }
+
     tracing::info!("{action} by {}: {} -> role={new_role}", claims.email, user.email);
     let ip = crate::routes::client_ip(&headers);
     activity::log_activity(
@@ -466,6 +708,11 @@ pub async fn reset_password(
     // Actually revoke the user's live token(s) so a stolen/active session cannot
     // survive the reset — matches the self-service reset path (auth.rs).
     crate::routes::auth::revoke_all_user_sessions(&state, id).await;
+
+    // Keep the SSH account's password in step — one credential to the person
+    // holding it. The panel hash is already written, so a failure is reported
+    // honestly rather than rolled back.
+    sync_ssh_password(&state, id, &body.password).await?;
 
     tracing::info!("Password reset by admin {} for user {}", claims.email, user.email);
     let ip = crate::routes::client_ip(&headers);
@@ -593,6 +840,29 @@ pub async fn remove(
         ));
     }
 
+    // Remove the OS account first, while the panel row still records the login
+    // name. Best-effort on purpose: an unreachable agent must not make a panel
+    // user undeletable, so a failure is reported in the response and the log
+    // rather than refusing the delete — an operator can then remove the login by
+    // hand. Doing it before the row is deleted means a retry after a transient
+    // failure still knows which account to remove.
+    let os_removed = match user.os_username.as_deref() {
+        None => None,
+        Some(name) => {
+            let path = format!("/os-users/{name}");
+            match state.agents.local().delete(&path).await {
+                Ok(_) => Some(true),
+                Err(e) => {
+                    tracing::warn!(
+                        "user delete: SSH account '{name}' (user {}) could not be removed: {e}",
+                        user.email
+                    );
+                    Some(false)
+                }
+            }
+        }
+    };
+
     // Revoke the user's live token(s) BEFORE deletion — otherwise the stateless JWT
     // keeps authenticating as a now-nonexistent principal until it expires.
     crate::routes::auth::revoke_all_user_sessions(&state, id).await;
@@ -707,6 +977,7 @@ pub async fn remove(
         "ok": true,
         "email": user.email,
         "reassigned_servers": reassigned,
+        "os_account_removed": os_removed,
     })))
 }
 

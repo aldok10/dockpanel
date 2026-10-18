@@ -1041,6 +1041,11 @@ pub async fn reset_password(
     .await
     .map_err(|e| internal_error("reset password", e))?;
 
+    // Mirror the new password onto the SSH login, if this account has one. The
+    // panel hash is already written; a failure is reported rather than rolled
+    // back, and says which half changed.
+    crate::routes::users::sync_ssh_password(&state, user.id, &body.password).await?;
+
     // Invalidate ALL sessions for this user (no current session to preserve)
     let all_sessions: Vec<(String,)> = sqlx::query_as(
         "DELETE FROM user_sessions WHERE user_id = $1 RETURNING jti"
@@ -1936,6 +1941,18 @@ pub async fn change_password(
         .execute(&state.db)
         .await
         .map_err(|e| internal_error("change password", e))?;
+
+    // Keep a self-service password change in step with the SSH login too — a user
+    // who changes their password here must not leave their old one working over
+    // SSH. A no-op for panel-only accounts; the panel hash is already written, so
+    // a failure is surfaced rather than rolled back.
+    crate::routes::users::sync_ssh_password(&state, claims.sub, new_pass)
+        .await
+        .map_err(|_| err(
+            StatusCode::BAD_GATEWAY,
+            "Your panel password was changed, but the SSH login password could not be \
+             updated — please try changing it again",
+        ))?;
 
     // Invalidate all other sessions for this user (keep current session)
     if let Some(ref current_jti) = claims.jti {

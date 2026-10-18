@@ -20,6 +20,7 @@ pub mod sbom;
 pub mod mail;
 pub mod migration;
 pub mod nginx;
+pub mod os_users;
 pub mod panel_update;
 pub mod remote_backup;
 pub mod security;

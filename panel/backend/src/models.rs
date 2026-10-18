@@ -11,6 +11,9 @@ pub struct User {
     pub password_hash: String,
     pub role: String,
     pub email_verified: bool,
+    /// Linux login name of this user's SSH account on the panel host, or `None`
+    /// for a panel-only account. Owned by `routes::users`; see the module there.
+    pub os_username: Option<String>,
     #[serde(skip_serializing)]
     pub email_token: Option<String>,
     #[serde(skip_serializing)]

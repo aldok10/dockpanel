@@ -24,6 +24,7 @@ pub mod logs;
 pub mod sbom_scanner;
 pub mod migration;
 pub mod nginx;
+pub mod os_accounts;
 pub mod ownership;
 pub mod phone_home;
 pub mod pkg;

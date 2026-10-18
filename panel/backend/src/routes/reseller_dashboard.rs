@@ -321,6 +321,10 @@ pub async fn update_user(
             .await
             .map_err(|e| internal_error("update user", e))?;
 
+        // Keep the tenant's SSH login in step with the reset — same one-credential
+        // rule as the admin and self-service paths.
+        crate::routes::users::sync_ssh_password(&state, id, password).await?;
+
         // A password reset must evict the user's live token(s) (mirrors the admin
         // users::reset_password fix) — otherwise a stolen session survives the reset.
         crate::routes::auth::revoke_all_user_sessions(&state, id).await;

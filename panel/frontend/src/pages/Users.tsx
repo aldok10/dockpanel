@@ -10,6 +10,7 @@ interface User {
   created_at: string;
   site_count: number;
   totp_enabled: boolean;
+  os_username: string | null;
 }
 
 export default function Users() {
@@ -24,6 +25,7 @@ export default function Users() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [role, setRole] = useState("user");
+  const [osUsername, setOsUsername] = useState("");
   const [creating, setCreating] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
   const [editTarget, setEditTarget] = useState<string | null>(null);
@@ -56,11 +58,18 @@ export default function Users() {
     setCreating(true);
     setMessage({ text: "", type: "" });
     try {
-      await api.post("/users", { email, password, role });
+      await api.post("/users", {
+        email,
+        password,
+        role,
+        // Omit when blank so the backend stores NULL rather than an empty login.
+        os_username: osUsername.trim() || undefined,
+      });
       setShowCreate(false);
       setEmail("");
       setPassword("");
       setRole("user");
+      setOsUsername("");
       setMessage({ text: "User created successfully", type: "success" });
       loadUsers();
     } catch (e) {
@@ -89,9 +98,15 @@ export default function Users() {
 
   const handleDelete = async (id: string) => {
     try {
-      await api.delete(`/users/${id}`);
+      const data = await api.delete<{ os_account_removed?: boolean | null }>(`/users/${id}`);
       setDeleteTarget(null);
-      setMessage({ text: "User deleted", type: "success" });
+      setMessage({
+        text:
+          data?.os_account_removed === false
+            ? "User deleted, but the SSH account could not be removed — delete it manually on the server"
+            : "User deleted",
+        type: data?.os_account_removed === false ? "error" : "success",
+      });
       loadUsers();
     } catch (e) {
       setMessage({
@@ -250,10 +265,17 @@ export default function Users() {
                   <td className="px-5 py-4">
                     <div className="flex items-center gap-3">
                       <div className={`w-8 h-8 rounded-full flex items-center justify-center text-sm font-medium ${user.role === "suspended" ? "bg-dark-600 text-dark-400" : "bg-rust-500/15 text-rust-500"}`}>{user.email[0].toUpperCase()}</div>
-                      <div className="flex items-center gap-2">
-                        <span className="text-sm text-dark-50 font-mono">{user.email}</span>
-                        {user.role === "suspended" && (
-                          <span className="inline-flex px-2 py-0.5 rounded-full text-xs font-medium bg-danger-500/15 text-danger-400">Suspended</span>
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2">
+                          <span className="text-sm text-dark-50 font-mono">{user.email}</span>
+                          {user.role === "suspended" && (
+                            <span className="inline-flex px-2 py-0.5 rounded-full text-xs font-medium bg-danger-500/15 text-danger-400">Suspended</span>
+                          )}
+                        </div>
+                        {user.os_username && (
+                          <div className="text-xs text-dark-300 font-mono mt-0.5" title="SSH login on the panel host">
+                            ssh: {user.os_username}
+                          </div>
                         )}
                       </div>
                     </div>
@@ -339,7 +361,10 @@ export default function Users() {
                           <span className="inline-flex px-1.5 py-0.5 rounded-full text-[10px] font-medium bg-danger-500/15 text-danger-400 shrink-0">Suspended</span>
                         )}
                       </div>
-                      <span className="text-xs text-dark-300 font-mono">{new Date(user.created_at).toLocaleDateString()}</span>
+                      <span className="text-xs text-dark-300 font-mono block truncate">
+                        {new Date(user.created_at).toLocaleDateString()}
+                        {user.os_username ? ` · ssh: ${user.os_username}` : ""}
+                      </span>
                     </div>
                   </div>
                   <div className="flex items-center gap-2 shrink-0 ml-2">
@@ -406,6 +431,7 @@ export default function Users() {
               setShowCreate(false);
               setEmail("");
               setPassword("");
+              setOsUsername("");
             }
           }}
         >
@@ -443,6 +469,24 @@ export default function Users() {
                 />
               </div>
               <div>
+                <label htmlFor="create-user-ssh" className="block text-sm font-medium text-dark-100 mb-1">
+                  SSH Username <span className="text-dark-400 font-normal">(optional)</span>
+                </label>
+                <input
+                  id="create-user-ssh"
+                  type="text"
+                  value={osUsername}
+                  onChange={(e) => setOsUsername(e.target.value)}
+                  className="w-full px-3 py-2 border border-dark-500 rounded-lg text-sm font-mono focus:ring-2 focus:ring-accent-500 focus:border-accent-500"
+                  placeholder="e.g. alice"
+                />
+                <p className="text-xs text-dark-400 mt-1">
+                  Creates a Linux login account on this server with the password above, so this
+                  person can sign in over SSH. Leave blank for a panel-only account. No sudo
+                  rights are granted.
+                </p>
+              </div>
+              <div>
                 <label htmlFor="create-user-role" className="block text-sm font-medium text-dark-100 mb-1">
                   Role
                 </label>
@@ -465,6 +509,7 @@ export default function Users() {
                   setShowCreate(false);
                   setEmail("");
                   setPassword("");
+                  setOsUsername("");
                 }}
                 className="px-4 py-2 text-sm text-dark-300 border border-dark-600 rounded-lg hover:text-dark-100 hover:border-dark-400 transition-colors"
               >
@@ -522,6 +567,12 @@ export default function Users() {
                 }}
               />
             </div>
+            {users.find(u => u.id === resetPwTarget)?.os_username && (
+              <p className="text-xs text-dark-400 mt-2">
+                This also updates the SSH login password for{" "}
+                <span className="font-mono text-dark-200">{users.find(u => u.id === resetPwTarget)?.os_username}</span>.
+              </p>
+            )}
             <div className="flex justify-end gap-2 mt-6">
               <button
                 onClick={() => {
