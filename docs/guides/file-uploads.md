@@ -111,16 +111,20 @@ accounts it found so you know what to recreate, and for Plesk and HestiaCP it do
 not even list them. Either way, mailboxes have to be recreated by hand in the Mail
 section.
 
-## Per-site SFTP does not exist yet
+## Per-site SFTP and jailed SSH
 
-Today there are two ways into a site's files: the file manager, with the limits
-above, and shell access. Both mean the operator does the work.
+Each site can be given its own Linux account with a chroot built around that
+site's files. The site's owner turns it on from the site's page — there is no
+operator step and no host user to create by hand:
 
-There is no per-site SFTP account, and no per-site system user to hang one on —
-every site's files are owned by the web server user. Giving a customer scoped
-upload access is a decided direction rather than an open question, and it is the
-most-requested missing piece, but it is not built and this guide will not pretend
-otherwise.
+* **SFTP** signs the account into its own jail. It sees the site's files and
+  nothing else — not another site, not the rest of the server.
+* **SSH** is the same account with a real login shell inside the same jail. You
+  land in the site's files at `/content`, and nothing outside them is reachable.
 
-If you are running sites for other people today, the honest answer is that file
-upload is still your job.
+Both are one account: one password, one set of public keys. The owner resets the
+password or installs a key from the site's page; the operator keeps the sshd
+daemon and the server's own root keys.
+
+A site that has not been given access has no per-site account — its files are
+owned by the web server user, and the file manager is the way in.

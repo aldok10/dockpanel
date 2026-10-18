@@ -52,7 +52,7 @@ pub struct SshAccount {
 /// the segment and the agent would 404 on a key it holds — intermittently, for
 /// whichever keys happened to contain the character. Encoding here, with axum
 /// decoding at the agent, keeps the fingerprint one opaque segment.
-fn enc_segment(s: &str) -> String {
+pub(crate) fn enc_segment(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {

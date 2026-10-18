@@ -156,6 +156,10 @@ pub struct Site {
     pub sftp_enabled: bool,
     pub sftp_uid: Option<i32>,
     pub sftp_gid: Option<i32>,
+    /// Whether the site's Linux account (above) also gets a jailed interactive
+    /// shell. Reuses the SAME uid/jail/files as SFTP; see
+    /// `services::sftp_accounts::enable_shell` on the agent.
+    pub ssh_shell_enabled: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

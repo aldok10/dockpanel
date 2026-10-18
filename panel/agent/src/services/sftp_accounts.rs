@@ -23,7 +23,39 @@ use sha_crypt::{PasswordHasher, ShaCrypt};
 /// created once, by name (no fixed gid needed; useradd/sshd both accept names).
 pub const SFTP_GROUP: &str = "sftp_sites";
 
+/// The shared secondary group whose members get a jailed *interactive* shell in
+/// their site's jail.
+///
+/// Deliberately a SECOND group rather than the same one: sshd applies only the
+/// first value it obtains for a keyword, and `Match Group sftp_sites` (below)
+/// carries `ForceCommand internal-sftp`. A user left in `SFTP_GROUP` would be
+/// caught by that keyword and pinned to the SFTP subsystem for ever, never
+/// reaching a shell. A shell user is therefore a member of this group and NOT of
+/// `SFTP_GROUP`; SFTP still works for them, because `internal-sftp` also runs as
+/// the `Subsystem sftp` handler when nothing forces it.
+pub const SHELL_GROUP: &str = "ssh_shell_sites";
+
+/// The sshd drop-in that scopes the chroot to the two groups above.
 const SSHD_DROPIN: &str = "/etc/ssh/sshd_config.d/99-dockpanel-sftp.conf";
+
+/// Utilities made available inside a jailed shell by symlinking them at
+/// BusyBox. BusyBox is one small binary that answers to every one of these
+/// names, so a whole userland needs one copy + one library, not one per tool.
+/// Anything not here (e.g. `git`, `php`) the tenant does not get, which is the
+/// point of a jail rather than a full desktop.
+const BUSYBOX_APPLETS: &[&str] = &[
+    "sh", "ash", "ls", "cat", "cp", "mv", "rm", "mkdir", "rmdir", "ln", "chmod",
+    "touch", "echo", "pwd", "env", "grep", "egrep", "fgrep", "sed", "awk", "find",
+    "xargs", "sort", "uniq", "head", "tail", "wc", "cut", "tr", "tee", "less",
+    "vi", "tar", "gzip", "gunzip", "zip", "unzip", "ps", "top", "kill", "sleep",
+    "date", "id", "whoami", "uname", "hostname", "stat", "df", "du", "which",
+    "wget", "curl", "diff", "make", "nohup", "true", "false",
+];
+
+/// Directories the shell runtime owns inside the jail. Removed together when
+/// shell access is turned off. `content/` is NOT among them: it is the tenant's
+/// real files (a bind mount) and outlives the shell.
+const RUNTIME_DIRS: &[&str] = &["bin", "dev", "etc", "lib", "lib64", "usr", "tmp"];
 
 /// Where the panel records which domain owns an allocated uid — read by
 /// [`crate::services::ownership::sftp_user`] before any teardown touches a
@@ -84,9 +116,16 @@ pub async fn provision(domain: &str, uid: i32, gid: i32) -> Result<(), String> {
         return Err(format!("{site_dir} does not exist — cannot enable SFTP"));
     }
 
-    // 1. Shared secondary group — idempotent, ignore "already exists".
+    // 1. Shared secondary groups — idempotent, ignore "already exists". Both are
+    // created up front so the sshd drop-in, which references both in its Match
+    // blocks, never names a group sshd cannot resolve (sshd would refuse to
+    // start with an invalid Match group).
     let _ = safe_command_unsandboxed("groupadd", &[])
         .args([SFTP_GROUP])
+        .output()
+        .await;
+    let _ = safe_command_unsandboxed("groupadd", &[])
+        .args([SHELL_GROUP])
         .output()
         .await;
 
@@ -156,37 +195,9 @@ pub async fn provision(domain: &str, uid: i32, gid: i32) -> Result<(), String> {
     let _ = safe_command_unsandboxed("chown", &[]).args(["root:root", &jail]).output().await;
     let _ = safe_command_unsandboxed("chmod", &[]).args(["0755", &jail]).output().await;
 
-    // 4. Bind-mount content/ onto the REAL, unmoved site directory.
-    let unit_name = mount_unit_name(&content_dir).await?;
-    let unit = format!(
-        "[Unit]\n\
-         Description=DockPanel SFTP jail content mount: {domain}\n\
-         \n\
-         [Mount]\n\
-         What={site_dir}\n\
-         Where={content_dir}\n\
-         Type=none\n\
-         Options=bind\n\
-         \n\
-         [Install]\n\
-         WantedBy=multi-user.target\n"
-    );
-    let unit_path = format!("/etc/systemd/system/{unit_name}");
-    if let Err(e) = std::fs::write(&unit_path, &unit) {
-        return Err(format!("Failed to write mount unit {unit_path}: {e}"));
-    }
-    let _ = safe_command("systemctl").args(["daemon-reload"]).output().await;
-    let out = safe_command("systemctl")
-        .args(["enable", "--now", &unit_name])
-        .output()
-        .await
-        .map_err(|e| format!("Failed to start {unit_name}: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "Failed to start {unit_name}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        ));
-    }
+    // 4. Bind-mount content/ onto the REAL, unmoved site directory. Described
+    // by `ensure_content_mount`, which knows the two init-system shapes.
+    ensure_content_mount(domain, &site_dir, &content_dir).await?;
 
     // 5. The actual isolation: re-own the real site directory. PHP-FPM's pool
     // is re-pointed at this same identity by the caller (`put_site`, driven by
@@ -241,15 +252,7 @@ pub async fn deprovision(domain: &str, uid: i32, gid: i32, last_sftp_site: bool)
     // path-based tools), but tearing down in this order means a failure here
     // leaves the account still enabled rather than half-disabled.
     let content_dir = jail_content_dir(domain);
-    if let Ok(unit_name) = mount_unit_name(&content_dir).await {
-        let unit_path = format!("/etc/systemd/system/{unit_name}");
-        if std::path::Path::new(&unit_path).exists() {
-            let _ = safe_command("systemctl").args(["stop", &unit_name]).output().await;
-            let _ = safe_command("systemctl").args(["disable", &unit_name]).output().await;
-            let _ = std::fs::remove_file(&unit_path);
-            let _ = safe_command("systemctl").args(["daemon-reload"]).output().await;
-        }
-    }
+    remove_content_mount(&content_dir).await;
 
     // 2. Revert the real content back to the shared identity every other site
     // uses. The caller updates `sftp_enabled = false` and rebuilds the vhost
@@ -351,6 +354,10 @@ pub async fn deprovision(domain: &str, uid: i32, gid: i32, last_sftp_site: bool)
     if last_sftp_site {
         let _ = std::fs::remove_file(SSHD_DROPIN);
         let _ = reload_sshd_validated().await;
+        // The shell group only ever holds members of these accounts, so the
+        // last teardown is also when it should go. Best-effort: a leftover
+        // empty group is harmless and the next provision re-creates it.
+        let _ = safe_command_unsandboxed("groupdel", &[]).args([SHELL_GROUP]).output().await;
     }
 
     tracing::info!("SFTP deprovisioned for {domain}: user={username}");
@@ -364,7 +371,14 @@ pub async fn deprovision(domain: &str, uid: i32, gid: i32, last_sftp_site: bool)
 /// (unlike plaintext) is not sensitive to pass as a `usermod -p` argument;
 /// that is the entire reason hashing exists.
 pub async fn set_password(uid: i32, plaintext: &str) -> Result<(), String> {
-    let username = sftp_username(uid);
+    apply_password(&sftp_username(uid), plaintext).await
+}
+
+/// Hash `plaintext` and store it on `username`.
+///
+/// Shared by the SFTP password route and the jailed-shell unlock below, which
+/// has no caller-supplied password to store and generates one.
+async fn apply_password(username: &str, plaintext: &str) -> Result<(), String> {
     // NOT `ShaCrypt::hash_password()` — its auto-generated salt is
     // `password_hash`'s generic RECOMMENDED_SALT_LEN (16 RAW BYTES), which
     // base64-encodes to 22 characters. SHA-crypt's own spec caps the salt at
@@ -397,30 +411,59 @@ pub async fn set_password(uid: i32, plaintext: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Write the sshd `Match Group` drop-in if it is not already present, then
-/// validate and reload — never the bare `restart_sshd`/no-validation path
-/// `services::security`'s existing SSH-hardening functions use today, since
-/// that path has no `sshd -t` gate anywhere and a malformed Match block would
-/// otherwise lock out SSH access on reload with no warning.
-async fn ensure_sshd_dropin() -> Result<(), String> {
-    if std::path::Path::new(SSHD_DROPIN).exists() {
-        return Ok(());
-    }
-    let block = format!(
-        "# Managed by DockPanel — per-site SFTP jails (GH #108). Do not edit by hand;\n\
-         # regenerated the next time a site's SFTP account is enabled/disabled.\n\
+/// The drop-in's exact contents. Two `Match` blocks, shell first: sshd takes the
+/// first value it obtains for each keyword, so for the (never-produced, but
+/// cheap to defend) case of a user in both groups the shell block wins over the
+/// SFTP block's `ForceCommand internal-sftp`.
+///
+/// Written and reloaded — behind `sshd -t`, never the bare `restart_sshd` /
+/// no-validation path `services::security`'s SSH-hardening functions use, since
+/// a malformed Match block would otherwise lock out SSH on reload with no
+/// warning — by [`write_sshd_dropin`].
+fn sshd_dropin_body() -> String {
+    format!(
+        "# Managed by DockPanel — per-site SFTP jails and jailed shells (GH #108).\n\
+         # Do not edit by hand; regenerated when a site's account changes.\n\
+         Match Group {SHELL_GROUP}\n\
+         \tChrootDirectory %h\n\
+         \tAllowTcpForwarding no\n\
+         \tX11Forwarding no\n\
          Match Group {SFTP_GROUP}\n\
          \tChrootDirectory %h\n\
          \tForceCommand internal-sftp\n\
          \tAllowTcpForwarding no\n\
          \tX11Forwarding no\n"
-    );
-    if let Err(e) = std::fs::write(SSHD_DROPIN, &block) {
+    )
+}
+
+/// Write the drop-in and reload sshd behind `sshd -t`. On a failed validation
+/// the file is removed again so the box is never left with a config sshd would
+/// refuse on the next restart.
+async fn write_sshd_dropin() -> Result<(), String> {
+    if let Err(e) = std::fs::write(SSHD_DROPIN, sshd_dropin_body()) {
         return Err(format!("Failed to write {SSHD_DROPIN}: {e}"));
     }
     if let Err(e) = reload_sshd_validated().await {
         let _ = std::fs::remove_file(SSHD_DROPIN);
         return Err(e);
+    }
+    Ok(())
+}
+
+/// Write the drop-in if it is missing or predates jailed shells.
+async fn ensure_sshd_dropin() -> Result<(), String> {
+    let refresh = match std::fs::read_to_string(SSHD_DROPIN) {
+        Ok(existing) => !existing.contains(SHELL_GROUP),
+        Err(_) => true,
+    };
+    if refresh {
+        // The Match block names the shell group, so it must exist before sshd is
+        // asked to validate a config that references it.
+        let _ = safe_command_unsandboxed("groupadd", &[])
+            .args([SHELL_GROUP])
+            .output()
+            .await;
+        write_sshd_dropin().await?;
     }
     Ok(())
 }
@@ -447,6 +490,384 @@ async fn reload_sshd_validated() -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+// ── Jailed interactive shells ───────────────────────────────────────────────
+//
+// A jailed shell is the SFTP account with a userland inside the same jail and a
+// real login shell instead of `ForceCommand internal-sftp`. Enable/disable only
+// swaps the group membership and writes/removes the runtime below; the account,
+// the uid/gid and the bind-mounted `content/` are untouched, so a tenant keeps
+// their files whether or not the shell is on.
+
+/// Run `cmd` OUTSIDE the agent's sandbox. Every shell-runtime write targets the
+/// jail, which lives outside the agent's `ReadWritePaths` on a systemd box, so
+/// nothing below can use the sandboxed [`safe_command`].
+async fn run_un(cmd: &str, args: &[&str]) -> Result<(), String> {
+    let out = safe_command_unsandboxed(cmd, &[])
+        .args(args.iter().copied())
+        .output()
+        .await
+        .map_err(|e| format!("{cmd} failed to run: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "{cmd} {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+const FSTAB: &str = "/etc/fstab";
+
+/// Ensure `content_dir` is a bind mount of the real, unmoved `site_dir`.
+///
+/// systemd gets the generated `.mount` unit this feature shipped with. OpenRC
+/// has no `.mount` equivalent — and the agent's `systemctl` shim explicitly has
+/// no `.mount` support — so the systemd path would fail here with "service not
+/// found". There the mount is made directly and recorded in `/etc/fstab`, which
+/// OpenRC's `localmount` service replays at boot; without that line the tenant's
+/// files would silently vanish from the jail on the next reboot while the mount
+/// still looked healthy in the running system.
+async fn ensure_content_mount(
+    domain: &str,
+    site_dir: &str,
+    content_dir: &str,
+) -> Result<(), String> {
+    if crate::services::init::has_systemd() {
+        let unit_name = mount_unit_name(content_dir).await?;
+        let unit = format!(
+            "[Unit]\n\
+             Description=DockPanel SFTP jail content mount: {domain}\n\
+             \n\
+             [Mount]\n\
+             What={site_dir}\n\
+             Where={content_dir}\n\
+             Type=none\n\
+             Options=bind\n\
+             \n\
+             [Install]\n\
+             WantedBy=multi-user.target\n"
+        );
+        let unit_path = format!("/etc/systemd/system/{unit_name}");
+        std::fs::write(&unit_path, &unit)
+            .map_err(|e| format!("Failed to write mount unit {unit_path}: {e}"))?;
+        let _ = safe_command("systemctl").args(["daemon-reload"]).output().await;
+        let out = safe_command("systemctl")
+            .args(["enable", "--now", &unit_name])
+            .output()
+            .await
+            .map_err(|e| format!("Failed to start {unit_name}: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "Failed to start {unit_name}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        return Ok(());
+    }
+
+    run_un("mkdir", &["-p", content_dir]).await?;
+    run_un("mount", &["--bind", site_dir, content_dir]).await?;
+    write_fstab_bind(site_dir, content_dir).await?;
+    Ok(())
+}
+
+/// Undo [`ensure_content_mount`]. Best-effort: a leftover bind mount keeps the
+/// tenant's files reachable but is not a reason to leave the account half-gone.
+async fn remove_content_mount(content_dir: &str) {
+    if crate::services::init::has_systemd() {
+        if let Ok(unit_name) = mount_unit_name(content_dir).await {
+            let unit_path = format!("/etc/systemd/system/{unit_name}");
+            if std::path::Path::new(&unit_path).exists() {
+                let _ = safe_command("systemctl").args(["stop", &unit_name]).output().await;
+                let _ = safe_command("systemctl")
+                    .args(["disable", &unit_name])
+                    .output()
+                    .await;
+                let _ = std::fs::remove_file(&unit_path);
+                let _ = safe_command("systemctl").args(["daemon-reload"]).output().await;
+            }
+        }
+        return;
+    }
+    let _ = safe_command_unsandboxed("umount", &[])
+        .args([content_dir])
+        .output()
+        .await;
+    remove_fstab_bind(content_dir).await;
+}
+
+/// Append `src dst none bind,nofail 0 0` to `/etc/fstab` unless a line already
+/// mounts `dst`. `/etc` is writable here because the OpenRC branch is only
+/// reached on a box that is not sandboxed.
+/// Replace the whole of `/etc/fstab`, through the unsandboxed escape.
+///
+/// A plain `std::fs::write` to `/etc` would fail under the agent's
+/// `ProtectSystem=strict` namespace — the exact ReadWritePaths omission
+/// `tests/agent-sandbox-paths-pin-e2e.sh` exists to catch — so the new contents
+/// are staged under the agent's own writable tree and copied into place by the
+/// escape, matching every other write this module makes outside the namespace.
+async fn write_fstab(contents: &str) -> Result<(), String> {
+    let staging = format!("/var/lib/dockpanel/.fstab.{}", uuid::Uuid::new_v4());
+    std::fs::write(&staging, contents).map_err(|e| format!("could not stage {FSTAB}: {e}"))?;
+    let result = run_un("cp", &["-f", &staging, FSTAB]).await;
+    let _ = std::fs::remove_file(&staging);
+    result
+}
+
+/// Append `src dst none bind,nofail 0 0` to `/etc/fstab` unless a line already
+/// mounts `dst`.
+async fn write_fstab_bind(src: &str, dst: &str) -> Result<(), String> {
+    let current = tokio::fs::read_to_string(FSTAB).await.unwrap_or_default();
+    if fstab_has_mount(&current, dst) {
+        return Ok(());
+    }
+    let mut next = current;
+    if !next.is_empty() && !next.ends_with('\n') {
+        next.push('\n');
+    }
+    next.push_str(&format!("{src} {dst} none bind,nofail 0 0\n"));
+    write_fstab(&next).await
+}
+
+async fn remove_fstab_bind(dst: &str) {
+    let Ok(current) = tokio::fs::read_to_string(FSTAB).await else {
+        return;
+    };
+    let kept: String = current
+        .lines()
+        .filter(|l| !line_mounts(l, dst))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let _ = write_fstab(&kept).await;
+}
+
+fn fstab_has_mount(content: &str, dst: &str) -> bool {
+    content.lines().any(|l| line_mounts(l, dst))
+}
+
+/// True when an fstab line's second field (the mount point) is `dst`.
+fn line_mounts(line: &str, dst: &str) -> bool {
+    let mut fields = line.split_whitespace();
+    let _src = fields.next();
+    fields.next() == Some(dst)
+}
+
+/// The login shell handed to a jailed account — the path INSIDE the jail.
+/// `/bin/bash` where the host ships it (its libraries are copied in by
+/// [`copy_into_jail`]), otherwise BusyBox's `/bin/sh`.
+fn jail_shell() -> &'static str {
+    if std::path::Path::new("/bin/bash").exists() {
+        "/bin/bash"
+    } else {
+        "/bin/sh"
+    }
+}
+
+/// Copy a host binary (resolving symlinks) into the jail at the same path, with
+/// every shared library `ldd` reports. A static binary yields no libraries and
+/// is copied whole.
+async fn copy_into_jail(host_path: &str, jail: &str) -> Result<(), String> {
+    let real = tokio::fs::canonicalize(host_path)
+        .await
+        .map_err(|e| format!("cannot resolve {host_path}: {e}"))?
+        .to_string_lossy()
+        .into_owned();
+    let dest = format!("{jail}{host_path}");
+    if let Some((dir, _)) = dest.rsplit_once('/') {
+        run_un("mkdir", &["-p", dir]).await?;
+    }
+    run_un("cp", &["-f", &real, &dest]).await?;
+    let _ = run_un("chmod", &["755", &dest]).await;
+    for lib in dynamic_deps(&real).await {
+        let lib_dest = format!("{jail}{lib}");
+        if let Some((dir, _)) = lib_dest.rsplit_once('/') {
+            run_un("mkdir", &["-p", dir]).await?;
+        }
+        let _ = run_un("cp", &["-f", &lib, &lib_dest]).await;
+    }
+    Ok(())
+}
+
+/// The shared libraries `binary` loads, parsed from `ldd`. A binary whose `ldd`
+/// cannot run (e.g. already static) yields an empty list — the copy then either
+/// needs nothing or fails loudly at exec, never a silent half-copy.
+async fn dynamic_deps(binary: &str) -> Vec<String> {
+    let Ok(out) = safe_command("ldd").arg(binary).output().await else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            // "libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x…)" — or, for the
+            // loader, a bare "/lib/ld-musl-x86_64.so.1 (0x…)".
+            let path = match line.split_once("=> ") {
+                Some((_, rest)) => rest.split_whitespace().next(),
+                None => line.split_whitespace().next(),
+            }?;
+            (path.starts_with('/')
+                && !path.contains("linux-vdso")
+                && std::path::Path::new(path).is_file())
+            .then(|| path.to_string())
+        })
+        .collect()
+}
+
+/// Write `body` to `{jail}/{rel}` through a staged file: the jail is outside the
+/// agent's writable namespace on a systemd box, so the write goes through
+/// `install`, which the unsandboxed escape can reach.
+async fn write_jail_file(jail: &str, rel: &str, body: &str) -> Result<(), String> {
+    let staging = format!("/var/lib/dockpanel/.jail.{}", uuid::Uuid::new_v4());
+    std::fs::write(&staging, body).map_err(|e| format!("could not stage {rel}: {e}"))?;
+    let result = run_un(
+        "install",
+        &["-D", "-m", "644", &staging, &format!("{jail}/{rel}")],
+    )
+    .await;
+    let _ = std::fs::remove_file(&staging);
+    result
+}
+
+/// Lay down the whole userland a jailed login needs: a shell, its libraries, the
+/// BusyBox applets, the device nodes, and a minimal `/etc`.
+async fn build_shell_runtime(
+    jail: &str,
+    username: &str,
+    uid: i32,
+    gid: i32,
+) -> Result<(), String> {
+    for dir in RUNTIME_DIRS {
+        run_un("mkdir", &["-p", &format!("{jail}/{dir}")]).await?;
+    }
+
+    let shell = jail_shell();
+    copy_into_jail(shell, jail).await?;
+    if std::path::Path::new("/bin/busybox").exists() {
+        copy_into_jail("/bin/busybox", jail).await?;
+        for applet in BUSYBOX_APPLETS {
+            let _ = run_un("ln", &["-sf", "busybox", &format!("{jail}/bin/{applet}")]).await;
+        }
+    }
+    if shell != "/bin/sh" {
+        let name = shell.rsplit('/').next().unwrap_or("sh");
+        let _ = run_un("ln", &["-sf", name, &format!("{jail}/bin/sh")]).await;
+    }
+
+    // Device nodes. `/dev/null` is load-bearing for anything that redirects,
+    // `/dev/tty` for interactive programs, `/dev/urandom` for key material.
+    for (node, major, minor) in [
+        ("null", "1", "3"),
+        ("zero", "1", "5"),
+        ("random", "1", "8"),
+        ("urandom", "1", "9"),
+        ("tty", "5", "0"),
+    ] {
+        let dev = format!("{jail}/dev/{node}");
+        let _ = run_un("mknod", &[&dev, "c", major, minor]).await;
+        let _ = run_un("chmod", &["666", &dev]).await;
+    }
+    run_un("chmod", &["1777", &format!("{jail}/tmp")]).await?;
+
+    // A minimal /etc: `whoami`/`ls -l` need the passwd/group entries, and
+    // /etc/profile drops the tenant straight into their files at /content.
+    write_jail_file(
+        jail,
+        "etc/passwd",
+        &format!("root:x:0:0:root:/root:{shell}\n{username}:x:{uid}:{gid}:{username}:/:/bin/sh\n"),
+    )
+    .await?;
+    write_jail_file(jail, "etc/group", &format!("root:x:0:\n{username}:x:{gid}:\n")).await?;
+    write_jail_file(jail, "etc/shells", &format!("/bin/sh\n{shell}\n")).await?;
+    write_jail_file(
+        jail,
+        "etc/profile",
+        "export PATH=/bin:/usr/bin\nexport HOME=/\ncd /content 2>/dev/null || true\n",
+    )
+    .await?;
+    write_jail_file(
+        jail,
+        "etc/motd",
+        "DockPanel jailed shell — your files are in /content.\n",
+    )
+    .await?;
+    if let Ok(resolv) = tokio::fs::read_to_string("/etc/resolv.conf").await {
+        let _ = write_jail_file(jail, "etc/resolv.conf", &resolv).await;
+    }
+    Ok(())
+}
+
+/// Give `domain`'s account a jailed interactive shell. The account and jail must
+/// already exist — the caller enables file (SFTP) access first.
+pub async fn enable_shell(domain: &str, uid: i32, gid: i32) -> Result<(), String> {
+    let jail = jail_root(domain);
+    if !std::path::Path::new(&jail).exists() {
+        return Err(format!(
+            "the jail for {domain} does not exist yet — enable file (SFTP) access first"
+        ));
+    }
+    let username = sftp_username(uid);
+    let _ = safe_command_unsandboxed("groupadd", &[])
+        .args([SHELL_GROUP])
+        .output()
+        .await;
+    build_shell_runtime(&jail, &username, uid, gid).await?;
+    // sshd refuses a locked account even for publickey auth ("account is
+    // locked"), so a shell account must be unlocked. If no password is set yet,
+    // set a random one: the account becomes usable by key immediately, and a
+    // password login stays impossible until the owner resets it to a known value.
+    ensure_unlocked(&username).await?;
+    run_un("usermod", &["-s", jail_shell(), &username]).await?;
+    run_un("usermod", &["-aG", SHELL_GROUP, &username]).await?;
+    // NOT left in the SFTP group: its `ForceCommand` would pin the login to
+    // internal-sftp for ever (see `SHELL_GROUP`).
+    let _ = run_un("gpasswd", &["-d", &username, SFTP_GROUP]).await;
+    write_sshd_dropin().await?;
+    tracing::info!("jailed shell enabled for {domain}: user={username}");
+    Ok(())
+}
+
+/// Turn the jailed shell back into SFTP-only, keeping the account and files.
+pub async fn disable_shell(domain: &str, uid: i32) -> Result<(), String> {
+    let jail = jail_root(domain);
+    let username = sftp_username(uid);
+    let _ = run_un("usermod", &["-s", "/usr/sbin/nologin", &username]).await;
+    let _ = run_un("gpasswd", &["-d", &username, SHELL_GROUP]).await;
+    let _ = run_un("usermod", &["-aG", SFTP_GROUP, &username]).await;
+    // Remove only the runtime; content/ is the tenant's files and stays.
+    for dir in RUNTIME_DIRS {
+        let _ = run_un("rm", &["-rf", &format!("{jail}/{dir}")]).await;
+    }
+    tracing::info!("jailed shell disabled for {domain}: user={username}");
+    Ok(())
+}
+
+/// Ensure `username`'s password is not locked, setting a random one if it is.
+async fn ensure_unlocked(username: &str) -> Result<(), String> {
+    let shadow = tokio::fs::read_to_string("/etc/shadow")
+        .await
+        .map_err(|e| format!("could not read /etc/shadow: {e}"))?;
+    let locked = shadow
+        .lines()
+        .find(|l| l.starts_with(&format!("{username}:")))
+        .map(|l| {
+            let field = l.split(':').nth(1).unwrap_or("");
+            field.is_empty() || field.starts_with('!') || field.starts_with('*')
+        })
+        .unwrap_or(true);
+    if !locked {
+        return Ok(());
+    }
+    let mut buf = [0u8; 24];
+    {
+        use rand::Rng as _;
+        rand::rng().fill(&mut buf);
+    }
+    apply_password(username, &hex::encode(buf)).await
 }
 
 #[cfg(test)]
@@ -512,5 +933,20 @@ mod tests {
                 .is_err(),
             "a wrong password must not verify"
         );
+    }
+
+    /// The fstab bookkeeping that makes an OpenRC bind mount survive a reboot:
+    /// the mount point is the SECOND field, and a comment or an unrelated mount
+    /// must never be mistaken for it.
+    #[test]
+    fn fstab_mount_lookup_matches_only_the_mount_point_field() {
+        let fstab = "# /etc/fstab\n\
+                     /dev/sda1 / ext4 defaults 0 1\n\
+                     /var/www/example.com /var/dockpanel-sftp/example.com/content none bind,nofail 0 0\n";
+        assert!(fstab_has_mount(fstab, "/var/dockpanel-sftp/example.com/content"));
+        assert!(!fstab_has_mount(fstab, "/var/www/example.com"));
+        assert!(!fstab_has_mount(fstab, "# /var/dockpanel-sftp/example.com/content"));
+        assert!(!line_mounts("# a comment", "/anything"));
+        assert!(!line_mounts("", "/anything"));
     }
 }

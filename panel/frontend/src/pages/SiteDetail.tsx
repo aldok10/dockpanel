@@ -37,8 +37,17 @@ interface Site {
   bot_protection: string;
   sftp_enabled: boolean;
   sftp_uid: number | null;
+  ssh_shell_enabled: boolean;
   created_at: string;
   updated_at: string;
+}
+
+/** One installed public key, as the agent's key reader reports it. */
+interface SshKey {
+  key_type: string;
+  fingerprint: string;
+  comment: string;
+  preview: string;
 }
 
 interface StagingInfo {
@@ -234,6 +243,12 @@ export default function SiteDetail() {
   const [sftpResetting, setSftpResetting] = useState(false);
   const [sftpMsg, setSftpMsg] = useState("");
   const [sftpPassword, setSftpPassword] = useState<string | null>(null);
+  const [sshToggling, setSshToggling] = useState(false);
+  const [sshMsg, setSshMsg] = useState("");
+  const [sshKeys, setSshKeys] = useState<SshKey[]>([]);
+  const [sshKeyInput, setSshKeyInput] = useState("");
+  const [sshKeyBusy, setSshKeyBusy] = useState(false);
+  const [sshKeyMsg, setSshKeyMsg] = useState("");
   const [copied, setCopied] = useState("");
 
   const copyToClipboard = (text: string, label: string) => {
@@ -418,6 +433,21 @@ export default function SiteDetail() {
     }
     loadSslProvenance();
   }, [site?.ssl_enabled, site?.domain, loadSslProvenance]);
+
+  // The account's installed public keys. Fetched only for a shell-enabled site:
+  // the keys belong to the same Linux account either way, but they only open a
+  // login once the shell is on, so there is nothing to show before that.
+  const loadSshKeys = useCallback(() => {
+    api
+      .get<{ keys: SshKey[] }>(`/sites/${id}/ssh/keys`)
+      .then((r) => setSshKeys(r.keys))
+      .catch(() => setSshKeys([]));
+  }, [id]);
+
+  useEffect(() => {
+    if (site?.ssh_shell_enabled) loadSshKeys();
+    else setSshKeys([]);
+  }, [site?.ssh_shell_enabled, loadSshKeys]);
 
   // Composite score augmenting the plain up/down Health Check button above —
   // computed server-side from SSL expiry + backup freshness + monitor uptime,
@@ -1829,6 +1859,156 @@ export default function SiteDetail() {
                     {copied === "sftp_password" ? "Copied!" : "Copy"}
                   </button>
                 </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* SSH Access — a jailed interactive shell on the site's own account */}
+      {site.status === "active" && (
+        <div className="bg-dark-800 rounded-lg border border-dark-500 overflow-hidden mt-6">
+          <div className="px-5 py-4 border-b border-dark-600 flex items-center justify-between">
+            <h2 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">SSH Access</h2>
+            <span className={`inline-flex px-2.5 py-0.5 rounded-full text-xs font-medium ${
+              site.ssh_shell_enabled ? "bg-rust-500/10 text-rust-400" : "bg-dark-700 text-dark-300"
+            }`}>
+              {site.ssh_shell_enabled ? "Enabled" : "Disabled"}
+            </span>
+          </div>
+          <div className="p-5 space-y-4">
+            <p className="text-sm text-dark-200">
+              A jailed login over SSH on this site's own Linux account — the same one SFTP
+              uses, so there is one password and one set of keys for both. You land in your
+              site's files at <code className="font-mono text-dark-100">/content</code> and nothing
+              outside them is reachable. Enabling it creates the account if the site does not
+              have one yet.
+            </p>
+            {site.ssh_shell_enabled && site.sftp_uid != null && (
+              <div className="grid grid-cols-2 gap-3 text-xs font-mono">
+                <div>
+                  <div className="text-dark-400 uppercase tracking-wide mb-1">Username</div>
+                  <div className="text-dark-100">sftp{site.sftp_uid}</div>
+                </div>
+                <div>
+                  <div className="text-dark-400 uppercase tracking-wide mb-1">Connect</div>
+                  <div className="text-dark-100">ssh sftp{site.sftp_uid}@{site.domain}</div>
+                </div>
+              </div>
+            )}
+            <div className="flex items-center gap-3">
+              <button
+                disabled={sshToggling}
+                onClick={async () => {
+                  setSshToggling(true);
+                  setSshMsg("");
+                  try {
+                    const path = site.ssh_shell_enabled ? "disable" : "enable";
+                    const result = await api.post<{ ssh_shell_enabled: boolean }>(`/sites/${id}/ssh/${path}`);
+                    // The enable response carries no uid — re-fetching the site is
+                    // what surfaces the account created on the way (same as SFTP).
+                    setSite(s => s ? { ...s, ssh_shell_enabled: result.ssh_shell_enabled } : s);
+                    if (result.ssh_shell_enabled) {
+                      const fresh = await api.get<Site>(`/sites/${id}`);
+                      setSite(fresh);
+                    }
+                    setSshMsg(site.ssh_shell_enabled ? "SSH disabled" : "SSH enabled");
+                  } catch (e) {
+                    setSshMsg(e instanceof Error ? e.message : "Toggle failed");
+                  } finally {
+                    setSshToggling(false);
+                  }
+                }}
+                className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors disabled:opacity-50 ${
+                  site.ssh_shell_enabled
+                    ? "bg-warn-500/10 text-warn-400 hover:bg-warn-500/20"
+                    : "bg-rust-500 text-white hover:bg-rust-600"
+                }`}
+              >
+                {sshToggling ? "..." : site.ssh_shell_enabled ? "Disable SSH" : "Enable SSH"}
+              </button>
+              {sshMsg && (
+                <span className={`text-xs ${sshMsg.includes("failed") || sshMsg.includes("Failed") ? "text-danger-400" : "text-rust-400"}`}>
+                  {sshMsg}
+                </span>
+              )}
+            </div>
+
+            {site.ssh_shell_enabled && (
+              <div className="border-t border-dark-600 pt-4 space-y-3">
+                <div className="flex items-center justify-between gap-3">
+                  <h3 className="text-xs font-medium text-dark-300 uppercase font-mono tracking-widest">SSH Keys</h3>
+                  <span className="text-xs text-dark-400 text-right">
+                    Password sign-in uses the same account password — reset it in the SFTP card above.
+                  </span>
+                </div>
+                {sshKeys.length === 0 ? (
+                  <p className="text-xs text-dark-400">No keys installed yet.</p>
+                ) : (
+                  <ul className="space-y-2">
+                    {sshKeys.map((k) => (
+                      <li key={k.fingerprint} className="flex items-center justify-between gap-3 bg-dark-900 rounded-lg px-3 py-2">
+                        <div className="min-w-0">
+                          <div className="text-xs font-mono text-dark-100 truncate">
+                            {k.key_type} {k.preview}
+                          </div>
+                          <div className="text-[11px] text-dark-400 font-mono truncate">
+                            {k.fingerprint}{k.comment ? ` · ${k.comment}` : ""}
+                          </div>
+                        </div>
+                        <button
+                          onClick={async () => {
+                            setSshKeyMsg("");
+                            try {
+                              await api.delete(`/sites/${id}/ssh/keys/${encodeURIComponent(k.fingerprint)}`);
+                              loadSshKeys();
+                            } catch (e) {
+                              setSshKeyMsg(e instanceof Error ? e.message : "Remove failed");
+                            }
+                          }}
+                          className="shrink-0 px-3 py-1.5 bg-warn-500/10 text-warn-400 rounded-lg text-xs hover:bg-warn-500/20 transition-colors"
+                        >
+                          Remove
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                <div className="flex items-start gap-2">
+                  <textarea
+                    value={sshKeyInput}
+                    onChange={(e) => setSshKeyInput(e.target.value)}
+                    placeholder="ssh-ed25519 AAAA… user@host"
+                    rows={2}
+                    spellCheck={false}
+                    className="flex-1 bg-dark-900 border border-dark-500 rounded-lg px-3 py-2 text-xs font-mono text-dark-50 placeholder-dark-500 focus:outline-none focus:border-rust-500"
+                  />
+                  <button
+                    disabled={sshKeyBusy || !sshKeyInput.trim()}
+                    onClick={async () => {
+                      setSshKeyBusy(true);
+                      setSshKeyMsg("");
+                      try {
+                        await api.post(`/sites/${id}/ssh/keys`, { key: sshKeyInput });
+                        setSshKeyInput("");
+                        loadSshKeys();
+                        setSshKeyMsg("Key added");
+                      } catch (e) {
+                        setSshKeyMsg(e instanceof Error ? e.message : "Add failed");
+                      } finally {
+                        setSshKeyBusy(false);
+                      }
+                    }}
+                    className="shrink-0 px-4 py-2 bg-dark-700 text-dark-100 rounded-lg text-sm font-medium hover:bg-dark-600 disabled:opacity-50 transition-colors"
+                  >
+                    {sshKeyBusy ? "Adding..." : "Add Key"}
+                  </button>
+                </div>
+                {sshKeyMsg && (
+                  <span className={`text-xs ${sshKeyMsg.includes("failed") || sshKeyMsg.includes("Failed") ? "text-danger-400" : "text-rust-400"}`}>
+                    {sshKeyMsg}
+                  </span>
+                )}
               </div>
             )}
           </div>

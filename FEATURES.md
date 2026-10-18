@@ -16,6 +16,7 @@
 | Feature | Description | Backend | Agent | Frontend | DB Tables |
 |---------|-------------|---------|-------|----------|-----------|
 | **Sites** | Static, PHP (8.1–8.5), Node.js, Python sites with nginx. Domain rename, auto-firewall for proxy ports, Laravel auto-migrations | `routes/sites.rs`, `ssl.rs`, `files.rs`, `deploy.rs` | `nginx.rs`, `php.rs`, `ssl.rs`, `files.rs`, `cms.rs` | `Sites.tsx`, `SiteDetail.tsx`, `Files.tsx` | `sites` |
+| **Site SFTP & Jailed SSH** | Per-site Linux account in a chroot around the site's files: SFTP-only by default, or a jailed interactive shell that lands in `/content`. One account — owner-managed password and public keys; the sshd daemon and the server's root keys stay admin-managed | `routes/sites.rs` | `sftp_accounts.rs` | `SiteDetail.tsx` | `sites` |
 | **Databases** | MySQL/PostgreSQL via Docker, SQL browser, schema viewer, password reset | `routes/databases.rs` | `database.rs` | `Databases.tsx` | `databases` |
 | **Backups** | Scheduled backups, S3/SFTP/B2/GCS remote storage, one-click restore | `routes/backups.rs`, `backup_schedules.rs`, `backup_destinations.rs` | `backups.rs`, `remote_backup.rs` | `Backups.tsx` | `backups`, `backup_schedules`, `backup_destinations` |
 | **Backup Orchestrator** | DB/volume/site backups, AES-256 encryption, restore verification, policies, health dashboard, auto-verifier, **fleet-wide unified view across all servers with server+kind filters**, **end-to-end restore drills (site/db/volume), Restore Confidence SLA card, chain-of-trust JSON+PDF report across site/db/volume backups with per-arch sha256-pinned typst (v2.8.2)** | `routes/backup_orchestrator.rs` | `database_backup.rs`, `volume_backup.rs`, `encryption.rs`, `backup_verify.rs`, `backup_drills.rs`, `chain_report.rs` | `BackupOrchestrator.tsx` | `backup_policies`, `database_backups`, `volume_backups`, `backup_verifications`, `backup_drills` |
@@ -243,10 +244,10 @@ honest:
 | Panel services RAM (agent + API) | ~49 MB | measured | 2026-07-27 |
 | Full-stack RAM (with bundled PostgreSQL) | ~109 MB | measured | 2026-07-27 |
 | App templates | 147 | derived | every commit |
-| HTTP routes | 853 (551 backend + 302 agent) | derived | every commit |
-| Regression-pin assertions | 4746 (144 suites) | derived | every commit |
+| HTTP routes | 859 (555 backend + 304 agent) | derived | every commit |
+| Regression-pin assertions | 4770 (144 suites) | derived | every commit |
 | Frontend pages | 53 | derived | every commit |
-| DB migrations | 140 | derived | every commit |
+| DB migrations | 141 | derived | every commit |
 | Supervised background services | 17 | derived | every commit |
 
 Five of these were wrong when the register was built (s272), some by a factor of

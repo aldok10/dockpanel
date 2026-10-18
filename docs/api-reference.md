@@ -1,6 +1,6 @@
 # API Reference
 
-DockPanel exposes 853 REST endpoints (551 backend + 302 agent) across 50+ categories — the figure derived from the two routers in `FEATURES.md` §Verified Metrics, which owns it. The tables below document the commonly used subset, not every route. All endpoints except `/api/health`, `/api/branding`, `/api/auth/setup-status`, and `/api/auth/login` require authentication.
+DockPanel exposes 859 REST endpoints (555 backend + 304 agent) across 50+ categories — the figure derived from the two routers in `FEATURES.md` §Verified Metrics, which owns it. The tables below document the commonly used subset, not every route. All endpoints except `/api/health`, `/api/branding`, `/api/auth/setup-status`, and `/api/auth/login` require authentication.
 
 ## Authentication
 
@@ -764,6 +764,11 @@ leaves the stored value unchanged — there is no way to clear one through this 
 | GET | `/api/ssh/accounts/{id}/keys` | List an SSH login's authorized keys |
 | POST | `/api/ssh/accounts/{id}/keys` | Install an authorized key |
 | DELETE | `/api/ssh/accounts/{id}/keys/{fingerprint}` | Remove an authorized key |
+| POST | `/api/sites/{id}/ssh/enable` | Give the site's own Linux account a jailed interactive shell |
+| POST | `/api/sites/{id}/ssh/disable` | Drop the shell, keeping the account and files |
+| GET | `/api/sites/{id}/ssh/keys` | List the site account's authorized keys |
+| POST | `/api/sites/{id}/ssh/keys` | Install an authorized key for the site account |
+| DELETE | `/api/sites/{id}/ssh/keys/{fingerprint}` | Remove an authorized key |
 | GET/POST/POST | `/api/auto-updates/*` | Auto-update management |
 | GET/POST | `/api/backup-destinations` | Remote backup targets |
 | POST | `/api/traefik/install` | Install Traefik |

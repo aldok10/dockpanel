@@ -86,9 +86,51 @@ async fn set_password(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
+#[derive(Deserialize)]
+struct ShellEnableRequest {
+    uid: i32,
+    gid: i32,
+}
+
+#[derive(Deserialize)]
+struct ShellDisableRequest {
+    uid: i32,
+}
+
+/// POST /sftp/sites/{domain}/shell/enable — a jailed interactive shell for the
+/// site's existing SFTP account.
+async fn shell_enable(
+    Path(domain): Path<String>,
+    Json(body): Json<ShellEnableRequest>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    if !is_valid_domain(&domain) {
+        return Err(err(StatusCode::BAD_REQUEST, "Invalid domain"));
+    }
+    sftp_accounts::enable_shell(&domain, body.uid, body.gid)
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &e))?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// POST /sftp/sites/{domain}/shell/disable — back to SFTP-only, files intact.
+async fn shell_disable(
+    Path(domain): Path<String>,
+    Json(body): Json<ShellDisableRequest>,
+) -> Result<Json<serde_json::Value>, ApiErr> {
+    if !is_valid_domain(&domain) {
+        return Err(err(StatusCode::BAD_REQUEST, "Invalid domain"));
+    }
+    sftp_accounts::disable_shell(&domain, body.uid)
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &e))?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/sftp/sites/{domain}/enable", post(enable))
         .route("/sftp/sites/{domain}/disable", post(disable))
         .route("/sftp/sites/{domain}/password", post(set_password))
+        .route("/sftp/sites/{domain}/shell/enable", post(shell_enable))
+        .route("/sftp/sites/{domain}/shell/disable", post(shell_disable))
 }

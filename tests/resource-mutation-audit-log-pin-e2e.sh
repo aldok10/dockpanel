@@ -106,7 +106,7 @@ check_count secrets 1
 check_count security 15
 check_count servers 5
 check_count settings 2
-check_count sites 8
+check_count sites 12
 check_count ssl 1
 check_count stacks 1
 check_count staging 2
@@ -123,10 +123,10 @@ for f in $FILES; do
   n=$(code "$ROUTES/$f.rs" | grep -c "audit_log(")
   TOTAL=$((TOTAL + n))
 done
-if [ "$TOTAL" -eq 113 ]; then
-  ok "grand total audit_log() calls across all 32 files is 113 (13 pre-existing + 97 from this session's own extension + 3 from the later SFTP feature's own enable/disable/reset-password credential-lifecycle events)"
+if [ "$TOTAL" -eq 117 ]; then
+  ok "grand total audit_log() calls across all 32 files is 117 (13 pre-existing + 97 from this session's own extension + 3 from the SFTP feature's own enable/disable/reset-password credential-lifecycle events + 4 from the jailed-shell feature's ssh enable/disable and site-key add/remove events)"
 else
-  bad "grand total audit_log() calls: expected 113, found $TOTAL"
+  bad "grand total audit_log() calls: expected 117, found $TOTAL"
 fi
 
 # ── 3. Targeted content checks — the highest-value / trickiest sites ───

@@ -360,7 +360,7 @@ echo "── H. The tenancy boundary this door would otherwise cross ───�
 #
 # Row-scoping cannot close that, because files with no row are exactly what this door is
 # for. `require_admin` closes it and costs nothing real: placing a file in that directory
-# needs root, there is no per-site SFTP, and an admin can already read /var/backups.
+# needs root, a jailed per-site SFTP/SSH account cannot reach /var/backups, and an admin can already read /var/backups.
 for fn in dumps import; do
   BODY=$(perl -0777 -ne "print \$1 if /pub async fn $fn\\((.*?)\\n\\}\\n/s" "$DBS")
   if [ -z "$BODY" ]; then

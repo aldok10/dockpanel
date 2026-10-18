@@ -3974,6 +3974,359 @@ pub async fn reset_sftp_password(
     Ok(Json(serde_json::json!({ "ok": true, "password": password })))
 }
 
+/// The site's Linux login name — the same identity SFTP uses, which is what
+/// makes the two one account with one password and one key set.
+fn site_linux_username(site: &Site) -> Result<String, ApiError> {
+    let uid = site
+        .sftp_uid
+        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "This site has no Linux account yet"))?;
+    Ok(format!("sftp{uid}"))
+}
+
+/// POST /api/sites/{id}/ssh/enable — give the site's Linux account a jailed
+/// interactive shell.
+///
+/// The shell lives inside the SFTP account's jail, so this provisions that
+/// account first when the site has never had one — the same uid allocation and
+/// nginx/PHP-FPM rebuild the SFTP enable path performs, in the same order.
+/// `ssh_shell_enabled` is the only column that changes on an existing account.
+pub async fn enable_site_ssh(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if crate::services::security_hardening::is_locked_down(&state.db).await {
+        return Err(err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "System is in lockdown mode",
+        ));
+    }
+
+    let mut site: Site = sqlx::query_as(SITE_FOR_CALLER_ALL.as_str())
+        .bind(id)
+        .bind(claims.sub)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| internal_error("enable site ssh", e))?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "Site not found"))?;
+
+    if site.ssh_shell_enabled {
+        return Ok(Json(serde_json::json!({
+            "ok": true,
+            "ssh_shell_enabled": true,
+            "message": "SSH access is already enabled for this site",
+        })));
+    }
+
+    let agent = crate::helpers::agent_for_site_server(&state, site.server_id, &site.domain).await?;
+
+    if !site.sftp_enabled {
+        let (allocated,): (i32,) = sqlx::query_as("SELECT nextval('sftp_id_seq')::int")
+            .fetch_one(&state.db)
+            .await
+            .map_err(|e| internal_error("allocate site uid", e))?;
+        let (uid, gid) = (allocated, allocated);
+
+        agent
+            .post(
+                &format!("/sftp/sites/{}/enable", site.domain),
+                Some(serde_json::json!({ "uid": uid, "gid": gid })),
+            )
+            .await
+            .map_err(|e| agent_error("SSH shell SFTP enable", e))?;
+
+        sqlx::query(
+            "UPDATE sites SET sftp_enabled = true, sftp_uid = $1, sftp_gid = $2, updated_at = NOW() WHERE id = $3",
+        )
+        .bind(uid)
+        .bind(gid)
+        .bind(id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| internal_error("enable site ssh", e))?;
+
+        site.sftp_enabled = true;
+        site.sftp_uid = Some(uid);
+        site.sftp_gid = Some(gid);
+
+        // Re-own the PHP-FPM pool to the new uid before the shell is added — the
+        // SFTP enable path's ordering rule, and the same reason: `userdel`/the
+        // chown race aside, a pool still running as www-data would be unable to
+        // write the directories the shell user now owns.
+        agent
+            .put(
+                &format!("/nginx/sites/{}", site.domain),
+                build_nginx_body(&site),
+            )
+            .await
+            .map_err(|e| agent_error("SSH shell nginx/pool rebuild", e))?;
+    }
+
+    let uid = site
+        .sftp_uid
+        .ok_or_else(|| internal_error("enable site ssh", sqlx::Error::RowNotFound))?;
+    let gid = site
+        .sftp_gid
+        .ok_or_else(|| internal_error("enable site ssh", sqlx::Error::RowNotFound))?;
+
+    agent
+        .post(
+            &format!("/sftp/sites/{}/shell/enable", site.domain),
+            Some(serde_json::json!({ "uid": uid, "gid": gid })),
+        )
+        .await
+        .map_err(|e| agent_error("SSH shell enable", e))?;
+
+    sqlx::query("UPDATE sites SET ssh_shell_enabled = true, updated_at = NOW() WHERE id = $1")
+        .bind(id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| internal_error("enable site ssh", e))?;
+
+    let ip = crate::routes::client_ip(&headers);
+    tracing::info!("SSH shell enabled for {} (uid={uid})", site.domain);
+    activity::log_activity(
+        &state.db,
+        claims.sub,
+        &claims.email,
+        "site.ssh.enabled",
+        Some("site"),
+        Some(&site.domain),
+        None,
+        ip.as_deref(),
+        claims.key_id,
+    )
+    .await;
+    crate::services::security_hardening::audit_log(
+        &state.db,
+        "site.ssh.enabled",
+        Some(&claims.email),
+        ip.as_deref(),
+        Some("site"),
+        Some(&site.domain),
+        None,
+        None,
+        "warning",
+        claims.key_id,
+    )
+    .await;
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "ssh_shell_enabled": true,
+        "username": format!("sftp{uid}"),
+    })))
+}
+
+/// POST /api/sites/{id}/ssh/disable — drop the shell, keep the account and files.
+pub async fn disable_site_ssh(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let site: Site = sqlx::query_as(SITE_FOR_CALLER_ALL.as_str())
+        .bind(id)
+        .bind(claims.sub)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| internal_error("disable site ssh", e))?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "Site not found"))?;
+
+    if !site.ssh_shell_enabled {
+        return Ok(Json(serde_json::json!({
+            "ok": true,
+            "ssh_shell_enabled": false,
+            "message": "SSH access is already disabled for this site",
+        })));
+    }
+    let uid = site
+        .sftp_uid
+        .ok_or_else(|| internal_error("disable site ssh", sqlx::Error::RowNotFound))?;
+
+    let agent = crate::helpers::agent_for_site_server(&state, site.server_id, &site.domain).await?;
+    agent
+        .post(
+            &format!("/sftp/sites/{}/shell/disable", site.domain),
+            Some(serde_json::json!({ "uid": uid })),
+        )
+        .await
+        .map_err(|e| agent_error("SSH shell disable", e))?;
+
+    sqlx::query("UPDATE sites SET ssh_shell_enabled = false, updated_at = NOW() WHERE id = $1")
+        .bind(id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| internal_error("disable site ssh", e))?;
+
+    let ip = crate::routes::client_ip(&headers);
+    tracing::info!("SSH shell disabled for {}", site.domain);
+    activity::log_activity(
+        &state.db,
+        claims.sub,
+        &claims.email,
+        "site.ssh.disabled",
+        Some("site"),
+        Some(&site.domain),
+        None,
+        ip.as_deref(),
+        claims.key_id,
+    )
+    .await;
+    crate::services::security_hardening::audit_log(
+        &state.db,
+        "site.ssh.disabled",
+        Some(&claims.email),
+        ip.as_deref(),
+        Some("site"),
+        Some(&site.domain),
+        None,
+        None,
+        "warning",
+        claims.key_id,
+    )
+    .await;
+
+    Ok(Json(serde_json::json!({ "ok": true, "ssh_shell_enabled": false })))
+}
+
+/// GET /api/sites/{id}/ssh/keys — the account's installed public keys.
+pub async fn list_site_ssh_keys(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let site: Site = sqlx::query_as(SITE_FOR_CALLER_ALL.as_str())
+        .bind(id)
+        .bind(claims.sub)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| internal_error("list site ssh keys", e))?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "Site not found"))?;
+    let username = site_linux_username(&site)?;
+    let agent = crate::helpers::agent_for_site_server(&state, site.server_id, &site.domain).await?;
+    let keys = agent
+        .get(&format!("/os-users/{username}/keys"))
+        .await
+        .map_err(|e| agent_error("List site SSH keys", e))?;
+    Ok(Json(keys))
+}
+
+#[derive(serde::Deserialize)]
+pub struct SiteSshKeyRequest {
+    pub key: String,
+}
+
+/// POST /api/sites/{id}/ssh/keys — install one public key on the site's account.
+pub async fn add_site_ssh_key(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<SiteSshKeyRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let site: Site = sqlx::query_as(SITE_FOR_CALLER_ALL.as_str())
+        .bind(id)
+        .bind(claims.sub)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| internal_error("add site ssh key", e))?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "Site not found"))?;
+    let username = site_linux_username(&site)?;
+    let agent = crate::helpers::agent_for_site_server(&state, site.server_id, &site.domain).await?;
+    agent
+        .post(
+            &format!("/os-users/{username}/keys"),
+            Some(serde_json::json!({ "key": body.key })),
+        )
+        .await
+        .map_err(|e| agent_error("Add site SSH key", e))?;
+
+    let ip = crate::routes::client_ip(&headers);
+    activity::log_activity(
+        &state.db,
+        claims.sub,
+        &claims.email,
+        "site.ssh.key.add",
+        Some("site"),
+        Some(&site.domain),
+        Some(&username),
+        ip.as_deref(),
+        claims.key_id,
+    )
+    .await;
+    crate::services::security_hardening::audit_log(
+        &state.db,
+        "site.ssh.key.add",
+        Some(&claims.email),
+        ip.as_deref(),
+        Some("site"),
+        Some(&site.domain),
+        Some(&username),
+        None,
+        "warning",
+        claims.key_id,
+    )
+    .await;
+
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// DELETE /api/sites/{id}/ssh/keys/{fingerprint} — remove one key.
+pub async fn remove_site_ssh_key(
+    State(state): State<AppState>,
+    AuthUser(claims): AuthUser,
+    Path((id, fingerprint)): Path<(Uuid, String)>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let site: Site = sqlx::query_as(SITE_FOR_CALLER_ALL.as_str())
+        .bind(id)
+        .bind(claims.sub)
+        .fetch_optional(&state.db)
+        .await
+        .map_err(|e| internal_error("remove site ssh key", e))?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "Site not found"))?;
+    let username = site_linux_username(&site)?;
+    let agent = crate::helpers::agent_for_site_server(&state, site.server_id, &site.domain).await?;
+    agent
+        .delete(&format!(
+            "/os-users/{username}/keys/{}",
+            crate::routes::ssh::enc_segment(&fingerprint)
+        ))
+        .await
+        .map_err(|e| agent_error("Remove site SSH key", e))?;
+
+    let ip = crate::routes::client_ip(&headers);
+    activity::log_activity(
+        &state.db,
+        claims.sub,
+        &claims.email,
+        "site.ssh.key.remove",
+        Some("site"),
+        Some(&site.domain),
+        Some(&username),
+        ip.as_deref(),
+        claims.key_id,
+    )
+    .await;
+    crate::services::security_hardening::audit_log(
+        &state.db,
+        "site.ssh.key.remove",
+        Some(&claims.email),
+        ip.as_deref(),
+        Some("site"),
+        Some(&site.domain),
+        Some(&username),
+        None,
+        "warning",
+        claims.key_id,
+    )
+    .await;
+
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
 /// PUT /api/sites/{id}/waf — Toggle WAF and set mode for a site.
 pub async fn toggle_waf(
     State(state): State<AppState>,
