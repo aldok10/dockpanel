@@ -21,6 +21,9 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 sha2 = "0.10"
 hex = "0.4"
+# Already in the tree via `jsonwebtoken`; used directly to read the two dates a
+# listing sorts by — the `Date:` header and Dovecot's `date.received`.
+time = { version = "0.3", features = ["parsing", "formatting", "macros"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 utoipa-swagger-ui = { version = "10.0.1", features = ["axum", "gzip", "minified", "vendored"] }

@@ -51,13 +51,15 @@ use axum::{
 use lettre::message::{header::ContentType, header::MIME_VERSION_1_0, Mailbox, MultiPart};
 use lettre::Message;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use utoipa_swagger_ui::SwaggerUi;
 
+mod roundcube;
+
 /// A recipient list that may arrive either as a bare string or an array.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 enum OneOrMany {
     One(String),
@@ -124,6 +126,7 @@ struct AppState {
     http: reqwest::Client,
 }
 
+#[derive(Debug)]
 struct ApiErr(StatusCode, String);
 
 impl ApiErr {
@@ -1098,7 +1101,7 @@ async fn me_folder_delete(
 
 /// The fields a listing needs, in the names `doveadm fetch` uses.
 const MESSAGE_FIELDS: &str =
-    "uid flags size.virtual date.sent hdr.subject hdr.from hdr.to hdr.cc hdr.date";
+    "uid flags size.virtual date.sent date.received hdr.subject hdr.from hdr.to hdr.cc hdr.date";
 
 /// The flags a caller may set — a closed list, both because these land in argv
 /// and because a mailbox has no business accumulating keywords nobody reads.
@@ -1211,6 +1214,795 @@ async fn find_by_message_id(email: &str, folder: &str, message_id: &str) -> Opti
         .ok()
 }
 
+// ---------------------------------------------------------------------------
+// Searching and sorting a listing
+//
+// `GET /v1/me/messages` reads a folder the way the Roundcube webmail in front
+// of it searches one: free text over a chosen set of fields, the filter and
+// interval dropdowns, the `is:`/`larger:`/`since:`/`OR` tokens a user can type
+// into the search box, and the column sort with its order. The search runs in
+// Dovecot — `doveadm fetch` takes an IMAP search query — so `BODY` and `TEXT`
+// searches do not drag every message body through this daemon; only the sort
+// and the page are applied here, over the matching rows.
+//
+// Safety rests on the same rule as the rest of the file, extended to free text:
+// `doveadm` is spawned without a shell, every value is its own argv element,
+// and `--` is placed before the query so a value that begins with `-` cannot be
+// read as an option (doveadm's option parser stops there). The search KEYS come
+// only from the closed sets below — a caller supplies values, never keys.
+// ---------------------------------------------------------------------------
+
+/// The fields a plain-text term may look in — Roundcube's "search in" choices.
+/// `all` is not one of its field names but the set a caller usually means by it.
+const TEXT_FIELDS: [&str; 6] = ["subject", "from", "to", "cc", "bcc", "body"];
+
+/// Every field name accepted, `subject:…` and the slightly odd Webmail
+/// spellings included.
+const NAMED_FIELDS: [&str; 9] = [
+    "subject",
+    "from",
+    "to",
+    "cc",
+    "bcc",
+    "body",
+    "text",
+    "reply-to",
+    "followup-to",
+];
+
+/// One piece of an IMAP search, built only from the keys of
+/// `doveadm-search-query(7)`.
+enum Cond {
+    /// A key and its arguments, already in argv order: `["HEADER","SUBJECT","x"]`.
+    Key(Vec<String>),
+    /// `( a OR b OR c )` — parentheses are what let an OR sit inside an AND.
+    Or(Vec<Cond>),
+    /// `( a b c )`, an explicit AND group.
+    And(Vec<Cond>),
+    /// `NOT a`.
+    Not(Box<Cond>),
+}
+
+impl Cond {
+    fn key(parts: &[&str]) -> Cond {
+        Cond::Key(parts.iter().map(|p| (*p).to_string()).collect())
+    }
+
+    /// `HEADER <field> <value>`, the way Roundcube spells subject/from/to/cc/bcc.
+    fn header(field: &str, value: &str) -> Cond {
+        Cond::Key(vec!["HEADER".to_string(), field.to_ascii_uppercase(), value.to_string()])
+    }
+
+    /// Flatten to the argv `doveadm` reads a query from.
+    fn push(&self, out: &mut Vec<String>) {
+        match self {
+            Cond::Key(parts) => out.extend(parts.iter().cloned()),
+            Cond::Or(parts) => {
+                out.push("(".to_string());
+                for (i, part) in parts.iter().enumerate() {
+                    if i > 0 {
+                        out.push("OR".to_string());
+                    }
+                    part.push(out);
+                }
+                out.push(")".to_string());
+            }
+            Cond::And(parts) => {
+                out.push("(".to_string());
+                for part in parts {
+                    part.push(out);
+                }
+                out.push(")".to_string());
+            }
+            Cond::Not(inner) => {
+                out.push("NOT".to_string());
+                inner.push(out);
+            }
+        }
+    }
+}
+
+/// AND a list of conditions into one doveadm query.
+fn query_of(conds: &[Cond]) -> Vec<String> {
+    let mut out = Vec::new();
+    for cond in conds {
+        cond.push(&mut out);
+    }
+    out
+}
+
+/// One search field, as the key Roundcube would emit for it.
+fn field_cond(field: &str, value: &str) -> Option<Cond> {
+    Some(match field {
+        "subject" => Cond::header("SUBJECT", value),
+        "from" => Cond::header("FROM", value),
+        "to" => Cond::header("TO", value),
+        "cc" => Cond::header("CC", value),
+        "bcc" => Cond::header("BCC", value),
+        "body" => Cond::key(&["BODY", value]),
+        "text" => Cond::key(&["TEXT", value]),
+        // Two headers apiece on the wire, because the "reply-to"/"followup-to"
+        // spellings vary — the same OR Roundcube builds.
+        "reply-to" | "replyto" => {
+            Cond::Or(vec![Cond::header("REPLY-TO", value), Cond::header("MAIL-REPLY-TO", value)])
+        }
+        "followup-to" | "followupto" => Cond::Or(vec![
+            Cond::header("FOLLOWUP-TO", value),
+            Cond::header("MAIL-FOLLOWUP-TO", value),
+        ]),
+        _ => return None,
+    })
+}
+
+/// `has:attachment` / the filter dropdown's "with attachment", built the way
+/// Roundcube builds it: the content types a message with an attachment carries,
+/// OR the `$HasAttachment` keyword the Webmail's own list recognises — with
+/// `$HasNoAttachment` excluded. Nothing in this install sets the keyword, but a
+/// mailbox that already carries it must still match, exactly as it would there.
+fn attachment_cond() -> Cond {
+    let types = ["application/", "multipart/mixed", "multipart/signed", "multipart/report"];
+    let mut conds: Vec<Cond> = types.iter().map(|t| Cond::header("CONTENT-TYPE", t)).collect();
+    conds.push(Cond::And(vec![
+        Cond::key(&["KEYWORD", "$HasAttachment"]),
+        Cond::Not(Box::new(Cond::key(&["KEYWORD", "$HasNoAttachment"]))),
+    ]));
+    Cond::Or(conds)
+}
+
+/// The filter dropdown's names, plus the read/unread and keywoded flags people
+/// ask for directly.
+fn filter_cond(name: &str) -> Option<Cond> {
+    Some(match name.to_ascii_lowercase().as_str() {
+        "all" => return None,
+        "unread" => Cond::key(&["UNSEEN"]),
+        "read" | "seen" => Cond::key(&["SEEN"]),
+        "flagged" => Cond::key(&["FLAGGED"]),
+        "unflagged" => Cond::key(&["UNFLAGGED"]),
+        "answered" => Cond::key(&["ANSWERED"]),
+        "unanswered" => Cond::key(&["UNANSWERED"]),
+        "deleted" => Cond::key(&["DELETED"]),
+        "undeleted" => Cond::key(&["UNDELETED"]),
+        "draft" => Cond::key(&["DRAFT"]),
+        "undraft" => Cond::key(&["UNDRAFT"]),
+        "attachment" | "has-attachment" => attachment_cond(),
+        "priority-highest" => Cond::header("X-PRIORITY", "1"),
+        "priority-high" => Cond::header("X-PRIORITY", "2"),
+        "priority-normal" => Cond::And(vec![
+            Cond::Not(Box::new(Cond::header("X-PRIORITY", "1"))),
+            Cond::Not(Box::new(Cond::header("X-PRIORITY", "2"))),
+            Cond::Not(Box::new(Cond::header("X-PRIORITY", "4"))),
+            Cond::Not(Box::new(Cond::header("X-PRIORITY", "5"))),
+        ]),
+        "priority-low" => Cond::header("X-PRIORITY", "4"),
+        "priority-lowest" => Cond::header("X-PRIORITY", "5"),
+        _ => return None,
+    })
+}
+
+/// `is:<value>`, the token form of the flag filters.
+fn is_cond(value: &str) -> Option<Cond> {
+    Some(match value.to_ascii_lowercase().as_str() {
+        "unread" | "unseen" => Cond::key(&["UNSEEN"]),
+        "read" | "seen" => Cond::key(&["SEEN"]),
+        "flagged" => Cond::key(&["FLAGGED"]),
+        "unflagged" => Cond::key(&["UNFLAGGED"]),
+        "answered" => Cond::key(&["ANSWERED"]),
+        "unanswered" => Cond::key(&["UNANSWERED"]),
+        "deleted" => Cond::key(&["DELETED"]),
+        "undeleted" => Cond::key(&["UNDELETED"]),
+        "draft" => Cond::key(&["DRAFT"]),
+        "undraft" => Cond::key(&["UNDRAFT"]),
+        "recent" => Cond::key(&["RECENT"]),
+        "old" => Cond::key(&["OLD"]),
+        "new" => Cond::key(&["NEW"]),
+        _ => return None,
+    })
+}
+
+/// A date written the way `doveadm` reads one: `YYYY-MM-DD`, accepted with `/`
+/// as well because that is how people type it.
+fn iso_date(value: &str) -> Option<String> {
+    let normalized = value.trim().replace('/', "-");
+    let mut parts = normalized.split('-');
+    let (y, m, d) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() {
+        return None;
+    }
+    let year: i32 = y.parse().ok()?;
+    let month = time::Month::try_from(m.parse::<u8>().ok()?).ok()?;
+    let day: u8 = d.parse().ok()?;
+    let date = time::Date::from_calendar_date(year, month, day).ok()?;
+    date.format(&time::format_description::well_known::Iso8601::DATE).ok()
+}
+
+/// Step a date back by a number of months, clamping the day to the shorter
+/// month — what PHP's `DateInterval('P1M')` does for Roundcube.
+fn months_back(now: time::OffsetDateTime, months: i64) -> Option<time::OffsetDateTime> {
+    let total = now.year() as i64 * 12 + (u8::from(now.month()) as i64 - 1) - months;
+    let year = i32::try_from(total.div_euclid(12)).ok()?;
+    let month = time::Month::try_from(u8::try_from(total.rem_euclid(12) + 1).ok()?).ok()?;
+    let day = now.day().min(time::util::days_in_month(month, year));
+    let date = time::Date::from_calendar_date(year, month, day).ok()?;
+    Some(now.replace_date(date))
+}
+
+/// The date an interval names, resolved against today the way Roundcube
+/// resolves its dropdown rather than handed to Dovecot as `1M`, which Dovecot
+/// would read as one *minute*.
+fn interval_date(value: &str) -> Option<String> {
+    let value = value.trim();
+    let mut chars = value.chars();
+    let unit = chars.next_back()?;
+    let n: i64 = chars.as_str().parse().ok()?;
+    if n <= 0 {
+        return None;
+    }
+    let now = time::OffsetDateTime::now_utc();
+    let date = match unit.to_ascii_uppercase() {
+        'W' => now - time::Duration::weeks(n),
+        'D' => now - time::Duration::days(n),
+        'M' => months_back(now, n)?,
+        'Y' => months_back(now, n.checked_mul(12)?)?,
+        _ => return None,
+    };
+    date.format(&time::format_description::well_known::Iso8601::DATE).ok()
+}
+
+/// `since:`/`before:` — an interval or an explicit date, both turned into a
+/// `YYYY-MM-DD` Dovecot reads.
+fn date_cond(key: &str, value: &str) -> Option<Cond> {
+    let date = interval_date(value).or_else(|| iso_date(value))?;
+    Some(Cond::key(&[key, &date]))
+}
+
+/// `larger:`/`smaller:` — bytes, with the size suffixes Dovecot itself takes.
+fn size_bytes(value: &str) -> Option<String> {
+    let value = value.trim();
+    let mut chars = value.chars();
+    let last = chars.next_back()?;
+    let (num, mult): (&str, u64) = match last.to_ascii_uppercase() {
+        'K' => (chars.as_str(), 1024),
+        'M' => (chars.as_str(), 1024 * 1024),
+        'G' => (chars.as_str(), 1024 * 1024 * 1024),
+        'T' => (chars.as_str(), 1024 * 1024 * 1024 * 1024),
+        'B' => (chars.as_str(), 1),
+        _ => (value, 1),
+    };
+    let n: f64 = num.trim().parse().ok()?;
+    if !n.is_finite() || n < 0.0 {
+        return None;
+    }
+    Some(((n * mult as f64) as u64).to_string())
+}
+
+/// A `key:value` token, with the `-` negation left on the key for the caller to
+/// strip. Names are letters and `-` only, so a bare `http://…` stays text.
+fn split_option(token: &str) -> Option<(&str, &str)> {
+    let (option, value) = token.split_once(':')?;
+    let name = option.strip_prefix('-').unwrap_or(option);
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphabetic() || c == '-') {
+        return None;
+    }
+    Some((option, value))
+}
+
+/// Drop the surrounding quotes Roundcube's tokens may carry and undouble `\"`.
+fn unquote(value: &str) -> String {
+    let mut v = value.trim();
+    if let Some(rest) = v.strip_prefix('"') {
+        v = rest;
+    }
+    if let Some(rest) = v.strip_suffix('"') {
+        v = rest;
+    }
+    v.replace("\\\"", "\"")
+}
+
+/// Split on whitespace, but not inside quotes — Roundcube's
+/// `explode_quoted_string('\s+', …)`, and the only way `subject:"two words"`
+/// arrives as one token.
+fn tokenize(raw: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut quoted = false;
+    let mut escaped = false;
+    for c in raw.chars() {
+        if escaped {
+            cur.push(c);
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if quoted => {
+                cur.push(c);
+                escaped = true;
+            }
+            '"' => {
+                quoted = !quoted;
+                cur.push(c);
+            }
+            c if c.is_whitespace() && !quoted => {
+                if !cur.is_empty() {
+                    tokens.push(std::mem::take(&mut cur));
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        tokens.push(cur);
+    }
+    tokens
+}
+
+/// The inline tokens of the search box that name a field, a flag, a size or a
+/// date — `from:x`, `is:unread`, `larger:1M`, `since:2024-01-01`.
+fn option_cond(option: &str, value: &str) -> Option<Cond> {
+    let name = option.to_ascii_lowercase();
+    match name.as_str() {
+        "subject" | "from" | "to" | "cc" | "bcc" | "body" | "text" | "reply-to" | "replyto"
+        | "followup-to" | "followupto" => field_cond(&name, value),
+        "larger" | "smaller" => {
+            let size = size_bytes(value)?;
+            let key = name.to_ascii_uppercase();
+            Some(Cond::key(&[key.as_str(), size.as_str()]))
+        }
+        "since" => date_cond("SINCE", value),
+        // GMail's aliases, which Roundcube accepts too.
+        "newer_than" => date_cond("SINCE", value),
+        "before" => date_cond("BEFORE", value),
+        "older_than" => date_cond("BEFORE", value),
+        "is" => is_cond(value),
+        "has" if value.eq_ignore_ascii_case("attachment") => Some(attachment_cond()),
+        _ => None,
+    }
+}
+
+/// A plain-text term, OR-ed across the fields it was told to look in.
+fn or_over_fields(value: &str, fields: &[String]) -> Cond {
+    let conds: Vec<Cond> = fields.iter().filter_map(|f| field_cond(f, value)).collect();
+    match conds.len() {
+        0 => Cond::key(&["ALL"]),
+        1 => conds.into_iter().next().unwrap(),
+        _ => Cond::Or(conds),
+    }
+}
+
+/// One token of the parsed search box.
+enum Part {
+    Expr(Cond),
+    Or,
+    And,
+}
+
+/// Parse the free-text `q` into conditions, mirroring Roundcube's
+/// `search_input`: `OR` joins the term before it to the term after, `AND` is
+/// dropped (AND is the default), a leading `-` negates an option or a quoted
+/// phrase, and anything unrecognised is text.
+fn text_conds(raw: &str, fields: &[String]) -> Vec<Cond> {
+    let mut pieces: Vec<Part> = Vec::new();
+
+    for token in tokenize(raw) {
+        if token.eq_ignore_ascii_case("OR") {
+            pieces.push(Part::Or);
+            continue;
+        }
+        if token.eq_ignore_ascii_case("AND") {
+            pieces.push(Part::And);
+            continue;
+        }
+
+        if let Some((option, value)) = split_option(&token) {
+            let (name, negated) = match option.strip_prefix('-') {
+                Some(n) => (n, true),
+                None => (option, false),
+            };
+            // An option with no value is not an option at all: Roundcube leaves
+            // the token to be read as plain text, and so does this.
+            let value = unquote(value);
+            if !value.trim().is_empty() {
+                if let Some(cond) = option_cond(name, &value) {
+                    pieces.push(Part::Expr(if negated { Cond::Not(Box::new(cond)) } else { cond }));
+                    continue;
+                }
+            }
+        }
+
+        let mut negated = false;
+        let mut text = token.as_str();
+        if let Some(rest) = token.strip_prefix('-') {
+            if rest.len() >= 2 && rest.starts_with('"') && rest.ends_with('"') {
+                negated = true;
+                text = rest;
+            }
+        }
+        let value = unquote(text);
+        if value.trim().is_empty() {
+            continue;
+        }
+        let cond = or_over_fields(&value, fields);
+        pieces.push(Part::Expr(if negated { Cond::Not(Box::new(cond)) } else { cond }));
+    }
+
+    // `a OR b OR c` becomes `( ( a OR b ) OR c )`; an `OR` with nothing to its
+    // left or right is dropped, as Roundcube drops it.
+    let mut out: Vec<Cond> = Vec::new();
+    let mut pending_or = false;
+    for piece in pieces {
+        match piece {
+            Part::Expr(cond) => {
+                if pending_or {
+                    match out.pop() {
+                        Some(prev) => out.push(Cond::Or(vec![prev, cond])),
+                        None => out.push(cond),
+                    }
+                    pending_or = false;
+                } else {
+                    out.push(cond);
+                }
+            }
+            Part::Or => pending_or = true,
+            Part::And => {}
+        }
+    }
+    out
+}
+
+/// Whether `name` is `base` or sits under it — Roundcube's folder comparison,
+/// which reads both hierarchy separators because a mailbox may use either.
+fn is_under(name: &str, base: &str) -> bool {
+    match name.get(..base.len()) {
+        Some(head) if head.eq_ignore_ascii_case(base) => {
+            name.len() == base.len() || name[base.len()..].starts_with(['.', '/'])
+        }
+        _ => false,
+    }
+}
+
+/// The fields `q`'s plain words look in when the caller names none.
+///
+/// Roundcube's own default `search_mods`: `subject` and `from`, and `subject`
+/// and `to` in the folders the account writes into (`Sent`, `Drafts` and their
+/// children) — so a bare `q` reads the same mail the Webmail's search box would.
+fn default_search_fields(folder: &str) -> Vec<String> {
+    let folder = folder.trim();
+    if is_under(folder, "Sent") || is_under(folder, "Drafts") {
+        vec!["subject".to_string(), "to".to_string()]
+    } else {
+        vec!["subject".to_string(), "from".to_string()]
+    }
+}
+
+/// The fields a free-text term looks in, from the `search` parameter. Naming
+/// none — or naming only blanks — leaves [`default_search_fields`].
+fn parse_fields(raw: Option<&str>, folder: &str) -> Result<Vec<String>, ApiErr> {
+    let mut out: Vec<String> = Vec::new();
+    for name in raw.unwrap_or("").split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let name = name.to_ascii_lowercase();
+        if name == "all" || name == "any" {
+            for field in TEXT_FIELDS {
+                if !out.iter().any(|f| f == field) {
+                    out.push(field.to_string());
+                }
+            }
+        } else if NAMED_FIELDS.contains(&name.as_str()) {
+            if !out.contains(&name) {
+                out.push(name);
+            }
+        } else {
+            return Err(ApiErr::bad(format!(
+                "unknown search field {name:?}; one of all, subject, from, to, cc, bcc, body, text, \
+                 reply-to, followup-to"
+            )));
+        }
+    }
+    if out.is_empty() {
+        out = default_search_fields(folder);
+    }
+    Ok(out)
+}
+
+/// The interval dropdown: `1W`, `1M`, `1Y`, and the `-` forms that mean
+/// "before", resolved to a date here.
+fn interval_cond(interval: &str) -> Result<Cond, ApiErr> {
+    let (back, rest) = match interval.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, interval),
+    };
+    let date = interval_date(rest).ok_or_else(|| {
+        ApiErr::bad(format!("unknown interval {interval:?}; one of 1W, 1M, 1Y, -1W, -1M, -1Y"))
+    })?;
+    Ok(Cond::key(&[if back { "BEFORE" } else { "SINCE" }, &date]))
+}
+
+/// Every condition the query parameters and the free text add up to.
+fn search_conds(q: &MessagesQuery) -> Result<Vec<Cond>, ApiErr> {
+    let mut conds = Vec::new();
+
+    let fields = parse_fields(q.search.as_deref(), q.folder.as_deref().unwrap_or("INBOX"))?;
+    if let Some(text) = q.q.as_deref() {
+        conds.extend(text_conds(text, &fields));
+    }
+
+    if let Some(filter) = q.filter.as_deref() {
+        for name in filter.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            // `all` is the dropdown's "no filter" and adds nothing.
+            if name.eq_ignore_ascii_case("all") {
+                continue;
+            }
+            match filter_cond(name) {
+                Some(cond) => conds.push(cond),
+                None => {
+                    return Err(ApiErr::bad(format!(
+                        "unknown filter {name:?}; one of all, unread, read, flagged, unflagged, \
+                         answered, unanswered, deleted, undeleted, draft, undraft, attachment, \
+                         priority-highest, priority-high, priority-normal, priority-low, \
+                         priority-lowest"
+                    )));
+                }
+            }
+        }
+    }
+
+    // The read/unread switch people reach for first.
+    if let Some(read) = q.read {
+        conds.push(Cond::key(&[if read { "SEEN" } else { "UNSEEN" }]));
+    }
+
+    if let Some(interval) = q.interval.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        conds.push(interval_cond(interval)?);
+    }
+
+    Ok(conds)
+}
+
+/// The column a listing is sorted by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sort {
+    Date,
+    Arrival,
+    Subject,
+    From,
+    To,
+    Cc,
+    Size,
+    /// The empty column: Dovecot's own uid order, folder by folder, with the
+    /// direction applied by reverting each folder's run.
+    None,
+}
+
+impl Sort {
+    fn parse(raw: Option<&str>, folder: &str) -> Result<Sort, ApiErr> {
+        Ok(match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            None | Some("") | Some("date") => Sort::Date,
+            Some("arrival") | Some("received") => Sort::Arrival,
+            Some("subject") => Sort::Subject,
+            Some("from") => Sort::From,
+            Some("to") => Sort::To,
+            // Roundcube's "smart" From/To column: the recipient in the folders
+            // the account writes into, the sender everywhere else. It resolves
+            // here, so the answer reports the column actually sorted by.
+            Some("fromto") => {
+                let folder = folder.trim();
+                if is_under(folder, "Sent") || is_under(folder, "Drafts") {
+                    Sort::To
+                } else {
+                    Sort::From
+                }
+            }
+            Some("cc") => Sort::Cc,
+            Some("size") => Sort::Size,
+            // Roundcube's empty column: Dovecot's own uid order — folder by
+            // folder — with the direction applied by reverting each folder.
+            Some("none") | Some("natural") | Some("server") => Sort::None,
+            Some(other) => {
+                return Err(ApiErr::bad(format!(
+                    "unknown sort {other:?}; one of date, arrival, subject, from, to, fromto, cc, \
+                     size, none"
+                )));
+            }
+        })
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Sort::Date => "date",
+            Sort::Arrival => "arrival",
+            Sort::Subject => "subject",
+            Sort::From => "from",
+            Sort::To => "to",
+            Sort::Cc => "cc",
+            Sort::Size => "size",
+            Sort::None => "none",
+        }
+    }
+}
+
+/// `order`, defaulting to newest/highest first the way a mail list does.
+fn descending(raw: Option<&str>) -> Result<bool, ApiErr> {
+    Ok(match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") | Some("desc") | Some("descending") => true,
+        Some("asc") | Some("ascending") => false,
+        Some(other) => {
+            return Err(ApiErr::bad(format!("unknown order {other:?}; one of asc, desc")));
+        }
+    })
+}
+
+/// The `Date:` header, which is what `sort=date` is about.
+fn parse_sent(value: Option<&str>) -> Option<i64> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc2822)
+        .ok()
+        .map(|d| d.unix_timestamp())
+}
+
+/// Dovecot's `date.received`, e.g. `2010-01-19 01:17:41 (+0100)`.
+fn parse_received(value: Option<&str>) -> Option<i64> {
+    let value = value?.trim();
+    let format = time::macros::format_description!(
+        "[year]-[month]-[day] [hour]:[minute]:[second] ([offset_hour sign:mandatory][offset_minute])"
+    );
+    time::OffsetDateTime::parse(value, &format)
+        .ok()
+        .map(|d| d.unix_timestamp())
+}
+
+/// One listing row: the message as the API reports it, plus the keys a sort may
+/// need that the reported fields do not carry in a sortable form.
+struct Row {
+    message: Value,
+    folder: String,
+    uid: u64,
+    size: u64,
+    subject: String,
+    from: String,
+    to: String,
+    cc: String,
+    sent: i64,
+    received: i64,
+}
+
+impl Row {
+    fn new(raw: &Value, folder: &str) -> Row {
+        let mut message = message_row(raw);
+        // `folder` is what makes a uid unambiguous once more than one folder is
+        // in the result, so every row carries it.
+        if let Some(obj) = message.as_object_mut() {
+            obj.insert("folder".to_string(), Value::String(folder.to_string()));
+        }
+        let text = |k: &str| {
+            message.get(k).and_then(|v| v.as_str()).unwrap_or("").to_lowercase()
+        };
+        Row {
+            uid: message.get("uid").and_then(|v| v.as_u64()).unwrap_or(0),
+            size: message.get("size").and_then(|v| v.as_u64()).unwrap_or(0),
+            subject: text("subject"),
+            from: text("from"),
+            to: text("to"),
+            cc: text("cc"),
+            sent: parse_sent(raw.get("hdr.date").and_then(|v| v.as_str())).unwrap_or(0),
+            received: parse_received(raw.get("date.received").and_then(|v| v.as_str()))
+                .unwrap_or(0),
+            folder: folder.to_string(),
+            // `folder` is what makes a uid unambiguous once more than one folder
+            // is in the result, so every row carries it.
+            message,
+        }
+    }
+}
+
+/// Sort in this process: `doveadm fetch` returns a folder in uid order and has
+/// no SORT of its own. Ties — and rows that carry no date at all — fall back to
+/// the folder and uid, so the order is total and a page boundary cannot move.
+fn sort_rows(rows: &mut [Row], sort: Sort, desc: bool) {
+    // Roundcube's empty column: Dovecot's own order — folder by folder, uid
+    // ascending — with the direction still applied, reverting each folder's run
+    // so the folders themselves keep the order Dovecot listed them in.
+    if sort == Sort::None {
+        if desc {
+            let mut i = 0;
+            while i < rows.len() {
+                let mut j = i + 1;
+                while j < rows.len() && rows[j].folder == rows[i].folder {
+                    j += 1;
+                }
+                rows[i..j].reverse();
+                i = j;
+            }
+        }
+        return;
+    }
+    rows.sort_by(|a, b| {
+        let ord = match sort {
+            Sort::Date => a.sent.cmp(&b.sent),
+            Sort::Arrival => a.received.cmp(&b.received),
+            Sort::Subject => a.subject.cmp(&b.subject),
+            Sort::From => a.from.cmp(&b.from),
+            Sort::To => a.to.cmp(&b.to),
+            Sort::Cc => a.cc.cmp(&b.cc),
+            Sort::Size => a.size.cmp(&b.size),
+            // Unreachable: `none` returned above. Only here to keep the match
+            // exhaustive; it is never reached.
+            Sort::None => std::cmp::Ordering::Equal,
+        }
+        .then_with(|| a.folder.cmp(&b.folder))
+        .then_with(|| a.uid.cmp(&b.uid));
+        if desc {
+            ord.reverse()
+        } else {
+            ord
+        }
+    });
+}
+
+/// `doveadm fetch` for one folder, with the search query when there is one.
+///
+/// `--` sits between the options and the query only when a query is present:
+/// it is what lets a value beginning with `-` be a value rather than an option,
+/// and a plain listing has no values of its own to protect.
+fn fetch_args(email: &str, folder: &str, query: &[String]) -> Vec<String> {
+    let mut args = vec!["fetch".to_string(), "-u".to_string(), email.to_string()];
+    if !query.is_empty() {
+        args.push("--".to_string());
+    }
+    args.push(MESSAGE_FIELDS.to_string());
+    args.push("mailbox".to_string());
+    args.push(folder.to_string());
+    args.extend(query.iter().cloned());
+    args
+}
+
+async fn fetch_rows(email: &str, folder: &str, query: &[String]) -> Result<Value, ApiErr> {
+    let args = fetch_args(email, folder, query);
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    doveadm_json(&refs).await
+}
+
+/// The folders a listing reads: the one asked for, its children, or all of them.
+async fn scoped_folders(email: &str, base: &str, scope: &str) -> Result<Vec<String>, ApiErr> {
+    if scope == "base" {
+        return Ok(vec![base.to_string()]);
+    }
+    let out = doveadm(&["mailbox", "list", "-u", email])
+        .await
+        .map_err(|e| ApiErr::internal(format!("doveadm mailbox list: {e}")))?;
+    let all: Vec<String> = out
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if scope == "all" {
+        return Ok(all);
+    }
+    // `sub`: the folder itself and anything nested under it, whichever
+    // hierarchy separator the mailbox uses.
+    let dot = format!("{base}.");
+    let slash = format!("{base}/");
+    let mut folders = vec![base.to_string()];
+    folders.extend(
+        all.into_iter().filter(|f| f.starts_with(&dot) || f.starts_with(&slash)),
+    );
+    Ok(folders)
+}
+
+fn resolve_scope(raw: Option<&str>) -> Result<&'static str, ApiErr> {
+    let name = raw.map(|s| s.trim().to_ascii_lowercase());
+    Ok(match name.as_deref() {
+        None | Some("") | Some("base") | Some("current") | Some("folder") => "base",
+        Some("sub") | Some("subfolders") => "sub",
+        Some("all") => "all",
+        Some(other) => {
+            return Err(ApiErr::bad(format!(
+                "unknown scope {other:?}; one of base, sub, all"
+            )));
+        }
+    })
+}
+
 #[derive(Debug, Deserialize)]
 struct MessagesQuery {
     /// Defaults to `INBOX`.
@@ -1220,6 +2012,34 @@ struct MessagesQuery {
     limit: Option<usize>,
     #[serde(default)]
     offset: Option<usize>,
+    /// Free text to search for. Roundcube's inline tokens — `from:`, `is:`,
+    /// `larger:`, `since:`, `OR`, a `-` prefix — are understood here too.
+    #[serde(default)]
+    q: Option<String>,
+    /// Comma-separated fields `q`'s plain text looks in. Naming none leaves
+    /// Roundcube's own default — `subject`+`from`, `subject`+`to` in
+    /// `Sent`/`Drafts`.
+    #[serde(default)]
+    search: Option<String>,
+    /// Comma-separated filter names, or the same thing as `is:` tokens.
+    #[serde(default)]
+    filter: Option<String>,
+    /// `true` for read, `false` for unread.
+    #[serde(default)]
+    read: Option<bool>,
+    /// `1W`, `1M`, `1Y`, `-1W`, `-1M`, `-1Y` — the interval dropdown.
+    #[serde(default)]
+    interval: Option<String>,
+    /// `base` (default), `sub` or `all`.
+    #[serde(default)]
+    scope: Option<String>,
+    /// `date` (default), `arrival`, `subject`, `from`, `to`, `fromto`, `cc`,
+    /// `size` or `none`.
+    #[serde(default)]
+    sort: Option<String>,
+    /// `asc` or `desc` (default).
+    #[serde(default)]
+    order: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1233,36 +2053,54 @@ struct MessageQuery {
 /// `GET /v1/me/messages?folder=Sent`
 ///
 /// How `Drafts`, `Sent` and `Trash` are read: they are folders, not routes, and
-/// `folder` defaults to `INBOX`. Newest first, with `limit` and `offset` applied
-/// over that order.
+/// `folder` defaults to `INBOX`.
+///
+/// The listing doubles as the search the Webmail in front of it offers: `q` for
+/// free text (with `search`, `filter`, `read` and `interval` alongside it, and
+/// Roundcube's inline `from:`/`is:`/`larger:`/`since:`/`OR` tokens accepted in
+/// the text), `scope` to widen it past one folder, and `sort`/`order` for the
+/// column. `limit` and `offset` page over the sorted result.
 async fn me_messages(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(q): Query<MessagesQuery>,
 ) -> Result<Json<Value>, ApiErr> {
     let p = principal(&state, &headers).await?;
-    let folder = q.folder.unwrap_or_else(|| "INBOX".to_string());
+    let folder = q.folder.clone().unwrap_or_else(|| "INBOX".to_string());
     known_folder(&p.email, &folder).await?;
 
-    let rows = doveadm_json(&["fetch", "-u", &p.email, MESSAGE_FIELDS, "mailbox", &folder]).await?;
+    let scope = resolve_scope(q.scope.as_deref())?;
+    let folders = scoped_folders(&p.email, &folder, scope).await?;
 
-    // `doveadm fetch` walks the folder in uid order, which is oldest first, while
-    // a mail client shows the newest. Sort rather than reverse, so the order does
-    // not depend on how the storage backend happens to iterate.
-    let mut messages: Vec<Value> = rows
-        .as_array()
-        .map(|a| a.iter().map(message_row).collect())
-        .unwrap_or_default();
-    messages.sort_by_key(|m| std::cmp::Reverse(m.get("uid").and_then(|v| v.as_u64()).unwrap_or(0)));
+    let query = query_of(&search_conds(&q)?);
+    let sort = Sort::parse(q.sort.as_deref(), &folder)?;
+    let desc = descending(q.order.as_deref())?;
 
-    let total = messages.len();
+    let mut rows: Vec<Row> = Vec::new();
+    for name in &folders {
+        let fetched = fetch_rows(&p.email, name, &query).await?;
+        for raw in fetched.as_array().map(Vec::as_slice).unwrap_or_default() {
+            rows.push(Row::new(raw, name));
+        }
+    }
+    sort_rows(&mut rows, sort, desc);
+
+    let total = rows.len();
     let offset = q.offset.unwrap_or(0);
     let limit = q.limit.unwrap_or(50).min(500);
-    let page: Vec<Value> = messages.into_iter().skip(offset).take(limit).collect();
+    let page: Vec<Value> = rows
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|row| row.message)
+        .collect();
 
     Ok(Json(json!({
         "email": p.email,
         "folder": folder,
+        "scope": scope,
+        "sort": sort.name(),
+        "order": if desc { "desc" } else { "asc" },
         "total": total,
         "offset": offset,
         "messages": page,
@@ -1737,6 +2575,364 @@ async fn doveadm(args: &[&str]) -> Result<String, String> {
 }
 
 // ---------------------------------------------------------------------------
+// Address book and settings — the tables Roundcube already keeps for a mailbox.
+//
+// These live in the Webmail's own SQLite database rather than a store of this
+// daemon's own, so a contact or identity touched here is the same one the
+// webmail shows. The daemon already opens that file to resolve API tokens; the
+// schema knowledge sits in the `roundcube` module, and these handlers are only
+// the HTTP edge over it.
+// ---------------------------------------------------------------------------
+
+/// `GET /v1/me/contacts` — search, filter by group, sort and page.
+async fn contacts_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<roundcube::ContactQuery>,
+) -> Result<Json<Value>, ApiErr> {
+    let p = principal(&state, &headers).await?;
+    Ok(Json(roundcube::contacts(
+        state.cfg.roundcube_db.as_deref(),
+        &p.email,
+        &q,
+    )?))
+}
+
+/// `POST /v1/me/contacts`
+async fn contacts_create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<roundcube::ContactInput>,
+) -> Result<Json<Value>, ApiErr> {
+    let p = principal(&state, &headers).await?;
+    Ok(Json(roundcube::contact_create(
+        state.cfg.roundcube_db.as_deref(),
+        &p.email,
+        &body,
+    )?))
+}
+
+/// `GET /v1/me/contacts/{id}`
+async fn contact_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, ApiErr> {
+    let p = principal(&state, &headers).await?;
+    Ok(Json(roundcube::contact_get(
+        state.cfg.roundcube_db.as_deref(),
+        &p.email,
+        id,
+    )?))
+}
+
+/// `PUT /v1/me/contacts/{id}` — only the named fields change.
+async fn contact_update(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(body): Json<roundcube::ContactInput>,
+) -> Result<Json<Value>, ApiErr> {
+    let p = principal(&state, &headers).await?;
+    Ok(Json(roundcube::contact_update(
+        state.cfg.roundcube_db.as_deref(),
+        &p.email,
+        id,
+        &body,
+    )?))
+}
+
+/// `DELETE /v1/me/contacts/{id}`
+async fn contact_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, ApiErr> {
+    let p = principal(&state, &headers).await?;
+    Ok(Json(roundcube::contact_delete(
+        state.cfg.roundcube_db.as_deref(),
+        &p.email,
+        id,
+    )?))
+}
+
+/// `GET /v1/me/contactgroups`
+async fn groups_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiErr> {
+    let p = principal(&state, &headers).await?;
+    Ok(Json(roundcube::groups(state.cfg.roundcube_db.as_deref(), &p.email)?))
+}
+
+/// `POST /v1/me/contactgroups`
+async fn group_create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<roundcube::GroupInput>,
+) -> Result<Json<Value>, ApiErr> {
+    let p = principal(&state, &headers).await?;
+    Ok(Json(roundcube::group_create(
+        state.cfg.roundcube_db.as_deref(),
+        &p.email,
+        &body,
+    )?))
+}
+
+/// `GET /v1/me/contactgroups/{id}` — the group and its member ids.
+async fn group_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, ApiErr> {
+    let p = principal(&state, &headers).await?;
+    Ok(Json(roundcube::group_get(
+        state.cfg.roundcube_db.as_deref(),
+        &p.email,
+        id,
+    )?))
+}
+
+/// `PUT /v1/me/contactgroups/{id}` — rename.
+async fn group_update(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(body): Json<roundcube::GroupInput>,
+) -> Result<Json<Value>, ApiErr> {
+    let p = principal(&state, &headers).await?;
+    Ok(Json(roundcube::group_update(
+        state.cfg.roundcube_db.as_deref(),
+        &p.email,
+        id,
+        &body,
+    )?))
+}
+
+/// `DELETE /v1/me/contactgroups/{id}`
+async fn group_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, ApiErr> {
+    let p = principal(&state, &headers).await?;
+    Ok(Json(roundcube::group_delete(
+        state.cfg.roundcube_db.as_deref(),
+        &p.email,
+        id,
+    )?))
+}
+
+/// `PUT /v1/me/contactgroups/{id}/contacts` — body `{"contact_ids":[…]}`.
+async fn group_set_members(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(body): Json<roundcube::GroupMembers>,
+) -> Result<Json<Value>, ApiErr> {
+    let p = principal(&state, &headers).await?;
+    Ok(Json(roundcube::group_set_members(
+        state.cfg.roundcube_db.as_deref(),
+        &p.email,
+        id,
+        &body,
+    )?))
+}
+
+/// `GET /v1/me/identities`
+async fn identities_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiErr> {
+    let p = principal(&state, &headers).await?;
+    Ok(Json(roundcube::identities(
+        state.cfg.roundcube_db.as_deref(),
+        &p.email,
+    )?))
+}
+
+/// `POST /v1/me/identities`
+async fn identity_create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<roundcube::IdentityInput>,
+) -> Result<Json<Value>, ApiErr> {
+    let p = principal(&state, &headers).await?;
+    Ok(Json(roundcube::identity_create(
+        state.cfg.roundcube_db.as_deref(),
+        &p.email,
+        &body,
+    )?))
+}
+
+/// `PUT /v1/me/identities/{id}`
+async fn identity_update(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(body): Json<roundcube::IdentityInput>,
+) -> Result<Json<Value>, ApiErr> {
+    let p = principal(&state, &headers).await?;
+    Ok(Json(roundcube::identity_update(
+        state.cfg.roundcube_db.as_deref(),
+        &p.email,
+        id,
+        &body,
+    )?))
+}
+
+/// `DELETE /v1/me/identities/{id}`
+async fn identity_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, ApiErr> {
+    let p = principal(&state, &headers).await?;
+    Ok(Json(roundcube::identity_delete(
+        state.cfg.roundcube_db.as_deref(),
+        &p.email,
+        id,
+    )?))
+}
+
+/// `GET /v1/me/responses` — canned responses.
+async fn responses_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiErr> {
+    let p = principal(&state, &headers).await?;
+    Ok(Json(roundcube::responses(
+        state.cfg.roundcube_db.as_deref(),
+        &p.email,
+    )?))
+}
+
+/// `POST /v1/me/responses`
+async fn response_create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<roundcube::ResponseInput>,
+) -> Result<Json<Value>, ApiErr> {
+    let p = principal(&state, &headers).await?;
+    Ok(Json(roundcube::response_create(
+        state.cfg.roundcube_db.as_deref(),
+        &p.email,
+        &body,
+    )?))
+}
+
+/// `PUT /v1/me/responses/{id}`
+async fn response_update(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(body): Json<roundcube::ResponseInput>,
+) -> Result<Json<Value>, ApiErr> {
+    let p = principal(&state, &headers).await?;
+    Ok(Json(roundcube::response_update(
+        state.cfg.roundcube_db.as_deref(),
+        &p.email,
+        id,
+        &body,
+    )?))
+}
+
+/// `DELETE /v1/me/responses/{id}`
+async fn response_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, ApiErr> {
+    let p = principal(&state, &headers).await?;
+    Ok(Json(roundcube::response_delete(
+        state.cfg.roundcube_db.as_deref(),
+        &p.email,
+        id,
+    )?))
+}
+
+/// `GET /v1/me/settings` — the Webmail's preferences, decoded.
+async fn settings_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiErr> {
+    let p = principal(&state, &headers).await?;
+    Ok(Json(roundcube::preferences_get(
+        state.cfg.roundcube_db.as_deref(),
+        &p.email,
+    )?))
+}
+
+/// `PUT /v1/me/settings` — merge the given preferences; a `null` removes one.
+async fn settings_put(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Map<String, Value>>,
+) -> Result<Json<Value>, ApiErr> {
+    let p = principal(&state, &headers).await?;
+    Ok(Json(roundcube::preferences_put(
+        state.cfg.roundcube_db.as_deref(),
+        &p.email,
+        &body,
+    )?))
+}
+
+#[derive(Debug, Deserialize)]
+struct CollectedQuery {
+    /// 1 for recipients collected from sent mail, 2 for trusted senders.
+    #[serde(default, rename = "type")]
+    kind: Option<i64>,
+}
+
+/// `GET /v1/me/collected-addresses`
+async fn collected_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<CollectedQuery>,
+) -> Result<Json<Value>, ApiErr> {
+    let p = principal(&state, &headers).await?;
+    Ok(Json(roundcube::collected(
+        state.cfg.roundcube_db.as_deref(),
+        &p.email,
+        q.kind,
+    )?))
+}
+
+/// `DELETE /v1/me/collected-addresses/{id}`
+async fn collected_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>, ApiErr> {
+    let p = principal(&state, &headers).await?;
+    Ok(Json(roundcube::collected_delete(
+        state.cfg.roundcube_db.as_deref(),
+        &p.email,
+        id,
+    )?))
+}
+
+#[derive(Debug, Deserialize)]
+struct AutocompleteQuery {
+    #[serde(default)]
+    q: Option<String>,
+}
+
+/// `GET /v1/me/autocomplete?q=` — address suggestions for a recipient field.
+async fn autocomplete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<AutocompleteQuery>,
+) -> Result<Json<Value>, ApiErr> {
+    let p = principal(&state, &headers).await?;
+    Ok(Json(roundcube::autocomplete(
+        state.cfg.roundcube_db.as_deref(),
+        &p.email,
+        q.q.as_deref().unwrap_or_default(),
+    )?))
+}
+
+// ---------------------------------------------------------------------------
 
 /// The OpenAPI document, embedded at build time. Serving the spec out of the
 /// binary rather than off disk keeps it in step with the routes compiled into
@@ -1795,6 +2991,39 @@ async fn main() {
         .route("/v1/me/messages/{uid}/move", post(me_message_move))
         .route("/v1/me/messages/{uid}/flags", post(me_message_flags))
         .route("/v1/me/trash/empty", post(me_trash_empty))
+        // The address book and settings Roundcube keeps for the mailbox: same
+        // tables the Webmail reads, so the two stay in step.
+        .route("/v1/me/contacts", get(contacts_list).post(contacts_create))
+        .route(
+            "/v1/me/contacts/{id}",
+            get(contact_get).put(contact_update).delete(contact_delete),
+        )
+        .route("/v1/me/contactgroups", get(groups_list).post(group_create))
+        .route(
+            "/v1/me/contactgroups/{id}",
+            get(group_get).put(group_update).delete(group_delete),
+        )
+        .route(
+            "/v1/me/contactgroups/{id}/contacts",
+            put(group_set_members),
+        )
+        .route("/v1/me/identities", get(identities_list).post(identity_create))
+        .route(
+            "/v1/me/identities/{id}",
+            put(identity_update).delete(identity_delete),
+        )
+        .route("/v1/me/responses", get(responses_list).post(response_create))
+        .route(
+            "/v1/me/responses/{id}",
+            put(response_update).delete(response_delete),
+        )
+        .route("/v1/me/settings", get(settings_get).put(settings_put))
+        .route("/v1/me/collected-addresses", get(collected_list))
+        .route(
+            "/v1/me/collected-addresses/{id}",
+            delete(collected_delete),
+        )
+        .route("/v1/me/autocomplete", get(autocomplete))
         // Management — admin mailboxes, or a panel `dp_` API key
         .route("/v1/domains", get(domains_list).post(domains_create))
         .route(
@@ -1851,5 +3080,313 @@ mod tests {
             spec.get("paths").is_some_and(|p| p.as_object().is_some_and(|o| !o.is_empty())),
             "the embedded spec must describe at least one path"
         );
+    }
+
+    /// A query with only the parameters a test names, the rest defaulted.
+    fn query(params: Value) -> MessagesQuery {
+        serde_json::from_value(params).expect("a query")
+    }
+
+    /// The argv the search builds, with no filters or text.
+    fn tokens(params: Value) -> Vec<String> {
+        query_of(&search_conds(&query(params)).ok().expect("valid search"))
+    }
+
+    /// A value beginning with `-` must sit behind `--`, or doveadm reads it as
+    /// an option. A plain listing has no such value and keeps its old argv.
+    #[test]
+    fn a_leading_dash_is_never_an_option() {
+        let plain = fetch_args("a@b.c", "INBOX", &[]);
+        assert!(!plain.iter().any(|a| a == "--"), "no query, no separator: {plain:?}");
+        assert_eq!(
+            plain,
+            vec!["fetch", "-u", "a@b.c", MESSAGE_FIELDS, "mailbox", "INBOX"]
+        );
+
+        let search = fetch_args(
+            "a@b.c",
+            "INBOX",
+            &["HEADER".into(), "SUBJECT".into(), "-foo".into()],
+        );
+        assert_eq!(search[3], "--");
+        assert_eq!(search[4], MESSAGE_FIELDS);
+        assert_eq!(search.last().unwrap(), "-foo");
+    }
+
+    /// The read/unread filter, called by its two names.
+    #[test]
+    fn read_and_unread() {
+        assert_eq!(tokens(json!({ "read": false })), vec!["UNSEEN"]);
+        assert_eq!(tokens(json!({ "read": true })), vec!["SEEN"]);
+        assert_eq!(tokens(json!({ "filter": "unread" })), vec!["UNSEEN"]);
+        // `all` is the dropdown's "no filter" and adds nothing.
+        assert!(tokens(json!({ "filter": "all" })).is_empty());
+        assert!(tokens(json!({ "filter": " , " })).is_empty());
+        // A name the dropdown does not carry is refused, not ignored.
+        assert!(search_conds(&query(json!({ "filter": "bogus" }))).is_err());
+        // Both at once would contradict, and so match nothing — that is the
+        // caller's doing, not something to silently drop one half of. The
+        // filter names are written first, then the read switch.
+        assert_eq!(
+            tokens(json!({ "read": false, "filter": "read" })),
+            vec!["SEEN", "UNSEEN"]
+        );
+    }
+
+    /// The Roundcube token forms, field, flag, size and date alike.
+    #[test]
+    fn inline_tokens() {
+        assert_eq!(tokens(json!({ "q": "is:unread" })), vec!["UNSEEN"]);
+        assert_eq!(
+            tokens(json!({ "q": "from:alice" })),
+            vec!["HEADER", "FROM", "alice"]
+        );
+        assert_eq!(
+            tokens(json!({ "q": "subject:\"two words\"" })),
+            vec!["HEADER", "SUBJECT", "two words"]
+        );
+        // A `-` on an option negates it.
+        assert_eq!(
+            tokens(json!({ "q": "-from:spam" })),
+            vec!["NOT", "HEADER", "FROM", "spam"]
+        );
+        assert_eq!(
+            tokens(json!({ "q": "larger:1M" })),
+            vec!["LARGER", "1048576"]
+        );
+        assert_eq!(
+            tokens(json!({ "q": "has:attachment" })),
+            vec![
+                "(",
+                "HEADER",
+                "CONTENT-TYPE",
+                "application/",
+                "OR",
+                "HEADER",
+                "CONTENT-TYPE",
+                "multipart/mixed",
+                "OR",
+                "HEADER",
+                "CONTENT-TYPE",
+                "multipart/signed",
+                "OR",
+                "HEADER",
+                "CONTENT-TYPE",
+                "multipart/report",
+                "OR",
+                "(",
+                "KEYWORD",
+                "$HasAttachment",
+                "NOT",
+                "KEYWORD",
+                "$HasNoAttachment",
+                ")",
+                ")"
+            ]
+        );
+    }
+
+    /// `OR` joins the term before it to the term after; `AND` is the default and
+    /// is dropped; a leading `OR` with nothing on its left is dropped too.
+    #[test]
+    fn or_joins_its_neighbours() {
+        assert_eq!(
+            tokens(json!({ "q": "from:a OR from:b" })),
+            vec!["(", "HEADER", "FROM", "a", "OR", "HEADER", "FROM", "b", ")"]
+        );
+        assert_eq!(
+            tokens(json!({ "q": "from:a OR OR from:b" })),
+            vec!["(", "HEADER", "FROM", "a", "OR", "HEADER", "FROM", "b", ")"]
+        );
+        assert_eq!(
+            tokens(json!({ "q": "OR from:a" })),
+            vec!["HEADER", "FROM", "a"]
+        );
+        assert_eq!(
+            tokens(json!({ "q": "from:a AND from:b" })),
+            vec!["HEADER", "FROM", "a", "HEADER", "FROM", "b"]
+        );
+    }
+
+    /// Plain text is OR-ed across the fields `search` names, and a field name
+    /// that is not one of them is refused rather than dropped.
+    #[test]
+    fn plain_text_spans_the_chosen_fields() {
+        assert_eq!(
+            tokens(json!({ "q": "hello", "search": "subject,from" })),
+            vec!["(", "HEADER", "SUBJECT", "hello", "OR", "HEADER", "FROM", "hello", ")"]
+        );
+        // `all` reaches the body too: five headers at three keys each, the body
+        // at two, five ORs and the two parentheses.
+        assert_eq!(
+            tokens(json!({ "q": "hello", "search": "all" })).len(),
+            5 * 3 + 2 + 5 + 2
+        );
+        assert!(search_conds(&query(json!({ "search": "subject,bogus" }))).is_err());
+    }
+
+    /// A bare `q` reads Roundcube's default fields — `subject`+`from`, and
+    /// `subject`+`to` in the folders the account writes into.
+    #[test]
+    fn a_bare_query_uses_roundcubes_default_fields() {
+        let subject_from =
+            vec!["(", "HEADER", "SUBJECT", "hello", "OR", "HEADER", "FROM", "hello", ")"];
+        let subject_to =
+            vec!["(", "HEADER", "SUBJECT", "hello", "OR", "HEADER", "TO", "hello", ")"];
+
+        assert_eq!(tokens(json!({ "q": "hello" })), subject_from);
+        assert_eq!(tokens(json!({ "q": "hello", "folder": "INBOX" })), subject_from);
+        assert_eq!(tokens(json!({ "q": "hello", "folder": "Sent" })), subject_to);
+        assert_eq!(tokens(json!({ "q": "hello", "folder": "Drafts" })), subject_to);
+        // A child of either counts as one of them, whichever separator is used.
+        assert_eq!(tokens(json!({ "q": "hello", "folder": "Sent.2026" })), subject_to);
+        assert_eq!(tokens(json!({ "q": "hello", "folder": "Drafts/notes" })), subject_to);
+        // Naming fields still wins over the default.
+        assert_eq!(tokens(json!({ "q": "hello", "search": "body" })), vec!["BODY", "hello"]);
+    }
+
+    /// An option with no value is not an option: Roundcube reads the token as
+    /// plain text, and so does this.
+    #[test]
+    fn an_option_with_no_value_is_text() {
+        assert_eq!(
+            tokens(json!({ "q": "from:" })),
+            vec!["(", "HEADER", "SUBJECT", "from:", "OR", "HEADER", "FROM", "from:", ")"]
+        );
+    }
+
+    /// The sort names Roundcube offers, and the two that resolve rather than
+    /// name a column of their own.
+    #[test]
+    fn sort_names_resolve_like_roundcube() {
+        assert_eq!(Sort::parse(None, "INBOX").ok(), Some(Sort::Date));
+        assert_eq!(Sort::parse(Some("fromto"), "INBOX").ok(), Some(Sort::From));
+        assert_eq!(Sort::parse(Some("fromto"), "Sent").ok(), Some(Sort::To));
+        assert_eq!(Sort::parse(Some("fromto"), "Drafts").ok(), Some(Sort::To));
+        assert_eq!(Sort::parse(Some("fromto"), "Sent.2026").ok(), Some(Sort::To));
+        assert_eq!(Sort::parse(Some("none"), "INBOX").ok(), Some(Sort::None));
+        assert!(Sort::parse(Some("bogus"), "INBOX").is_err());
+    }
+
+    /// The interval dropdown resolves to a date here, because Dovecot would read
+    /// `1M` as one minute.
+    #[test]
+    fn intervals_resolve_to_dates() {
+        let since = interval_date("1M").expect("1M");
+        assert_eq!(since.len(), 10, "{since}");
+        assert!(since.as_bytes()[4] == b'-');
+
+        assert_eq!(query_of(&[interval_cond("1W").ok().expect("1W")])[0], "SINCE");
+        assert_eq!(query_of(&[interval_cond("-1W").ok().expect("-1W")])[0], "BEFORE");
+        assert!(interval_cond("1M").is_ok());
+        assert!(interval_cond("1Y").is_ok());
+        assert!(interval_cond("nonsense").is_err());
+    }
+
+    /// Size suffixes, and a bare number read as octets.
+    #[test]
+    fn sizes_are_bytes() {
+        assert_eq!(size_bytes("1M").as_deref(), Some("1048576"));
+        assert_eq!(size_bytes("500k").as_deref(), Some("512000"));
+        assert_eq!(size_bytes("1024").as_deref(), Some("1024"));
+        assert_eq!(size_bytes("0").as_deref(), Some("0"));
+        assert_eq!(size_bytes("x").as_deref(), None);
+    }
+
+    /// Dates are read from both formats the two sort keys arrive in.
+    #[test]
+    fn dates_parse() {
+        let sent = parse_sent(Some("Tue, 19 Jan 2010 01:17:41 +0100"));
+        assert!(sent.is_some(), "an RFC 2822 Date header should parse");
+        assert!(parse_received(Some("2010-01-19 01:17:41 (+0100)")).is_some());
+        assert!(parse_received(Some("not a date")).is_none());
+    }
+
+    /// The sort is total regardless of the column, so two equal keys never
+    /// reorder between requests.
+    #[test]
+    fn sorting_is_total() {
+        let mut rows = vec![
+            Row {
+                message: json!({ "uid": 3 }),
+                folder: "INBOX".to_string(),
+                uid: 3,
+                size: 30,
+                subject: "b".to_string(),
+                from: String::new(),
+                to: String::new(),
+                cc: String::new(),
+                sent: 10,
+                received: 10,
+            },
+            Row {
+                message: json!({ "uid": 1 }),
+                folder: "INBOX".to_string(),
+                uid: 1,
+                size: 10,
+                subject: "a".to_string(),
+                from: String::new(),
+                to: String::new(),
+                cc: String::new(),
+                sent: 30,
+                received: 30,
+            },
+        ];
+        sort_rows(&mut rows, Sort::Size, true);
+        assert_eq!(rows.iter().map(|r| r.uid).collect::<Vec<_>>(), vec![3, 1]);
+        // `none` keeps Dovecot's uid order ascending, and reverts it descending.
+        sort_rows(&mut rows, Sort::None, false);
+        assert_eq!(rows.iter().map(|r| r.uid).collect::<Vec<_>>(), vec![3, 1]);
+        sort_rows(&mut rows, Sort::None, true);
+        assert_eq!(rows.iter().map(|r| r.uid).collect::<Vec<_>>(), vec![1, 3]);
+        sort_rows(&mut rows, Sort::Size, false);
+        assert_eq!(rows.iter().map(|r| r.uid).collect::<Vec<_>>(), vec![1, 3]);
+        sort_rows(&mut rows, Sort::Date, true);
+        assert_eq!(rows.iter().map(|r| r.uid).collect::<Vec<_>>(), vec![1, 3]);
+    }
+
+    /// `none` reverts each folder's run, not the whole result, so the folders
+    /// keep the order Dovecot listed them in.
+    #[test]
+    fn none_reverts_within_each_folder() {
+        let folder = |name: &str, uids: &[u64]| {
+            uids.iter()
+                .map(|&uid| Row {
+                    message: json!({ "uid": uid }),
+                    folder: name.to_string(),
+                    uid,
+                    size: 0,
+                    subject: String::new(),
+                    from: String::new(),
+                    to: String::new(),
+                    cc: String::new(),
+                    sent: 0,
+                    received: 0,
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut all = folder("INBOX", &[1, 3]);
+        all.extend(folder("Sent", &[2, 4]));
+
+        sort_rows(&mut all, Sort::None, false);
+        assert_eq!(all.iter().map(|r| r.uid).collect::<Vec<_>>(), vec![1, 3, 2, 4]);
+        sort_rows(&mut all, Sort::None, true);
+        assert_eq!(all.iter().map(|r| r.uid).collect::<Vec<_>>(), vec![3, 1, 4, 2]);
+    }
+
+    /// A message carries the folder that makes its uid mean something.
+    #[test]
+    fn rows_are_folder_qualified() {
+        let raw = json!({
+            "uid": "7",
+            "flags": "\\Seen",
+            "size.virtual": "42",
+            "hdr.subject": "hi",
+            "hdr.date": "Tue, 19 Jan 2010 01:17:41 +0100",
+        });
+        let row = Row::new(&raw, "Sent");
+        assert_eq!(row.message.get("folder").and_then(|v| v.as_str()), Some("Sent"));
+        assert_eq!(row.uid, 7);
+        assert_eq!(row.size, 42);
     }
 }

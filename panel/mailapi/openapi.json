@@ -397,8 +397,8 @@
     "/v1/me/messages": {
       "get": {
         "tags": ["Self-service"],
-        "summary": "List the messages in a folder",
-        "description": "`Drafts`, `Sent` and `Trash` are folders rather than routes: name one with `folder` and this is how it is read. Newest first.",
+        "summary": "List, search and sort the messages in a folder",
+        "description": "`Drafts`, `Sent` and `Trash` are folders rather than routes: name one with `folder` and this is how it is read.\n\nThe listing carries the search the bundled Webmail offers. `q` is free text, and it understands the tokens a Roundcube user types into the search box (`from:`, `to:`, `subject:`, `cc:`, `bcc:`, `body:`, `text:`, `reply-to:`, `followup-to:`, `is:`, `larger:`, `smaller:`, `since:`, `before:`, `older_than:`, `newer_than:`, `has:attachment`, `OR`, and a leading `-` to negate) as well as plain words, which are matched across the fields `search` names (`subject` and `from` by default — `subject` and `to` in `Sent` and `Drafts`). `filter`, `read` and `interval` expose the Webmail's dropdowns directly.\n\n`scope` widens the read past one folder — `sub` adds its children, `all` reads every folder — and then every message carries the `folder` its `uid` belongs to. `sort` picks the column (`date` by default, or `arrival`, `subject`, `from`, `to`, `fromto`, `cc`, `size`, `none`) and `order` the direction (`desc` by default; `fromto` resolves to `from` or `to`, and `none` is Dovecot's own `uid` order with `order` still applied). `limit` and `offset` page over that order.",
         "operationId": "meMessages",
         "parameters": [
           {
@@ -407,6 +407,77 @@
             "required": false,
             "description": "Folder to read. Defaults to `INBOX`. A query parameter rather than a path segment because folder names legitimately contain `/`.",
             "schema": { "type": "string", "default": "INBOX", "example": "Sent" }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "description": "Free text to search for, matched across the fields `search` names. The tokens of the Webmail's search box are understood here too: `from:alice`, `-to:bob`, `subject:\"two words\"`, `is:unread`, `is:flagged`, `larger:1M`, `smaller:500k`, `since:2024-01-01`, `older_than:1M`, `has:attachment`, and `OR` between two terms.",
+            "schema": { "type": "string", "example": "is:unread from:alice OR subject:invoice" }
+          },
+          {
+            "name": "search",
+            "in": "query",
+            "required": false,
+            "description": "Comma-separated fields `q`'s plain words are matched in. One or more of `subject`, `from`, `to`, `cc`, `bcc`, `body`, `text`, `reply-to`, `followup-to`, or `all`. Defaults to the Webmail's own set: `subject` and `from`, or `subject` and `to` when `folder` is `Sent`, `Drafts` or one of their children.",
+            "schema": { "type": "string", "example": "subject,from,body" }
+          },
+          {
+            "name": "filter",
+            "in": "query",
+            "required": false,
+            "description": "Comma-separated flags to keep, the Webmail's filter dropdown. One or more of `all`, `unread`, `read`, `flagged`, `unflagged`, `answered`, `unanswered`, `deleted`, `undeleted`, `draft`, `undraft`, `attachment`, `priority-highest`, `priority-high`, `priority-normal`, `priority-low`, `priority-lowest`.",
+            "schema": { "type": "string", "example": "flagged,attachment" }
+          },
+          {
+            "name": "read",
+            "in": "query",
+            "required": false,
+            "description": "Keep only read (`true`) or unread (`false`) messages. The same as `filter=read` or `filter=unread`, for the one filter people reach for first.",
+            "schema": { "type": "boolean", "example": false }
+          },
+          {
+            "name": "interval",
+            "in": "query",
+            "required": false,
+            "description": "Keep messages from an interval ending today, the Webmail's date dropdown. `1W`, `1M` or `1Y` for the last week, month or year, and the negated `-1W`, `-1M`, `-1Y` for anything older than that.",
+            "schema": {
+              "type": "string",
+              "enum": ["1W", "1M", "1Y", "-1W", "-1M", "-1Y"]
+            }
+          },
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "description": "Which folders to read: `base` (default) is just `folder`, `sub` adds its subfolders, `all` reads every folder. With anything but `base` each message carries the `folder` its `uid` belongs to.",
+            "schema": {
+              "type": "string",
+              "enum": ["base", "sub", "all"],
+              "default": "base"
+            }
+          },
+          {
+            "name": "sort",
+            "in": "query",
+            "required": false,
+            "description": "Column to sort by. `date` is the `Date:` header and `arrival` is when Dovecot received the message. `fromto` is the Webmail's smart column — `to` in `Sent`/`Drafts`, `from` everywhere else — and is reported resolved as `from` or `to`. `none` is Dovecot's own order — folder by folder, `uid` ascending — with `order` still applied, so `desc` reverts each folder.",
+            "schema": {
+              "type": "string",
+              "enum": ["date", "arrival", "subject", "from", "to", "fromto", "cc", "size", "none"],
+              "default": "date"
+            }
+          },
+          {
+            "name": "order",
+            "in": "query",
+            "required": false,
+            "description": "Sort direction. Defaults to `desc`, newest or largest first.",
+            "schema": {
+              "type": "string",
+              "enum": ["asc", "desc"],
+              "default": "desc"
+            }
           },
           {
             "name": "limit",
@@ -419,7 +490,7 @@
             "name": "offset",
             "in": "query",
             "required": false,
-            "description": "Messages to skip, newest first.",
+            "description": "Messages to skip, over the sorted order.",
             "schema": { "type": "integer", "minimum": 0, "default": 0 }
           }
         ],
@@ -664,6 +735,647 @@
           },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "500": { "$ref": "#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/me/contacts": {
+      "get": {
+        "tags": ["Self-service"],
+        "summary": "List the address book",
+        "description": "Contacts are Roundcube's own, so this reads the same table the Webmail does. `q` is free text matched against the searchable fields, `group` restricts to a group's members, and `sort`/`order`/`limit`/`offset` page over the result.",
+        "operationId": "meContactsList",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "description": "Free text, matched against name, email, organisation, notes and the rest.",
+            "schema": { "type": "string" }
+          },
+          {
+            "name": "group",
+            "in": "query",
+            "required": false,
+            "description": "Only the members of this contact group.",
+            "schema": { "type": "integer", "format": "int64" }
+          },
+          {
+            "name": "sort",
+            "in": "query",
+            "required": false,
+            "description": "Column to sort by.",
+            "schema": {
+              "type": "string",
+              "enum": ["name", "firstname", "surname", "email", "changed"],
+              "default": "name"
+            }
+          },
+          {
+            "name": "order",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": ["asc", "desc"],
+              "default": "asc"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer", "minimum": 1, "maximum": 500, "default": 50 }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "integer", "minimum": 0, "default": 0 }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of contacts.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ContactsResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      },
+      "post": {
+        "tags": ["Self-service"],
+        "summary": "Add a contact",
+        "operationId": "meContactsCreate",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ContactInput" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The contact as stored.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ContactResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/v1/me/contacts/{id}": {
+      "get": {
+        "tags": ["Self-service"],
+        "summary": "Read one contact",
+        "operationId": "meContactGet",
+        "parameters": [
+          { "$ref": "#/components/parameters/ContactId" }
+        ],
+        "responses": {
+          "200": {
+            "description": "The contact.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ContactResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      },
+      "put": {
+        "tags": ["Self-service"],
+        "summary": "Update a contact",
+        "description": "Only the fields present in the body change; the rest are left as they were.",
+        "operationId": "meContactUpdate",
+        "parameters": [
+          { "$ref": "#/components/parameters/ContactId" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ContactInput" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The updated contact.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ContactResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      },
+      "delete": {
+        "tags": ["Self-service"],
+        "summary": "Delete a contact",
+        "description": "A soft delete, as the Webmail does it: the row is flagged and hidden, not removed.",
+        "operationId": "meContactDelete",
+        "parameters": [
+          { "$ref": "#/components/parameters/ContactId" }
+        ],
+        "responses": {
+          "200": {
+            "description": "The id that was deleted.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Deleted" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/v1/me/contactgroups": {
+      "get": {
+        "tags": ["Self-service"],
+        "summary": "List contact groups",
+        "operationId": "meContactGroupsList",
+        "responses": {
+          "200": {
+            "description": "The mailbox's groups.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/GroupsResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      },
+      "post": {
+        "tags": ["Self-service"],
+        "summary": "Create a contact group",
+        "operationId": "meContactGroupsCreate",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/GroupInput" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The new group.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/GroupResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/v1/me/contactgroups/{id}": {
+      "get": {
+        "tags": ["Self-service"],
+        "summary": "Read a group and its members",
+        "operationId": "meContactGroupGet",
+        "parameters": [
+          { "$ref": "#/components/parameters/GroupId" }
+        ],
+        "responses": {
+          "200": {
+            "description": "The group, with its member ids.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/GroupDetailResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      },
+      "put": {
+        "tags": ["Self-service"],
+        "summary": "Rename a group",
+        "operationId": "meContactGroupUpdate",
+        "parameters": [
+          { "$ref": "#/components/parameters/GroupId" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/GroupInput" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The renamed group.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/GroupResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      },
+      "delete": {
+        "tags": ["Self-service"],
+        "summary": "Delete a group",
+        "operationId": "meContactGroupDelete",
+        "parameters": [
+          { "$ref": "#/components/parameters/GroupId" }
+        ],
+        "responses": {
+          "200": {
+            "description": "The id that was deleted.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Deleted" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/v1/me/contactgroups/{id}/contacts": {
+      "put": {
+        "tags": ["Self-service"],
+        "summary": "Replace a group's membership",
+        "description": "The body's `contact_ids` becomes the group's whole membership. Every id must be a contact this mailbox owns.",
+        "operationId": "meContactGroupSetMembers",
+        "parameters": [
+          { "$ref": "#/components/parameters/GroupId" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/GroupMembers" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The group, with its new members.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/GroupDetailResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/v1/me/identities": {
+      "get": {
+        "tags": ["Self-service"],
+        "summary": "List the sender identities",
+        "operationId": "meIdentitiesList",
+        "responses": {
+          "200": {
+            "description": "The mailbox's identities.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/IdentitiesResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      },
+      "post": {
+        "tags": ["Self-service"],
+        "summary": "Add an identity",
+        "description": "The first identity becomes the standard one, as does any created with `standard: true`.",
+        "operationId": "meIdentitiesCreate",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/IdentityInput" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The new identity.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/IdentityResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/v1/me/identities/{id}": {
+      "put": {
+        "tags": ["Self-service"],
+        "summary": "Update an identity",
+        "operationId": "meIdentityUpdate",
+        "parameters": [
+          { "$ref": "#/components/parameters/IdentityId" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/IdentityInput" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The updated identity.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/IdentityResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      },
+      "delete": {
+        "tags": ["Self-service"],
+        "summary": "Delete an identity",
+        "description": "The last identity cannot be deleted — every mailbox needs one to send as.",
+        "operationId": "meIdentityDelete",
+        "parameters": [
+          { "$ref": "#/components/parameters/IdentityId" }
+        ],
+        "responses": {
+          "200": {
+            "description": "The id that was deleted.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Deleted" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/v1/me/responses": {
+      "get": {
+        "tags": ["Self-service"],
+        "summary": "List canned responses",
+        "operationId": "meResponsesList",
+        "responses": {
+          "200": {
+            "description": "The mailbox's canned responses.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ResponsesResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      },
+      "post": {
+        "tags": ["Self-service"],
+        "summary": "Create a canned response",
+        "operationId": "meResponsesCreate",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ResponseInput" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The new response.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ResponseResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/v1/me/responses/{id}": {
+      "put": {
+        "tags": ["Self-service"],
+        "summary": "Update a canned response",
+        "operationId": "meResponseUpdate",
+        "parameters": [
+          { "$ref": "#/components/parameters/ResponseId" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ResponseInput" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The updated response.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ResponseResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      },
+      "delete": {
+        "tags": ["Self-service"],
+        "summary": "Delete a canned response",
+        "operationId": "meResponseDelete",
+        "parameters": [
+          { "$ref": "#/components/parameters/ResponseId" }
+        ],
+        "responses": {
+          "200": {
+            "description": "The id that was deleted.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Deleted" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/v1/me/settings": {
+      "get": {
+        "tags": ["Self-service"],
+        "summary": "Read the mailbox preferences",
+        "description": "The Webmail's preference blob, decoded into JSON. Keys are Roundcube's own (`language`, `timezone`, `pagesize`, `message_sort_col`, …).",
+        "operationId": "meSettingsGet",
+        "responses": {
+          "200": {
+            "description": "The decoded preferences.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/PreferencesResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "500": { "$ref": "#/components/responses/Internal" }
+        }
+      },
+      "put": {
+        "tags": ["Self-service"],
+        "summary": "Change mailbox preferences",
+        "description": "A shallow merge: the keys in the body are set and everything else is left alone. A key with a JSON `null` value is removed.",
+        "operationId": "meSettingsPut",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/PreferencesInput" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The full preferences after the merge.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/PreferencesResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "500": { "$ref": "#/components/responses/Internal" }
+        }
+      }
+    },
+    "/v1/me/collected-addresses": {
+      "get": {
+        "tags": ["Self-service"],
+        "summary": "List the addresses the Webmail collected",
+        "operationId": "meCollectedAddressesList",
+        "parameters": [
+          {
+            "name": "type",
+            "in": "query",
+            "required": false,
+            "description": "`1` for recipients collected from mail you sent, `2` for trusted senders.",
+            "schema": {
+              "type": "integer",
+              "enum": [1, 2]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The collected addresses.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/CollectedAddressesResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/v1/me/collected-addresses/{id}": {
+      "delete": {
+        "tags": ["Self-service"],
+        "summary": "Forget a collected address",
+        "operationId": "meCollectedAddressDelete",
+        "parameters": [
+          { "$ref": "#/components/parameters/AddressId" }
+        ],
+        "responses": {
+          "200": {
+            "description": "The id that was deleted.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Deleted" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/v1/me/autocomplete": {
+      "get": {
+        "tags": ["Self-service"],
+        "summary": "Suggest recipients",
+        "description": "Contacts first, then collected addresses, deduplicated by address — what the Webmail's recipient field offers.",
+        "operationId": "meAutocomplete",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Address suggestions.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AutocompleteResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" }
         }
       }
     },
@@ -1063,6 +1775,41 @@
         "required": true,
         "description": "A full mailbox address inside that domain.",
         "schema": { "type": "string", "format": "email", "example": "sales@example.com" }
+      },
+      "ContactId": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "description": "The contact's `contact_id`.",
+        "schema": { "type": "integer", "format": "int64" }
+      },
+      "GroupId": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "description": "The group's `contactgroup_id`.",
+        "schema": { "type": "integer", "format": "int64" }
+      },
+      "IdentityId": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "description": "The identity's `identity_id`.",
+        "schema": { "type": "integer", "format": "int64" }
+      },
+      "ResponseId": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "description": "The response's `response_id`.",
+        "schema": { "type": "integer", "format": "int64" }
+      },
+      "AddressId": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "description": "The collected address's `address_id`.",
+        "schema": { "type": "integer", "format": "int64" }
       }
     },
     "responses": {
@@ -1268,7 +2015,8 @@
           "from": { "type": "string", "nullable": true },
           "to": { "type": "string", "nullable": true },
           "cc": { "type": "string", "nullable": true },
-          "date": { "type": "string", "nullable": true, "description": "The `Date` header, as the message wrote it." }
+          "date": { "type": "string", "nullable": true, "description": "The `Date` header, as the message wrote it." },
+          "folder": { "type": "string", "description": "The folder this message is in. Present in a listing, which may read more than one folder; the uid alone is not unique across folders." }
         },
         "required": ["uid", "flags"]
       },
@@ -1277,11 +2025,28 @@
         "properties": {
           "email": { "type": "string", "format": "email" },
           "folder": { "type": "string", "example": "Sent" },
-          "total": { "type": "integer", "description": "Messages in the folder, before `limit` and `offset`." },
+          "scope": {
+            "type": "string",
+            "enum": ["base", "sub", "all"],
+            "description": "The folders actually read."
+          },
+          "sort": {
+            "type": "string",
+            "enum": ["date", "arrival", "subject", "from", "to", "cc", "size", "none"],
+            "description": "The column actually sorted by. `fromto` is reported as its resolved `from` or `to`; `none` means Dovecot's own `uid` order, with `order` applied."
+          },
+          "order": {
+            "type": "string",
+            "enum": ["asc", "desc"]
+          },
+          "total": { "type": "integer", "description": "Messages matching, before `limit` and `offset`." },
           "offset": { "type": "integer" },
-          "messages": { "type": "array", "items": { "$ref": "#/components/schemas/MessageSummary" } }
+          "messages": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/MessageSummary" }
+          }
         },
-        "required": ["email", "folder", "total", "offset", "messages"]
+        "required": ["email", "folder", "scope", "sort", "order", "total", "offset", "messages"]
       },
       "MessageResponse": {
         "type": "object",
@@ -1462,6 +2227,327 @@
           "size": { "type": "string" },
           "arrival_time": { "type": "string" },
           "status": { "type": "string" }
+        }
+      },
+      "Contact": {
+        "type": "object",
+        "description": "One address-book entry, as Roundcube stores it.",
+        "properties": {
+          "id": { "type": "integer", "format": "int64" },
+          "name": { "type": "string", "description": "Display name." },
+          "firstname": { "type": "string" },
+          "surname": { "type": "string" },
+          "organization": { "type": "string" },
+          "jobtitle": { "type": "string" },
+          "department": { "type": "string" },
+          "email": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "phone": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "mobile": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "street": { "type": "string" },
+          "locality": { "type": "string" },
+          "region": { "type": "string" },
+          "zipcode": { "type": "string" },
+          "country": { "type": "string" },
+          "website": { "type": "string" },
+          "notes": { "type": "string" },
+          "birthday": { "type": "string" },
+          "gender": { "type": "string" },
+          "groups": {
+            "type": "array",
+            "items": { "type": "integer", "format": "int64" },
+            "description": "Ids of the groups this contact belongs to."
+          },
+          "changed": { "type": "string", "description": "When the row was last written." }
+        }
+      },
+      "ContactInput": {
+        "type": "object",
+        "description": "A contact to write. Every field is optional; on update only the fields present change.",
+        "properties": {
+          "name": { "type": "string" },
+          "firstname": { "type": "string" },
+          "surname": { "type": "string" },
+          "organization": { "type": "string" },
+          "jobtitle": { "type": "string" },
+          "department": { "type": "string" },
+          "email": {
+            "oneOf": [
+              { "type": "string" },
+              {
+                "type": "array",
+                "items": { "type": "string" }
+              }
+            ],
+            "description": "A single value or a list of them.",
+            "example": ["jane@example.com"]
+          },
+          "phone": {
+            "oneOf": [
+              { "type": "string" },
+              {
+                "type": "array",
+                "items": { "type": "string" }
+              }
+            ],
+            "description": "A single value or a list of them.",
+            "example": ["jane@example.com"]
+          },
+          "mobile": {
+            "oneOf": [
+              { "type": "string" },
+              {
+                "type": "array",
+                "items": { "type": "string" }
+              }
+            ],
+            "description": "A single value or a list of them.",
+            "example": ["jane@example.com"]
+          },
+          "street": { "type": "string" },
+          "locality": { "type": "string" },
+          "region": { "type": "string" },
+          "zipcode": { "type": "string" },
+          "country": { "type": "string" },
+          "website": { "type": "string" },
+          "notes": { "type": "string" },
+          "birthday": { "type": "string" },
+          "gender": { "type": "string" }
+        }
+      },
+      "ContactResponse": {
+        "type": "object",
+        "properties": {
+          "email": { "type": "string", "description": "The mailbox." },
+          "contact": { "$ref": "#/components/schemas/Contact" }
+        }
+      },
+      "ContactsResponse": {
+        "type": "object",
+        "properties": {
+          "email": { "type": "string" },
+          "total": { "type": "integer", "description": "Matches before paging." },
+          "offset": { "type": "integer" },
+          "limit": { "type": "integer" },
+          "sort": { "type": "string" },
+          "order": { "type": "string" },
+          "contacts": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Contact" }
+          }
+        }
+      },
+      "ContactGroup": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "integer", "format": "int64" },
+          "name": { "type": "string" },
+          "changed": { "type": "string" },
+          "members": { "type": "integer", "description": "How many contacts are in it." }
+        }
+      },
+      "ContactGroupDetail": {
+        "allOf": [
+          { "$ref": "#/components/schemas/ContactGroup" },
+          {
+            "type": "object",
+            "properties": {
+              "contact_ids": {
+                "type": "array",
+                "items": { "type": "integer", "format": "int64" }
+              }
+            }
+          }
+        ]
+      },
+      "GroupInput": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string" }
+        }
+      },
+      "GroupMembers": {
+        "type": "object",
+        "required": ["contact_ids"],
+        "properties": {
+          "contact_ids": {
+            "type": "array",
+            "items": { "type": "integer", "format": "int64" }
+          }
+        }
+      },
+      "GroupResponse": {
+        "type": "object",
+        "properties": {
+          "email": { "type": "string" },
+          "group": { "$ref": "#/components/schemas/ContactGroup" }
+        }
+      },
+      "GroupDetailResponse": {
+        "type": "object",
+        "properties": {
+          "email": { "type": "string" },
+          "group": { "$ref": "#/components/schemas/ContactGroupDetail" }
+        }
+      },
+      "GroupsResponse": {
+        "type": "object",
+        "properties": {
+          "email": { "type": "string" },
+          "groups": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/ContactGroup" }
+          }
+        }
+      },
+      "Identity": {
+        "type": "object",
+        "description": "A sender identity: the From name, address and signature the Webmail composes with.",
+        "properties": {
+          "id": { "type": "integer", "format": "int64" },
+          "changed": { "type": "string" },
+          "standard": { "type": "boolean", "description": "The one used by default." },
+          "name": { "type": "string" },
+          "organization": { "type": "string" },
+          "email": { "type": "string" },
+          "reply_to": { "type": "string" },
+          "bcc": { "type": "string" },
+          "signature": { "type": "string" },
+          "html_signature": { "type": "boolean" }
+        }
+      },
+      "IdentityInput": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "organization": { "type": "string" },
+          "email": { "type": "string", "description": "Required when creating." },
+          "reply_to": { "type": "string" },
+          "bcc": { "type": "string" },
+          "signature": { "type": "string" },
+          "html_signature": { "type": "boolean" },
+          "standard": { "type": "boolean", "description": "Make this the default identity." }
+        }
+      },
+      "IdentityResponse": {
+        "type": "object",
+        "properties": {
+          "email": { "type": "string" },
+          "identity": { "$ref": "#/components/schemas/Identity" }
+        }
+      },
+      "IdentitiesResponse": {
+        "type": "object",
+        "properties": {
+          "email": { "type": "string" },
+          "identities": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Identity" }
+          }
+        }
+      },
+      "CannedResponse": {
+        "type": "object",
+        "description": "A canned response the Webmail can insert into a message.",
+        "properties": {
+          "id": { "type": "integer", "format": "int64" },
+          "changed": { "type": "string" },
+          "name": { "type": "string" },
+          "data": { "type": "string", "description": "The body." },
+          "is_html": { "type": "boolean" }
+        }
+      },
+      "ResponseInput": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string", "description": "Required when creating." },
+          "data": { "type": "string" },
+          "is_html": { "type": "boolean" }
+        }
+      },
+      "ResponseResponse": {
+        "type": "object",
+        "properties": {
+          "email": { "type": "string" },
+          "response": { "$ref": "#/components/schemas/CannedResponse" }
+        }
+      },
+      "ResponsesResponse": {
+        "type": "object",
+        "properties": {
+          "email": { "type": "string" },
+          "responses": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/CannedResponse" }
+          }
+        }
+      },
+      "PreferencesResponse": {
+        "type": "object",
+        "properties": {
+          "email": { "type": "string" },
+          "preferences": { "type": "object", "additionalProperties": true, "description": "Roundcube's own preference keys and their values." }
+        }
+      },
+      "PreferencesInput": { "type": "object", "additionalProperties": true, "description": "Preference keys to set (or remove, with `null`)." },
+      "CollectedAddress": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "integer", "format": "int64" },
+          "changed": { "type": "string" },
+          "name": { "type": "string" },
+          "email": { "type": "string" },
+          "type": {
+            "type": "integer",
+            "enum": [1, 2],
+            "description": "`1` recipient of sent mail, `2` trusted sender."
+          }
+        }
+      },
+      "CollectedAddressesResponse": {
+        "type": "object",
+        "properties": {
+          "email": { "type": "string" },
+          "total": { "type": "integer" },
+          "addresses": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/CollectedAddress" }
+          }
+        }
+      },
+      "Suggestion": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "email": { "type": "string" },
+          "source": { "type": "string", "description": "Where it came from." }
+        }
+      },
+      "AutocompleteResponse": {
+        "type": "object",
+        "properties": {
+          "email": { "type": "string" },
+          "q": { "type": "string" },
+          "suggestions": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Suggestion" }
+          }
+        }
+      },
+      "Deleted": {
+        "type": "object",
+        "properties": {
+          "email": { "type": "string" },
+          "deleted": { "type": "integer", "format": "int64" }
         }
       }
     }

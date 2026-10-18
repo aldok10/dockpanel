@@ -324,16 +324,53 @@ Self-service, with any token:
 | `POST` | `/v1/me/messages/{uid}/move` | `{"folder": "Trash", "to": "INBOX"}` |
 | `POST` | `/v1/me/messages/{uid}/flags` | `{"folder": "INBOX", "add": ["Seen"], "remove": ["Flagged"]}` |
 | `POST` | `/v1/me/trash/empty` | — |
+| `GET`/`POST` | `/v1/me/contacts` | `{"name": "Jane Doe", "email": ["jane@example.com"]}` |
+| `GET`/`PUT`/`DELETE` | `/v1/me/contacts/{id}` | any subset of the contact fields on `PUT` |
+| `GET`/`POST` | `/v1/me/contactgroups` | `{"name": "Friends"}` |
+| `GET`/`PUT`/`DELETE` | `/v1/me/contactgroups/{id}` | `{"name": "Friends"}` on `PUT` |
+| `PUT` | `/v1/me/contactgroups/{id}/contacts` | `{"contact_ids": [1, 2]}` |
+| `GET`/`POST` | `/v1/me/identities` | `{"email": "me@example.com", "name": "Me", "standard": true}` |
+| `PUT`/`DELETE` | `/v1/me/identities/{id}` | any subset of the identity fields on `PUT` |
+| `GET`/`POST` | `/v1/me/responses` | `{"name": "Thanks", "data": "Thank you!", "is_html": false}` |
+| `PUT`/`DELETE` | `/v1/me/responses/{id}` | any subset of the response fields on `PUT` |
+| `GET`/`PUT` | `/v1/me/settings` | `{"language": "id"}` — merged; `null` removes a key |
+| `GET` | `/v1/me/collected-addresses?type=1` | — |
+| `DELETE` | `/v1/me/collected-addresses/{id}` | — |
+| `GET` | `/v1/me/autocomplete?q=jane` | — |
 
 The folder to delete is a query parameter rather than a path segment because folder names
 legitimately contain `/`. `INBOX`, `Sent` and `Trash` are refused.
 
 Messages are addressed the same way, by `folder`: `Drafts`, `Sent` and `Trash` are folders
 rather than routes, so the same handful of calls reads and manages all of them — and every
-other folder besides. `GET /v1/me/messages` lists a folder newest first, with `limit` and
-`offset` over that order, and reports each message's `uid`, which is what the rest of these
-take. A `uid` belongs to its folder: a message moved to another folder gets that folder's
-next `uid`, so re-read it after a move.
+other folder besides. `GET /v1/me/messages` reads a folder newest first by default, with
+`limit` and `offset` over that order, and reports each message's `uid`, which is what the rest
+of these take. A `uid` belongs to its folder: a message moved to another folder gets that
+folder's next `uid`, so re-read it after a move.
+
+That same call carries the search and the sort the bundled Webmail offers:
+
+* `q=` is free text, matched across the fields `search=` names — the Webmail's own default of
+  `subject`+`from`, or `subject`+`to` in `Sent`/`Drafts`. The tokens a Roundcube user types
+  into the search box are understood here too: `from:alice`, `-to:bob`,
+  `subject:"two words"`, `is:unread`, `is:flagged`, `larger:1M`, `smaller:500k`,
+  `since:2024-01-01`, `older_than:1M`, `has:attachment`, and `OR` between two terms.
+* `filter=` is the Webmail's filter dropdown — `unread`, `read`, `flagged`, `unflagged`,
+  `answered`, `deleted`, `draft`, `attachment`, the `priority-*` names and their opposites,
+  comma-separated to combine. `read=true|false` is the same thing for the read/unread case
+  alone.
+* `interval=1W` — or `1M`, `1Y`, and the negated `-1W`, `-1M`, `-1Y` — keeps mail from the last
+  week, month or year, or older than that.
+* `scope=sub` adds a folder's subfolders and `scope=all` reads every folder; each message then
+  carries the `folder` its `uid` belongs to.
+* `sort=date|arrival|subject|from|to|fromto|cc|size|none` picks the column, and `order=asc|desc`
+  the direction — `date`/`desc` by default, where `date` is the `Date:` header and `arrival` is
+  when Dovecot received the message. `fromto` is the Webmail's smart column (`to` in
+  `Sent`/`Drafts`, `from` elsewhere), and `none` is Dovecot's own `uid` order (`order` still
+  applies).
+
+The search is run by Dovecot, so `body:` and `text:` do not pull every message body through the
+API; the sort and the page are applied to what comes back.
 
 * **Saving a draft** is `POST /v1/me/messages` with `folder: "Drafts"` and `flags: ["\\Draft"]`.
   It is not a send: the message is written into the folder and stays there. It takes the same
@@ -347,6 +384,65 @@ next `uid`, so re-read it after a move.
   to set.
 * A folder that the mailbox does not have is a `404` rather than an empty listing, so a typo
   cannot quietly look like an empty mail folder.
+
+### Address book and settings
+
+The address book and the settings are **Roundcube's own**. Contacts, their groups, sender
+identities, canned responses, the preference blob and the addresses the Webmail collected all
+live in the SQLite database the webmail already keeps for the mailbox — the same one the
+service reads to authenticate a token. There is no second store: a contact added through the
+API is in the webmail's address book on the next page load, a signature changed here is the one
+the compose window uses, and a contact added in the webmail comes back from the API.
+
+These routes need the mailbox to have signed in to the Webmail at least once, because that is
+what creates its Roundcube account; before that they answer `404` and say so.
+
+* **Contacts** — `GET /v1/me/contacts` lists them, newest change last, with `q=` free text
+  matched across name, addresses, organisation, notes and the rest, `group=` to read one group,
+  `sort=name|firstname|surname|email|changed` and `order=asc|desc`, and `limit`/`offset` over
+  that order. `POST` adds one and `PUT`/`DELETE` change or remove it by `id`. The fields are
+  `name`, `firstname`, `surname`, `organization`, `jobtitle`, `department`, `email`, `phone`,
+  `mobile`, `street`, `locality`, `region`, `zipcode`, `country`, `website`, `notes`,
+  `birthday` and `gender`; `email`, `phone` and `mobile` take either one value or a list. A
+  `PUT` changes only the fields it names, and a delete is the same soft delete the webmail does.
+* **Groups** — `GET`/`POST /v1/me/contactgroups` lists and creates them, `PUT` renames and
+  `DELETE` removes one, and `GET /v1/me/contactgroups/{id}` answers with the group plus the
+  `contact_ids` in it. `PUT /v1/me/contactgroups/{id}/contacts` replaces that membership
+  wholesale; every id must be a contact the same mailbox owns.
+* **Identities** — the `From` name, address and signature the webmail composes with. `GET`/`POST
+  /v1/me/identities` lists and adds, `PUT`/`DELETE /v1/me/identities/{id}` change and remove.
+  The first identity becomes the standard one, as does any created with `"standard": true`, and
+  the last identity cannot be deleted — a mailbox needs one to send as.
+* **Canned responses** — `GET`/`POST /v1/me/responses` and `PUT`/`DELETE /v1/me/responses/{id}`
+  manage the storable replies the webmail can drop into a message.
+* **Preferences** — `GET /v1/me/settings` returns the webmail's preferences as JSON, under
+  Roundcube's own keys (`language`, `timezone`, `pagesize`, `message_sort_col`, and so on).
+  `PUT` is a shallow merge: the keys you send are set and everything else is left alone, so a
+  preference set in the webmail is not lost by setting an unrelated one here. A key sent as
+  `null` is removed.
+* **Collected addresses** — `GET /v1/me/collected-addresses` lists the addresses Roundcube
+  saved on its own, `type=1` for the recipients of mail you sent and `type=2` for trusted
+  senders, and `DELETE /v1/me/collected-addresses/{id}` forgets one.
+* **Autocomplete** — `GET /v1/me/autocomplete?q=jane` returns `name`/`email` suggestions,
+  contacts first and then collected addresses, deduplicated — what the webmail's recipient field
+  offers.
+
+```bash
+# Add a contact
+curl -X POST https://mail-api.example.com/v1/me/contacts \
+  -H "Authorization: Bearer <TOKEN>" -H "Content-Type: application/json" \
+  -d '{"name":"Jane Doe","email":"jane@example.com","organization":"Acme"}'
+
+# Search the address book
+curl "https://mail-api.example.com/v1/me/contacts?q=acme&sort=name" \
+  -H "Authorization: Bearer <TOKEN>"
+
+# Read and change a preference
+curl https://mail-api.example.com/v1/me/settings -H "Authorization: Bearer <TOKEN>"
+curl -X PUT https://mail-api.example.com/v1/me/settings \
+  -H "Authorization: Bearer <TOKEN>" -H "Content-Type: application/json" \
+  -d '{"language":"id"}'
+```
 
 Server-wide, with an admin mailbox token or a panel API key:
 
